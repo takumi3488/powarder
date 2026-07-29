@@ -1,0 +1,41 @@
+name: PR Auto-merge
+
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.2.10'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check package
+        shell: bash
+        run: nimble check
+
+      - name: Run tests
+        shell: bash
+        run: nimble test -y
+
+
+  automerge:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event.pull_request.user.login == 'renovate[bot]'
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: automerge
+        uses: pascalgn/automerge-action@v0.16.4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MERGE_LABELS: "automerge"

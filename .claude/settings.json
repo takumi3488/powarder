@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "find src tests -name '*.nim' -print0 2>/dev/null | xargs -0 mise exec -- nimpretty && mise exec -- nim check --hints:off src/powarder.nim",
+            "type": "command"
+          }
+        ],
+        "matcher": "Write|Edit|MultiEdit"
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/remote_session_start.sh",
+            "type": "command"
+          }
+        ],
+        "matcher": "startup"
+      }
+    ]
+  }
+}

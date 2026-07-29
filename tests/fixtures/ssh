@@ -1,0 +1,228 @@
+#!/bin/sh
+# fake ssh フィクスチャ。
+#
+# 実 SSH サーバなしに daemon/muxclient（および後続の hostsession）をテスト
+# するためのスタブ。`PATH` の先頭にこのスクリプトを置いて powarder に `ssh` として
+# 掴ませる。挙動は環境変数 POWARDER_FAKE_SSH_MODE で切り替える。
+#
+# 出力文言は実測した本物の OpenSSH（core/muxparse.nim のテストに使われている
+# ものと同じ）を一字一句再現する。文言を変えると muxparse の判定がそのまま
+# 通らなくなるので、変更する場合は core/muxparse.nim / tests/tmuxparse.nim 側の
+# 実測データとの整合を必ず確認すること。
+
+mode="${POWARDER_FAKE_SSH_MODE:-ok}"
+orig_args="$*"
+
+# --- 引数の記録 -------------------------------------------------------------
+# POWARDER_FAKE_SSH_LOG が設定されていたら、受け取った全引数を1行にして追記する。
+# 引数の区切りには ASCII unit separator (0x1F) を使う。空白区切りにすると、
+# ホスト名やパスに空白が含まれるケース（quoteShell のテスト）で引数の境界が
+# 分からなくなるため、テスト側が正確に argv を復元できるようにしている。
+if [ -n "$POWARDER_FAKE_SSH_LOG" ]; then
+  logline=""
+  first=1
+  for arg in "$@"; do
+    if [ "$first" -eq 1 ]; then
+      logline="$arg"
+      first=0
+    else
+      logline="$logline$(printf '\037')$arg"
+    fi
+  done
+  printf '%s\n' "$logline" >> "$POWARDER_FAKE_SSH_LOG"
+fi
+
+# --- 引数の解析 --------------------------------------------------------------
+is_master=0
+is_config=0
+action=""
+ctl_path=""
+host=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -M)
+      is_master=1
+      shift
+      ;;
+    -G)
+      is_config=1
+      shift
+      ;;
+    -N | -v)
+      shift
+      ;;
+    -S)
+      ctl_path="$2"
+      shift 2
+      ;;
+    -O)
+      action="$2"
+      shift 2
+      ;;
+    -o)
+      # -o Key=Value は読み飛ばす（値そのものは fake ssh の挙動に影響しない）
+      shift 2
+      ;;
+    -L | -R)
+      # forward/cancel の spec 引数。fake ssh の挙動は spec の中身に依存しないので
+      # 値は捨てる（記録は POWARDER_FAKE_SSH_LOG 側で行う）。
+      shift 2
+      ;;
+    -*)
+      shift
+      ;;
+    *)
+      if [ -z "$host" ]; then
+        host="$1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+# --- no-master: -O のどのサブコマンドも制御ソケットに繋がらない扱いにする ----
+if [ -n "$action" ] && [ "$mode" = "no-master" ]; then
+  printf 'Control socket connect(%s): No such file or directory\n' "$ctl_path" >&2
+  exit 255
+fi
+
+# --- -M -N: ControlMaster 起動モード -----------------------------------------
+if [ "$is_master" -eq 1 ]; then
+  case "$mode" in
+    auth-failed)
+      # 認証失敗。制御ソケットを作らず即座に失敗する（sleep しない）。
+      printf '%s: Permission denied (publickey).\n' "$host" >&2
+      exit 255
+      ;;
+    slow-start)
+      # readiness ポーリングのテスト用に、制御ソケットを作る前に3秒待つ。
+      sleep 3
+      ;;
+  esac
+
+  # 実際に制御ソケット（UDS）を作る。`socketExists()` による readiness 判定が
+  # 本物同様に動くようにするため、ただのファイルではなく本物の UDS にする。
+  # `nc -lU` を使う（この環境・CI 双方で確認済み。`-k` で複数回の
+  # `-O check` / `-O forward` 呼び出しに耐えられるようにする）。
+  rm -f "$ctl_path"
+  nc -lkU "$ctl_path" >/dev/null 2>&1 &
+  nc_pid=$!
+
+  # M6 の孤児 adopt テスト向け: 実マスター（このスクリプト自身）の pid を
+  # ctl_path の隣に記録しておく。`-O check` はこれを読んで返す（無ければ
+  # `$$` にフォールバックする。下の `check)` 分岐を参照）。これが無いと
+  # `-O check` の pid が「check 呼び出し自身の短命な pid」になってしまい、
+  # adopt の生死判定・cmdline 照合が実マスターの pid と食い違って壊れる。
+  echo "$$" > "${ctl_path}.pid"
+
+  cleanup() {
+    kill "$nc_pid" 2>/dev/null
+    rm -f "$ctl_path" "${ctl_path}.pid"
+  }
+  trap 'cleanup; exit 0' TERM INT
+
+  while kill -0 "$nc_pid" 2>/dev/null; do
+    sleep 0.2
+  done
+  cleanup
+  exit 0
+fi
+
+# --- -G: ssh_config 解決モード -----------------------------------------------
+if [ "$is_config" -eq 1 ]; then
+  # 実測: OpenSSH は非対話端末からの実行時に stderr へ pseudo-terminal の
+  # 警告を出すことがある。core/sshgparse.parseSshG は stdout だけを見る契約
+  # なので、その契約が守られているかをテストできるようここでも常に出す。
+  printf 'Pseudo-terminal will not be allocated because stdin is not a terminal.\n' >&2
+  cat <<EOF
+host $host
+hostname $host
+user fakeuser
+port 22
+addressfamily any
+batchmode no
+canonicalizehostname false
+challengeresponseauthentication yes
+checkhostip no
+compression no
+connectionattempts 1
+connecttimeout none
+controlmaster false
+controlpersist no
+enablesshkeysign no
+forwardagent no
+forwardx11 no
+gatewayports no
+hashknownhosts no
+hostbasedauthentication no
+identitiesonly no
+identityfile ~/.ssh/id_rsa
+identityfile ~/.ssh/id_ecdsa
+kbdinteractiveauthentication yes
+nohostauthenticationforlocalhost no
+passwordauthentication yes
+permitlocalcommand no
+protocol 2
+proxycommand none
+pubkeyauthentication yes
+serveraliveinterval 0
+serveralivecountmax 3
+stricthostkeychecking ask
+tcpkeepalive yes
+userknownhostsfile ~/.ssh/known_hosts
+verifyhostkeydns false
+visualhostkey no
+EOF
+  exit 0
+fi
+
+# --- -O check / forward / cancel / exit --------------------------------------
+case "$action" in
+  check)
+    # 実マスターの pid が記録されていればそれを返す（`-M -N` 分岐が書く
+    # `${ctl_path}.pid`）。無ければ（＝マスターを一度も起動していない
+    # 呼び出し元。tmuxclient.nim の単体テストなど）このプロセス自身の pid に
+    # フォールバックする。
+    if [ -f "${ctl_path}.pid" ]; then
+      real_pid=$(cat "${ctl_path}.pid")
+    else
+      real_pid="$$"
+    fi
+    printf 'Master running (pid=%s)\r\n' "$real_pid" >&2
+    exit 0
+    ;;
+  forward)
+    case "$mode" in
+      bind-failed)
+        printf 'mux_client_forward: forwarding request failed: Port forwarding failed\n' >&2
+        printf 'muxclient: master forward request failed\n' >&2
+        exit 255
+        ;;
+      *)
+        exit 0
+        ;;
+    esac
+    ;;
+  cancel)
+    case "$mode" in
+      not-forwarded)
+        printf 'mux_client_forward: forwarding request failed: port not forwarded\n' >&2
+        printf 'muxclient: master cancel forward request failed\n' >&2
+        exit 0
+        ;;
+      *)
+        exit 0
+        ;;
+    esac
+    ;;
+  exit)
+    exit 0
+    ;;
+  *)
+    # ここに来るのは想定外の呼び出し方をした場合。テストが気付けるよう
+    # 黙って成功扱いにはせず、明示的に失敗させる。
+    printf 'fake ssh: unrecognized invocation: %s\n' "$orig_args" >&2
+    exit 1
+    ;;
+esac

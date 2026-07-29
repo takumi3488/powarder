@@ -1,0 +1,8 @@
+nimcache/
+/powarder
+*.exe
+htmldocs/
+
+# nim c -r が tests/ に吐く実行バイナリ（ソースは追跡する）
+tests/t*
+!tests/t*.nim
