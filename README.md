@@ -32,26 +32,90 @@ you see the whole picture at a glance.
 
 ## Installation
 
-`powarder` is written in Nim 2.2.10 and has **zero external nimble package
-dependencies** (only `std/*`). All you need to build it is Nim itself.
+### Quick install
 
-If you use [mise](https://mise.jdx.dev/):
-
-```bash
-mise plugins install nim https://github.com/mise-plugins/mise-nim
-mise install nim@2.2.10
-```
-
-Build:
+`powarder` is distributed as prebuilt binaries via GitHub Releases. Install
+(or upgrade) it with:
 
 ```bash
-git clone https://example.com/powarder.git
-cd powarder
-mise exec -- nimble build -y
+curl -fsSL https://raw.githubusercontent.com/takumi3488/powarder/main/install.sh | sh
 ```
 
-This produces the `./powarder` binary. Put it somewhere on your `$PATH`
-(e.g. `mv powarder /usr/local/bin/` or `~/.local/bin/`).
+The script detects your OS and architecture, downloads the matching release
+asset, and installs the binary. Two environment variables control where it
+puts things and which version it fetches:
+
+| Variable | Description | Default |
+|---|---|---|
+| `POWARDER_INSTALL_DIR` | Directory to install the `powarder` binary into | `${XDG_BIN_HOME:-$HOME/.local/bin}` |
+| `POWARDER_VERSION` | Release version to install, e.g. `v0.2.0` | the latest release |
+
+For example, to install into a shared system location instead:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/takumi3488/powarder/main/install.sh | POWARDER_INSTALL_DIR=/usr/local/bin sh
+```
+
+Since `/usr/local/bin` typically isn't writable by a regular user, you may
+need to run this with elevated privileges (e.g. via `sudo`) for the install
+to succeed.
+
+### Supported platforms
+
+Prebuilt binaries are published for:
+
+| OS | Architecture |
+|---|---|
+| macOS | Apple Silicon (arm64) |
+| Linux | x86_64 |
+| Linux | arm64 |
+
+**No binary is published for Intel Macs (darwin x86_64).** If that's your
+platform, see "Building from source" below.
+
+Linux binaries are built on Ubuntu and dynamically linked against glibc, so
+they may fail to run on distributions with a much older glibc.
+
+### Manual download
+
+If you'd rather not pipe a script into `sh`, download a release archive
+directly from the
+[releases page](https://github.com/takumi3488/powarder/releases). Each
+release publishes `powarder-darwin-arm64.tar.gz`,
+`powarder-linux-x86_64.tar.gz`, and `powarder-linux-arm64.tar.gz`, plus a
+`SHA256SUMS` file for verifying the archive before you extract it and put
+the binary on your `$PATH`.
+
+### Updating
+
+`powarder update` fetches the latest release and replaces the running
+binary in place, by re-invoking `install.sh` targeting the same directory
+the current executable lives in.
+
+```console
+$ powarder update --check
+update available: 0.1.0 -> 0.2.0 (run 'powarder update' to install it)
+
+$ powarder update
+==> Detected platform: darwin-arm64
+==> Installing the latest powarder release
+==> Downloading https://github.com/takumi3488/powarder/releases/latest/download/powarder-darwin-arm64.tar.gz
+==> Checksum OK for powarder-darwin-arm64.tar.gz.
+==> Installed /Users/you/.local/bin/powarder
+powarder 0.2.0
+✔ update complete
+```
+
+`--check` only queries the GitHub releases API and reports what it finds; it
+never downloads or replaces anything. Everything after it is install.sh's own
+output, since `powarder update` hands the download, checksum verification,
+and atomic replacement over to the very same script a fresh install runs.
+Pass `--to <VERSION>` (e.g. `powarder update --to v0.1.5`) to install a
+specific release instead of the latest one.
+
+If the daemon is currently running, it keeps the previously-loaded binary in
+memory until restarted -- `powarder update` says so on completion, and
+`powarder daemon restart` picks up the new version.
 
 ## Usage
 
@@ -249,3 +313,31 @@ is attached to the already-running master afterward via `ssh -O forward`.
   directory (where IPC sockets and ControlPath live) can't be nested too
   deeply. If it is, specify a shorter path explicitly with
   `POWARDER_RUNTIME_DIR`.
+
+## Building from source
+
+If you're on a platform without a prebuilt binary (Intel Macs, for
+instance) or want to hack on `powarder` itself, you can build it directly
+with Nim instead of using the prebuilt binaries described above.
+
+`powarder` is written in Nim 2.2.10 and has **zero external nimble package
+dependencies** (only `std/*`), so the Nim toolchain is the only thing you
+need.
+
+If you use [mise](https://mise.jdx.dev/):
+
+```bash
+mise plugins install nim https://github.com/mise-plugins/mise-nim
+mise install nim@2.2.10
+```
+
+Then clone and build:
+
+```bash
+git clone https://github.com/takumi3488/powarder.git
+cd powarder
+mise exec -- nimble build -y
+```
+
+This produces the `./powarder` binary. Put it somewhere on your `$PATH`
+(e.g. `mv powarder ~/.local/bin/`).
