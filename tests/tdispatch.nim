@@ -364,8 +364,28 @@ suite "argv.usage":
     let u = usage()
     for cmd in ["run", "up", "down", "ps", "start", "stop", "restart",
                 "inspect", "check", "logs", "rm", "hosts", "daemon",
-                "completion", "version", "help"]:
+                "update", "completion", "version", "help"]:
       check cmd in u
+
+  test "update's own usage() mentions --check and --to":
+    let u = usage("update")
+    check "--check" in u
+    check "--to" in u
+
+# ===========================================================================
+# dispatch: "update" (implemented in `cli/cmd_update.nim`)
+# ===========================================================================
+# **No test here actually invokes `dispatch(args)` (or `cmdUpdate`) with
+# subcommand "update".** Every path through it either talks to the GitHub
+# releases API (`--check`) or runs install.sh against the network and
+# replaces the currently running binary (the plain `update` path) -- both
+# are exactly the kind of side effect this test file otherwise goes out of
+# its way to avoid (see the module doc comment, and `tests/tservice.nim`'s
+# reasoning for the same policy applied to `installService`). The pure
+# string/argv-building and version-comparison functions `cmd_update.nim`
+# factors out (`installDirFromExePath` / `downloaderArgv` / `envAssignments`
+# / `updateShellCommand` / `normalizeVersion` / `isUpdateAvailable` /
+# `parseTagName`) are covered directly in `tests/tupdate.nim` instead.
 
 # ===========================================================================
 # dispatch: exit code 7 when --no-autostart and no daemon
