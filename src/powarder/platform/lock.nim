@@ -1,25 +1,30 @@
-## 多重起動防止（シングルトンロック）。
+## Preventing multiple daemon instances (singleton lock).
 ##
-## PID ファイルではなく `fcntl` のアドバイザリロック（`F_SETLK` / `F_WRLCK`）を
-## 多重起動判定の主機構にする。PID ファイル方式には
-## - プロセスが SIGKILL で死んだ後もファイルが残る（stale ファイル）
-## - PID の再利用による誤検知（別プロセスが偶然同じ PID を持ってしまう）
-## という古典的な弱点があるが、`fcntl` のアドバイザリロックはロックを保持した
-## プロセスが（SIGKILL であっても）終了すれば **カーネルが自動的に解放する** ため、
-## stale 状態が原理的に発生しない。
+## Rather than a PID file, use an `fcntl` advisory lock (`F_SETLK` /
+## `F_WRLCK`) as the primary mechanism for detecting multiple launches. The
+## PID file approach has classic weaknesses:
+## - the file survives after the process dies via SIGKILL (a stale file)
+## - false positives from PID reuse (a different process happens to get the
+##   same PID)
+## but an `fcntl` advisory lock is **automatically released by the kernel**
+## once the process holding it terminates (even via SIGKILL), so a stale
+## state can never occur in principle.
 ##
-## `flock(2)` の Nim バインディングは標準ライブラリに存在しないが、`fcntl` と
-## `F_SETLK` / `F_WRLCK` / `Tflock` 構造体は `std/posix` に揃っているのでそちらを使う。
+## A Nim binding for `flock(2)` does not exist in the standard library, but
+## `fcntl` and the `F_SETLK` / `F_WRLCK` / `Tflock` structure are available
+## in `std/posix`, so those are used instead.
 ##
-## **重要な注意（fcntl ロックの罠）**: POSIX の fcntl レコードロックは
-## 「プロセス単位」で管理される。そのため、ロックを保持したまま同じプロセスが
-## 同じファイルを別の fd で開き、**どちらか一方の fd だけを close しても、その
-## プロセスが持つそのファイルへの全ロックが解放されてしまう**（close に使った fd が
-## ロック取得に使ったものかどうかは関係ない）。したがって、ロックを保持している間は
-## そのロックファイルに対して `readPid` のような別経路の open/close を行っては
-## いけない。`readPid` は「このロックを保持していない別プロセス」から状態を
-## 覗き見る用途を想定している（`writePid` は保持中の `lock.fd` をそのまま使って
-## 書き込むのでこの罠を踏まない）。
+## **Important caveat (the fcntl lock trap)**: POSIX fcntl record locks are
+## managed "per process." Therefore, if the same process opens the same
+## file again through a different fd while holding the lock, and **closes
+## even just one of the two fds, every lock that process holds on that
+## file gets released** (it does not matter whether the fd used for the
+## close is the one that was used to acquire the lock). Consequently, while
+## holding the lock, you must not perform a separate open/close on that
+## lock file through another path such as `readPid`. `readPid` is intended
+## to be used from "a different process that does not hold this lock" to
+## peek at the state (`writePid` writes using the held `lock.fd` directly,
+## so it does not fall into this trap).
 
 import std/[options, posix, os, strutils]
 
@@ -29,21 +34,23 @@ type
     path*: string
 
   SingletonLockError* = object of CatchableError
-    ## `acquireSingletonLock` が、既に他プロセスがロックを保持していて
-    ## 取得できなかったときに投げる。
+    ## Raised by `acquireSingletonLock` when another process already holds
+    ## the lock and it could not be acquired.
 
 proc isHeldByOther(errCode: OSErrorCode): bool =
-  ## `F_SETLK` が既存のロックと衝突したときに返す errno。
-  ## POSIX はどちらを返すかを実装依存としているため両方を見る。
+  ## The errno returned when `F_SETLK` conflicts with an existing lock.
+  ## POSIX leaves it implementation-defined which one is returned, so both
+  ## are checked.
   cint(errCode) == EACCES or cint(errCode) == EAGAIN
 
 proc tryAcquireSingletonLock*(path: string): Option[SingletonLock] =
-  ## `path` に対してアドバイザリロック（排他・ファイル全体）の取得を試みる。
+  ## Attempts to acquire an advisory lock (exclusive, whole file) on `path`.
   ##
-  ## - 取得できた: `Some(SingletonLock)`。
-  ## - 既に他プロセスが保持している（errno が `EACCES` / `EAGAIN`）: `none`。
-  ## - それ以外の失敗（open できない、fcntl がそれ以外のエラーを返す等）:
-  ##   `OSError` を投げる。
+  ## - Acquired: `Some(SingletonLock)`.
+  ## - Already held by another process (errno is `EACCES` / `EAGAIN`):
+  ##   `none`.
+  ## - Any other failure (open fails, fcntl returns some other error, etc.):
+  ##   raises `OSError`.
   let fd = posix.open(path.cstring, O_CREAT or O_RDWR, 0o600)
   if fd < 0:
     raiseOSError(osLastError(), path)
@@ -52,7 +59,7 @@ proc tryAcquireSingletonLock*(path: string): Option[SingletonLock] =
   fl.l_type = F_WRLCK.cshort
   fl.l_whence = SEEK_SET.cshort
   fl.l_start = 0
-  fl.l_len = 0 # 0 はファイル全体を意味する
+  fl.l_len = 0 # 0 means the whole file
 
   if fcntl(fd, F_SETLK, addr fl) == -1:
     let err = osLastError()
@@ -64,8 +71,8 @@ proc tryAcquireSingletonLock*(path: string): Option[SingletonLock] =
   some(SingletonLock(fd: fd, path: path))
 
 proc acquireSingletonLock*(path: string): SingletonLock =
-  ## `tryAcquireSingletonLock` の、取得できなかった場合に
-  ## `SingletonLockError` を投げるラッパー。
+  ## A wrapper around `tryAcquireSingletonLock` that raises
+  ## `SingletonLockError` when the lock could not be acquired.
   let got = tryAcquireSingletonLock(path)
   if got.isNone:
     raise newException(SingletonLockError,
@@ -73,40 +80,44 @@ proc acquireSingletonLock*(path: string): SingletonLock =
   got.get
 
 proc release*(lock: SingletonLock) =
-  ## ロックを解放して fd を閉じる。
+  ## Releases the lock and closes the fd.
   ##
-  ## 冪等: 既に閉じられている fd（`fd < 0`、あるいは二重に `release` を呼んだ場合）
-  ## に対しても例外を投げない。`close(2)` は無効な fd に対して -1 を返すだけなので
-  ## 呼び捨てて問題ない。
+  ## Idempotent: does not raise even for an already-closed fd (`fd < 0`, or
+  ## when `release` is called twice). `close(2)` simply returns -1 for an
+  ## invalid fd, so it is fine to call and discard the result.
   if lock.fd >= 0:
     discard close(lock.fd)
 
 proc writePid*(lock: SingletonLock; pid: int) =
-  ## ロックファイルに `pid` を書き込む。
+  ## Writes `pid` into the lock file.
   ##
-  ## **これは人間・デバッグ向けの補助情報にすぎない。** 多重起動の判定はあくまで
-  ## `fcntl` のアドバイザリロックが権威であり、ここに書かれた PID の値そのものが
-  ## 排他制御に使われることは無い（`cat` 等で覗いたときに「今ロックを持っている
-  ## のは誰か」がすぐ分かるようにするためだけの値）。
+  ## **This is nothing more than auxiliary information for humans /
+  ## debugging.** The determination of multiple launches is authoritatively
+  ## made by the `fcntl` advisory lock alone; the PID value written here is
+  ## never itself used for exclusion control (it exists only so that
+  ## peeking with `cat` etc. immediately shows "who currently holds the
+  ## lock").
   ##
-  ## 既に開いている `lock.fd` に対して `pwrite`/`ftruncate` で書き込む
-  ## （新たに `open` し直さない。モジュール冒頭に書いた通り、ロックを保持した
-  ## まま同じファイルを別 fd で開いて close すると、ロックごと解放されてしまう
-  ## ため）。
+  ## Writes via `pwrite`/`ftruncate` on the already-open `lock.fd` (does not
+  ## `open` it again. As noted at the top of the module, opening the same
+  ## file through a different fd while holding the lock and then closing it
+  ## would release the lock along with it).
   let payload = $pid & "\n"
   discard ftruncate(lock.fd, 0.Off)
   discard pwrite(lock.fd, payload.cstring, payload.len, 0.Off)
 
 proc readPid*(path: string): Option[int] =
-  ## ロックファイルに書かれている PID を読む。
+  ## Reads the PID written in the lock file.
   ##
-  ## **多重起動の判定には使わない**（それは fcntl ロックの責務）。あくまで人間向け
-  ## の表示・デバッグ用。ファイルが無い/中身が数値として読めない場合は `none` を
-  ## 返す。
+  ## **Not used to determine multiple launches** (that is the fcntl lock's
+  ## responsibility). This is strictly for human-facing display /
+  ## debugging. Returns `none` if the file does not exist or its contents
+  ## cannot be parsed as a number.
   ##
-  ## 呼び出し元がこのロックを既に保持している場合、モジュール冒頭の注意の通り
-  ## この呼び出し（内部で新しい fd を open → close する）はロックそのものを解放
-  ## してしまう。ロックを保持していない別プロセスから使うことを想定している。
+  ## If the caller already holds this lock, as noted at the top of the
+  ## module, this call (which internally opens a new fd and then closes it)
+  ## will release the lock itself. It is intended to be used from a
+  ## different process that does not hold the lock.
   if not fileExists(path):
     return none(int)
   try:

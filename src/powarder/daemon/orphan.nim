@@ -1,45 +1,50 @@
-## デーモン起動時の孤児マスター adopt（M6）。
+## Adopting orphaned masters at daemon startup (M6).
 ##
-## デーモンが `kill -9` やクラッシュで死んでも、子の `ssh -M ... -N` マスター
-## プロセスは init/launchd に引き取られて**生き残る**（トンネル自体は維持
-## されるので、これ自体は望ましい挙動）。デーモンを再起動したときにこれを
-## 「知らないプロセス」として放置すると、ポートが二重に使われたり残骸が
-## 溜まったりする。**引き継げるなら引き継ぐ**のがこのモジュールの役割。
+## Even if the daemon dies from `kill -9` or a crash, the child `ssh -M ...
+## -N` master process is picked up by init/launchd and **survives** (the
+## tunnel itself is kept alive, so this is desirable behavior in itself).
+## If we leave it alone as "an unknown process" when the daemon restarts,
+## ports end up used twice or debris piles up. The role of this module is
+## to **adopt it if it can be adopted**.
 ##
-## ## 生死判定の設計（実測で確定済み。変更しないこと）
+## ## Design of the alive/dead check (settled by empirical measurement.
+## ## Do not change it.)
 ##
-## 1. **「同じ forward を `-O forward` で再送して `bind: Address already in
-##    use` が返れば生きている証拠」という判定は成立しない。** 既存の同一
-##    forward への再送は exit 0 / stderr 空で冪等成功する（実機検証済み）。
-##    だから生死判定には使えない。
-## 2. **代わりに UDS へ直接 connect して判定する**
-##    （`proxy/upstream.probeUpstream`）。実測で確定した挙動:
-##    - forward が生きている: 接続成功 + SSH バナーが返る
-##    - cancel 済み / マスター死亡（ソケットファイルは残っている）:
+## 1. **The judgment "if resending the same forward with `-O forward`
+##    returns `bind: Address already in use`, that proves it's alive" does
+##    not hold.** Resending to an existing identical forward succeeds
+##    idempotently with exit 0 / empty stderr (empirically verified on real
+##    hardware). So it cannot be used for the alive/dead check.
+## 2. **Instead, judge it by connecting directly to the UDS**
+##    (`proxy/upstream.probeUpstream`). Behavior confirmed by measurement:
+##    - forward is alive: connection succeeds and an SSH banner comes back
+##    - already cancelled / master dead (socket file still remains):
 ##      `ECONNREFUSED`
-##    - ソケットファイルも無い: `ENOENT`
-##    このプローブは宛先に実接続を発生させる（OpenSSH の
-##    `channel_post_port_listener` が accept 直後に `direct-tcpip` を開くため
-##    回避不可能）が、adopt は起動時に1回だけなので許容する。
-## 3. **adopt したマスターは自分の子プロセスではないので `peekExitCode` /
-##    `waitForExit` が原理的に使えない**（`waitpid` は自分の子しか回収
-##    できない）。`daemon/hostsession.adoptHostSession` が `adopted = true`
-##    にし、死活監視を `-O check` のみに依存させる（`hostsession.nim` を
-##    参照）。
-## 4. **`ps` は `-ww` が必須。** `platform/procinfo.processCmdline` が既に
-##    対応済み。
+##    - socket file doesn't even exist: `ENOENT`
+##    This probe causes a real connection to the destination (unavoidable,
+##    because OpenSSH's `channel_post_port_listener` opens a `direct-tcpip`
+##    right after accept), but it is acceptable because adopt only happens
+##    once at startup.
+## 3. **An adopted master is not our own child process, so `peekExitCode` /
+##    `waitForExit` cannot be used in principle** (`waitpid` can only reap
+##    one's own children). `daemon/hostsession.adoptHostSession` sets
+##    `adopted = true` and makes liveness monitoring depend solely on
+##    `-O check` (see `hostsession.nim`).
+## 4. **`ps` requires `-ww`.** `platform/procinfo.processCmdline` already
+##    handles this.
 ##
-## ## host と forward の対応付け
+## ## Mapping between host and forward
 ##
-## `PersistedForward` 自体は所属ホストを持たない（`fkLocal` はローカル
-## ポートがマシン全体で一意という設計上、`forwardId` に host を含めない。
-## `core/forwardspec.forwardId` の doc comment を参照）。そのため、
-## 各 `PersistedHostSession.forwardIds`（ホスト側が持つ「自分に属する
-## forward id 一覧」）を辿ることで対応付ける。ホストが adopt できなかった
-## （`aoNoSocket` / `aoDeadReclaimed` / `aoMismatch`）場合、そのホストに
-## 属していた forward は一切処理しない（persisted な記録を静かに捨てる）。
-## 設定にまだ存在するトンネルであれば、後続の通常の `reconcile` が新しい
-## ホスト・新しい forward を普通に作り直す。
+## `PersistedForward` itself does not hold its owning host (by design,
+## `fkLocal` treats the local port as unique machine-wide, so `forwardId`
+## does not include the host; see `core/forwardspec.forwardId`'s doc
+## comment). Because of that, the mapping is done by walking each
+## `PersistedHostSession.forwardIds` (the "list of forward ids belonging to
+## me" held on the host side). If a host could not be adopted
+## (`aoNoSocket` / `aoDeadReclaimed` / `aoMismatch`), any forward that
+## belonged to it is not processed at all (its persisted record is quietly
+## discarded). If the tunnel still exists in the config, the subsequent
+## normal `reconcile` will simply recreate a new host and a new forward.
 
 import std/[os, tables, asyncdispatch]
 
@@ -55,28 +60,30 @@ import powarder/platform/procinfo
 
 type
   AdoptOutcome* = enum
-    aoAdopted  ## 生きていたので引き継いだ
-    aoDeadReclaimed ## 死んでいたので記録を破棄し、残骸を掃除した
-    aoMismatch ## PID は生きているが cmdline が一致しない（別プロセスの PID 再利用）
-    aoNoSocket ## 制御ソケットが無い
+    aoAdopted       ## Was alive, so we adopted it
+    aoDeadReclaimed ## Was dead, so we discarded the record and cleaned up debris
+    aoMismatch      ## PID is alive but cmdline doesn't match (PID reused by another process)
+    aoNoSocket      ## No control socket
 
   AdoptReport* = object
     hosts*: seq[tuple[host: string, outcome: AdoptOutcome]]
-    adoptedForwards*: seq[string] ## 引き継げた Forward の id
-    reattachForwards*: seq[string] ## 死んでいた/楽観的に再 attach へ回した id
+    adoptedForwards*: seq[string] ## ids of Forwards that were successfully adopted
+    reattachForwards*: seq[string] ## ids that were dead, or optimistically routed to re-attach
     staleSocketsRemoved*: int
     notes*: seq[string]
 
 # ---------------------------------------------------------------------------
-# 内部ヘルパー
+# internal helpers
 # ---------------------------------------------------------------------------
 
 proc probeAlive(target: UpstreamTarget): bool =
-  ## `probeUpstream` を同期的に橋渡しする。`adoptOrphans` はデーモン起動時に
-  ## 1回だけ呼ばれる同期関数（`newDaemon` の中。`mainLoop`/`serve` が
-  ## 始まる前）であり、ここが唯一の `waitFor` なのでネストの心配は無い
-  ## （`daemon/run.handleTunnelCheck` の単発 `waitFor` と同じ考え方）。
-  ## 万一応答が返らない場合に備えて `withTimeout` で上限を設ける。
+  ## Synchronously bridges to `probeUpstream`. `adoptOrphans` is a
+  ## synchronous function called exactly once at daemon startup (inside
+  ## `newDaemon`, before `mainLoop`/`serve` starts), and this is the only
+  ## `waitFor` here, so there is no concern about nesting (the same idea as
+  ## the single `waitFor` in `daemon/run.handleTunnelCheck`).
+  ## Set an upper bound with `withTimeout` in case a response never comes
+  ## back.
   let fut = probeUpstream(target)
   let completed =
     try: waitFor(withTimeout(fut, 3000))
@@ -84,19 +91,21 @@ proc probeAlive(target: UpstreamTarget): bool =
   completed and (try: fut.read() except CatchableError: false)
 
 # ---------------------------------------------------------------------------
-# 公開 API
+# public API
 # ---------------------------------------------------------------------------
 
 proc adoptOrphans*(reg: Registry; st: PersistedState): AdoptReport =
-  ## デーモン起動シーケンスから1回だけ呼ぶ。`st`（前回保存された
-  ## `PersistedState`）を元に、生きている孤児マスター/forward を `reg` へ
-  ## 引き継ぐ。手順はモジュール doc comment を参照。
+  ## Called exactly once from the daemon startup sequence. Based on `st`
+  ## (the previously saved `PersistedState`), adopts any orphaned masters /
+  ## forwards that are still alive into `reg`. See the module doc comment
+  ## for the steps.
   result = AdoptReport(hosts: @[], adoptedForwards: @[],
       reattachForwards: @[], staleSocketsRemoved: 0, notes: @[])
 
-  # --- 手順1: ホストの adopt -------------------------------------------------
-  # adopt できたホストだけを (persisted 記録, 作った HostSession) の組で
-  # 憶えておく。forward 側の処理（手順2）はこの組だけを辿る。
+  # --- Step 1: adopting hosts -------------------------------------------------
+  # Remember only the hosts that were successfully adopted, as pairs of
+  # (persisted record, the created HostSession). The forward-side
+  # processing (step 2) only walks these pairs.
   var adopted: seq[tuple[phs: PersistedHostSession, hs: HostSession]] = @[]
 
   for phs in st.hosts:
@@ -106,16 +115,17 @@ proc adoptOrphans*(reg: Registry; st: PersistedState): AdoptReport =
 
     let (alive, _) = checkMaster(phs.ctlPath, phs.host)
     if not alive:
-      # ソケットファイルは残っている（`ECONNREFUSED` の場合。存在は既に
-      # 上で確認済み）ので消す。マスター死亡 + 残骸掃除。
+      # The socket file still remains (the `ECONNREFUSED` case; its
+      # existence was already confirmed above), so remove it. Master is
+      # dead + clean up debris.
       removeFile(phs.ctlPath)
       inc result.staleSocketsRemoved
       result.hosts.add (host: phs.host, outcome: aoDeadReclaimed)
       continue
 
     if not (pidAlive(phs.pid) and cmdlineMatches(phs.pid, phs.argv)):
-      # 生きてはいるが記録済みの argv と一致しない
-      # （＝別プロセスへの PID 再利用の疑い）。偽陽性を避けるため何もしない。
+      # Alive, but does not match the recorded argv (i.e. suspected PID
+      # reuse by another process). Do nothing to avoid a false positive.
       result.hosts.add (host: phs.host, outcome: aoMismatch)
       continue
 
@@ -125,7 +135,7 @@ proc adoptOrphans*(reg: Registry; st: PersistedState): AdoptReport =
     result.hosts.add (host: phs.host, outcome: aoAdopted)
     adopted.add (phs: phs, hs: hs)
 
-  # --- 手順2: forward の adopt / 再 attach ------------------------------------
+  # --- Step 2: adopting / re-attaching forwards -------------------------------
   var forwardById = initTable[string, PersistedForward]()
   for pfw in st.forwards:
     forwardById[pfw.id] = pfw
@@ -133,8 +143,8 @@ proc adoptOrphans*(reg: Registry; st: PersistedState): AdoptReport =
   for pair in adopted:
     for fid in pair.phs.forwardIds:
       if fid notin forwardById:
-        var note = "adopt: ホスト " & pair.phs.host
-        note.add " の forward 記録が見つかりません (id=" & fid & ")"
+        var note = "adopt: host " & pair.phs.host
+        note.add " has no forward record (id=" & fid & ")"
         result.notes.add note
         continue
       let pfw = forwardById[fid]
@@ -152,8 +162,9 @@ proc adoptOrphans*(reg: Registry; st: PersistedState): AdoptReport =
           discard registry.addForward(reg, pfw.tunnelName, pfw.spec, pair.hs)
           result.reattachForwards.add pfw.id
       of fkRemote:
-        # `fkRemote` はプローブする手段が無い（powarder がデータパスに
-        # 介在しないため）。楽観的に `fwPending` にして再 attach させる。
-        # `-O forward -R` は冪等成功するので、二重に張られる心配は無い。
+        # There is no way to probe `fkRemote` (because powarder does not
+        # sit in the data path). Optimistically set it to `fwPending` and
+        # have it re-attach. `-O forward -R` succeeds idempotently, so
+        # there is no concern about it being set up twice.
         discard registry.addForward(reg, pfw.tunnelName, pfw.spec, pair.hs)
         result.reattachForwards.add pfw.id

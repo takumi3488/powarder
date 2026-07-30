@@ -1,32 +1,35 @@
-## powarder CLI の argv パーサ。
+## The argv parser for the powarder CLI.
 ##
-## docker / docker compose / systemctl / tailscale の語彙を借用しつつ、`-L` / `-R` だけは
-## ssh 本体と完全互換の文法（`parseForwardSpec` 経由）で受け付ける。これにより
-## 既存の `ssh -L ... host` を `powarder run -L ... host` に機械的に置き換えるだけで
-## 移行できる。
+## Borrows vocabulary from docker / docker compose / systemctl / tailscale, but
+## only `-L` / `-R` are accepted with a syntax fully compatible with ssh itself
+## (via `parseForwardSpec`). This lets an existing `ssh -L ... host` be migrated
+## by mechanically rewriting it to `powarder run -L ... host`.
 ##
-## **`std/parseopt` は使わない。** サブコマンド機構が無く、`-L 8080:localhost:80` の
-## ようなスペース区切りの値付き短縮フラグを `shortNoVal` のセットで管理するのは
-## ssh 互換文法との相性が悪い（`-L` の値が `:` を含む1トークンであることを
-## 前提にした自前の分割が別途必要になり、結局 parseopt の恩恵が薄い）。
-## 代わりに argv を素朴に先頭から走査する状態機械として実装する。
+## **`std/parseopt` is not used.** There is no subcommand mechanism, and
+## managing a space-separated, value-taking short flag like `-L 8080:localhost:80`
+## via a `shortNoVal` set doesn't play well with ssh-compatible syntax (it would
+## need its own splitting logic that assumes the `-L` value is a single token
+## containing `:`, and at that point parseopt buys us little). Instead this is
+## implemented as a plain state machine that scans argv from the front.
 ##
-## ### `-f` / `-n` の多義性について
+## ### On the ambiguity of `-f` / `-n`
 ##
-## docker が `docker logs -f`（follow）と `docker up -f FILE`（compose ファイル指定）で
-## 同じ `-f` に別の意味を与えているのと同じ運用を許容する。**「今の subcommand が
-## 何か」を見てから `-f` を解釈する**ことでこの曖昧さを解消している:
+## We allow the same kind of overloading docker uses, where `docker logs -f`
+## (follow) and `docker up -f FILE` (compose file) give the same `-f` two
+## different meanings. **We resolve this by looking at the current subcommand
+## before interpreting `-f`**:
 ##
-## - `subcommand == "logs"` のとき `-f` は `follow`（値を取らない）
-## - それ以外のとき `-f` は `--config` の別名（値を1つ取る）
+## - When `subcommand == "logs"`, `-f` means `follow` (takes no value)
+## - Otherwise, `-f` is an alias for `--config` (takes one value)
 ##
-## 同様に `-n` も `logs`（`tailLines`、整数値）と、それ以外の subcommand
-## （`--name` の短縮形、文字列値）とで意味が変わる。曖昧さの種類としては同一なので
-## 同じ「subcommand を見てから分岐する」方針で統一している。
-## 長い形（`--follow` / `--file` / `--config` / `--name`）はどの subcommand でも
-## 意味が変わらないため、曖昧さの回避に `-f` / `-n` を避けたいスクリプトはそちらを使える。
+## Likewise, `-n` means something different under `logs` (`tailLines`, an
+## integer value) than under any other subcommand (short form of `--name`, a
+## string value). Since it's the same kind of ambiguity, we resolve it the same
+## way: branch on the subcommand. The long forms (`--follow` / `--file` /
+## `--config` / `--name`) mean the same thing under every subcommand, so
+## scripts that want to avoid the `-f` / `-n` ambiguity can use those instead.
 ##
-## このモジュールは I/O を一切行わない。
+## This module performs no I/O.
 
 import std/strutils
 import powarder/core/types
@@ -34,25 +37,25 @@ import powarder/core/forwardspec
 
 type
   ParsedArgs* = object
-    subcommand*: string ## "run", "up", "ps", "daemon" 等。空なら未指定（help を出す）
-    subsubcommand*: string   ## "daemon status" の "status"、"completion zsh" の "zsh"
-    positional*: seq[string] ## トンネル名やホスト名
-    localForwards*: seq[ForwardSpec] ## -L の繰り返し（fkLocal でパース済み）
-    remoteForwards*: seq[ForwardSpec] ## -R の繰り返し（fkRemote でパース済み）
-    name*: string            ## --name / -n
-    configPath*: string      ## --config / -f / --file
-    profiles*: seq[string]   ## --profile / -p の繰り返し
-    tailLines*: int          ## logs -n（既定 50）
+    subcommand*: string ## "run", "up", "ps", "daemon", etc. Empty means unspecified (show help)
+    subsubcommand*: string ## "status" from "daemon status", "zsh" from "completion zsh"
+    positional*: seq[string]          ## Tunnel names or host names
+    localForwards*: seq[ForwardSpec]  ## Repeated -L (parsed with fkLocal)
+    remoteForwards*: seq[ForwardSpec] ## Repeated -R (parsed with fkRemote)
+    name*: string                     ## --name / -n
+    configPath*: string               ## --config / -f / --file
+    profiles*: seq[string]            ## Repeated --profile / -p
+    tailLines*: int                   ## logs -n (default 50)
     json*: bool
     noColor*: bool
     verbose*: bool
     quiet*: bool
-    all*: bool               ## ps -a
-    quietList*: bool         ## ps -q（名前のみ出力）
-    follow*: bool            ## logs -f
-    probe*: bool             ## ps --probe（Tier2 ヘルスチェックのオプトイン）
+    all*: bool                        ## ps -a
+    quietList*: bool                  ## ps -q (print names only)
+    follow*: bool                     ## logs -f
+    probe*: bool                      ## ps --probe (opt into Tier2 health check)
     noAutostart*: bool
-    immediate*: bool         ## down が grace をスキップする
+    immediate*: bool                  ## down skips the grace period
     helpRequested*: bool
     versionRequested*: bool
 
@@ -67,23 +70,25 @@ const
   ]
   completionShells = ["zsh", "bash", "fish"]
   subsubcommandHosts = ["daemon", "completion"]
-    ## この subcommand だけは直後のトークンを subsubcommand として消費する。
+    ## Only these subcommands consume the next token as a subsubcommand.
 
 proc parseForwardArg(flag, value: string; kind: ForwardKind): ForwardSpec =
-  ## `parseForwardSpec` を呼び、失敗したら **同じ ValueError のまま** 再送出する
-  ## （呼び出し側からは「そのまま伝播してきた」ように見える）。
-  ## ただしメッセージの先頭に「どのフラグの値が悪かったか」（`-L` か `-R` か、
-  ## および実際に渡された値）を付け加える。`parseForwardSpec` 自身のメッセージには
-  ## 元の文字列は含まれるが、それが `-L` 由来か `-R` 由来かはここでしか分からないため。
+  ## Calls `parseForwardSpec` and, on failure, re-raises it **as the same
+  ## ValueError** (so callers see it as having simply propagated through).
+  ## However, it prefixes the message with which flag's value was bad (`-L` or
+  ## `-R`, plus the value actually given). `parseForwardSpec`'s own message
+  ## includes the original string, but only this call site knows whether it
+  ## came from `-L` or `-R`.
   try:
     parseForwardSpec(value, kind)
   except ValueError as e:
     raise newException(ValueError, flag & " " & value & ": " & e.msg)
 
 proc parseArgv*(args: openArray[string]): ParsedArgs =
-  ## argv（プログラム名を含まない）をパースする。不正な入力は `ArgvError`
-  ## （構文レベルの誤り）または `ValueError`（`-L`/`-R` の値が ssh 互換文法として
-  ## 不正。`parseForwardSpec` からそのまま伝播）を投げる。
+  ## Parses argv (not including the program name). Invalid input raises
+  ## `ArgvError` (a syntax-level error) or `ValueError` (the `-L`/`-R` value is
+  ## invalid as ssh-compatible syntax; propagated as-is from
+  ## `parseForwardSpec`).
   result = ParsedArgs(tailLines: defaultTailLines)
 
   if args.len == 0:
@@ -91,12 +96,13 @@ proc parseArgv*(args: openArray[string]): ParsedArgs =
     return
 
   var i = 0
-  var literalOnly = false ## `--` 以降
+  var literalOnly = false ## After `--`
 
   template nextValue(flagLabel: string): string =
-    ## 値を取るフラグの共通処理。値が無ければ `ArgvError`。
+    ## Common handling for flags that take a value. Raises `ArgvError` if no
+    ## value follows.
     if i >= args.len:
-      raise newException(ArgvError, flagLabel & " には値が必要です")
+      raise newException(ArgvError, flagLabel & " requires a value")
     let v = args[i]
     inc i
     v
@@ -155,27 +161,27 @@ proc parseArgv*(args: openArray[string]): ParsedArgs =
     of "--immediate":
       result.immediate = true
     of "-f":
-      # -f の意味は subcommand によって変わる（モジュール doc comment 参照）。
+      # The meaning of -f depends on the subcommand (see module doc comment).
       if result.subcommand == "logs":
         result.follow = true
       else:
         result.configPath = nextValue(a)
     of "-n":
-      # -n も同様に subcommand で意味が変わる。
+      # -n likewise changes meaning depending on the subcommand.
       if result.subcommand == "logs":
         let v = nextValue(a)
         try:
           result.tailLines = parseInt(v)
         except ValueError:
-          raise newException(ArgvError, "-n の値が数値ではありません: " & v)
+          raise newException(ArgvError, "-n value is not a number: " & v)
       else:
         result.name = nextValue(a)
     else:
       if a.len > 0 and a[0] == '-':
-        raise newException(ArgvError, "未知のフラグです: " & a)
+        raise newException(ArgvError, "unknown flag: " & a)
 
-      # フラグではない素のトークン。subcommand / subsubcommand / positional の
-      # どこに割り当てるべきかは、ここまでの状態次第で決まる。
+      # A bare token that isn't a flag. Where it should be assigned -
+      # subcommand / subsubcommand / positional - depends on the state so far.
       if result.subcommand.len == 0:
         case a
         of "version":
@@ -185,7 +191,7 @@ proc parseArgv*(args: openArray[string]): ParsedArgs =
           result.helpRequested = true
           return
         of "ls":
-          result.subcommand = "ps" ## docker compose 風のエイリアス
+          result.subcommand = "ps" ## docker compose-style alias
         else:
           result.subcommand = a
       elif result.subcommand in subsubcommandHosts and
@@ -195,18 +201,18 @@ proc parseArgv*(args: openArray[string]): ParsedArgs =
         of "daemon":
           if a notin daemonSubcommands:
             raise newException(ArgvError,
-                "daemon の未知のサブコマンドです: " & a)
+                "unknown daemon subcommand: " & a)
         of "completion":
           if a notin completionShells:
             raise newException(ArgvError,
-                "completion の未知のシェルです: " & a)
+                "unknown completion shell: " & a)
         else:
           discard
       else:
         result.positional.add(a)
 
 # ---------------------------------------------------------------------------
-# ヘルプ文字列
+# Help strings
 # ---------------------------------------------------------------------------
 
 const generalUsage = """
@@ -307,8 +313,9 @@ Usage: powarder completion <zsh|bash|fish>
 Print a shell completion script to stdout."""
 
 proc usage*(subcommand = ""): string =
-  ## ヘルプ文字列。`subcommand` が空なら全体のヘルプ、指定があればそのサブコマンドの
-  ## 詳細（未知の場合は全体のヘルプにフォールバックする）。
+  ## The help string. If `subcommand` is empty, returns the overall help;
+  ## otherwise returns details for that subcommand (falling back to the
+  ## overall help if unknown).
   case subcommand
   of "":
     generalUsage

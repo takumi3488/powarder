@@ -1,11 +1,13 @@
-## `powarder/daemon/forward` のテスト。
+## Tests for `powarder/daemon/forward`.
 ##
-## 実 SSH サーバなしにテストするため、`tests/fixtures/ssh` という fake ssh を
-## `PATH` の先頭に置いて powarder に `ssh` として掴ませる（`thostsession.nim` /
-## `tmuxclient.nim` と同じ手法）。fake ssh は `-O forward` を受けても実際には
-## UDS を作らないので、「forward が張られた状態」を模擬するために、テスト側で
-## ダミーのエコーサーバを `paths.forwardSocketPath(udsBasename(id))` の
-## 決定的なパスに自分で bind する（`tests/tproxy.nim` と同じ手法）。
+## To test without a real SSH server, a fake ssh at `tests/fixtures/ssh` is
+## placed at the front of `PATH` so powarder picks it up as `ssh` (the same
+## technique as `thostsession.nim` / `tmuxclient.nim`). Since the fake ssh
+## does not actually create a UDS even when it receives `-O forward`, to
+## simulate the state of "a forward is established", the test side itself
+## binds a dummy echo server to the deterministic path
+## `paths.forwardSocketPath(udsBasename(id))` (the same technique as
+## `tests/tproxy.nim`).
 
 import std/[unittest, os, options, monotimes, times, strutils]
 import std/asyncdispatch
@@ -28,11 +30,11 @@ const testStateDir = "/tmp/pw-fwd-state"
 const testLogFile = "/tmp/pw-fwd-log"
 
 # ---------------------------------------------------------------------------
-# セットアップ / ヘルパー
+# Setup / helpers
 # ---------------------------------------------------------------------------
 
 proc withMode(mode: string; body: proc()) =
-  ## `POWARDER_FAKE_SSH_MODE` を一時的に切り替えてテスト本体を実行する。
+  ## Temporarily switch `POWARDER_FAKE_SSH_MODE` and run the test body.
   let had = existsEnv("POWARDER_FAKE_SSH_MODE")
   let old = getEnv("POWARDER_FAKE_SSH_MODE")
   putEnv("POWARDER_FAKE_SSH_MODE", mode)
@@ -43,7 +45,7 @@ proc withMode(mode: string; body: proc()) =
     else: delEnv("POWARDER_FAKE_SSH_MODE")
 
 proc withLog(body: proc()) =
-  ## `POWARDER_FAKE_SSH_LOG` を一時的に有効にしてテスト本体を実行する。
+  ## Temporarily enable `POWARDER_FAKE_SSH_LOG` and run the test body.
   removeFile(testLogFile)
   putEnv("POWARDER_FAKE_SSH_LOG", testLogFile)
   try:
@@ -68,8 +70,9 @@ proc setupSuite() =
 setupSuite()
 
 var allSessions: seq[HostSession]
-  ## 後片付け漏れを防ぐため、生成した HostSession を全部覚えておいて
-  ## ファイルの末尾で teardown する（thostsession.nim と同じ手法）。
+  ## To avoid missing cleanup, remember every HostSession created and tear
+  ## them all down at the end of the file (same technique as
+  ## thostsession.nim).
 
 proc track(hs: HostSession): HostSession =
   allSessions.add(hs)
@@ -77,7 +80,7 @@ proc track(hs: HostSession): HostSession =
 
 proc waitForHostState(hs: HostSession; target: HostSessionState;
                       timeoutMs = 5000): bool =
-  ## `target` に達するまで hostsession.tick を呼び続ける。
+  ## Keep calling hostsession.tick until `target` is reached.
   let deadline = getMonoTime() + initDuration(milliseconds = timeoutMs)
   while hs.state != target:
     hostsession.tick(hs)
@@ -95,10 +98,11 @@ proc stopAndCleanup(hs: HostSession) =
 
 proc pollForward(fw: Forward; cond: proc(): bool {.closure.}; tries = 300;
                  delayMs = 20): Future[bool] {.async.} =
-  ## `tick(fw)` を呼びながら `cond` が満たされるのを待つ。`fw.tick` が
-  ## 段階的に進める非同期の後始末（プロキシの Future 回収 / probeUpstream）
-  ## にはイベントループを回す必要があるため `sleepAsync` で間を作る
-  ## (`tests/tproxy.nim` の `waitUntil` と同じ手法)。
+  ## Wait for `cond` to be satisfied while calling `tick(fw)`. The
+  ## asynchronous cleanup that `fw.tick` advances step by step (reclaiming
+  ## the proxy's Future / probeUpstream) requires spinning the event loop,
+  ## so `sleepAsync` is used to create gaps (same technique as `waitUntil`
+  ## in `tests/tproxy.nim`).
   for i in 0 ..< tries:
     tick(fw)
     if cond():
@@ -106,7 +110,7 @@ proc pollForward(fw: Forward; cond: proc(): bool {.closure.}; tries = 300;
     await sleepAsync(delayMs)
   result = cond()
 
-# ---- 「forward が張られた状態」を模擬するダミーのエコーサーバ (UDS) --------
+# ---- Dummy echo server (UDS) simulating the state of "a forward is established" --------
 
 type
   EchoServer = ref object
@@ -122,7 +126,7 @@ proc echoConn(sock: AsyncSocket) {.async.} =
   sock.close()
 
 proc newEchoServerUnix(path: string): EchoServer =
-  removeFile(path) ## fileExists は UDS には常に false を返すが removeFile は無条件に呼んでよい
+  removeFile(path) ## fileExists always returns false for a UDS, but removeFile can be called unconditionally
   let l = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_NONE, buffered = false)
   l.bindUnix(path)
   l.listen()
@@ -146,11 +150,11 @@ proc newTcpClient(port: int): Future[AsyncSocket] {.async.} =
   await result.connect("127.0.0.1", Port(port))
 
 # ---------------------------------------------------------------------------
-# 1. newForward: id と UDS パスの決定的な導出、参照カウント
+# 1. newForward: deterministic derivation of id and UDS path, reference counting
 # ---------------------------------------------------------------------------
 
 suite "newForward":
-  test "id は forwardId() から、UDS パスは udsBasename() から決定的に導出され、参照カウントが増える":
+  test "id is deterministically derived from forwardId() and the UDS path from udsBasename(), and the ref count increases":
     withMode("ok", proc() =
       let hs = track(newHostSession("host-fwd-newforward"))
       let spec = ForwardSpec(kind: fkLocal, bindAddr: defaultBindAddr,
@@ -170,7 +174,7 @@ suite "newForward":
 
       hostsession.teardown(hs))
 
-  test "同じ spec なら同じ id になる（決定的）":
+  test "the same spec yields the same id (deterministic)":
     withMode("ok", proc() =
       let hs = track(newHostSession("host-fwd-newforward-2"))
       let spec = ForwardSpec(kind: fkLocal, bindAddr: defaultBindAddr,
@@ -179,16 +183,16 @@ suite "newForward":
       let fwA = newForward("a", spec, hs)
       let fwB = newForward("b", spec, hs)
       check fwA.id == fwB.id
-      check refCount(hs) == 1 ## 同じ id の二重追加は hostsession 側で冪等
+      check refCount(hs) == 1 ## Adding the same id twice is idempotent on the hostsession side
 
       hostsession.teardown(hs))
 
 # ---------------------------------------------------------------------------
-# 2. attach -> プロキシ経由で疎通 -> 統計が計上される
+# 2. attach -> connectivity through the proxy -> stats are recorded
 # ---------------------------------------------------------------------------
 
-suite "attach -> 疎通 -> 統計":
-  test "fwActive になり、bindPort への接続がエコーされ bytesRx/bytesTx が増える":
+suite "attach -> connectivity -> stats":
+  test "becomes fwActive, and a connection to bindPort is echoed with bytesRx/bytesTx increasing":
     withMode("ok", proc() =
       let hs = track(newHostSession("host-fwd-active"))
       let spec = ForwardSpec(kind: fkLocal, bindAddr: defaultBindAddr,
@@ -229,11 +233,11 @@ suite "attach -> 疎通 -> 統計":
       stopAndCleanup(hs))
 
 # ---------------------------------------------------------------------------
-# 3. bind-failed: 1回だけ再試行してから fwError
+# 3. bind-failed: retries exactly once, then fwError
 # ---------------------------------------------------------------------------
 
 suite "attach: bind-failed":
-  test "1回だけ再試行し、それでも失敗すれば fwError になる（attachRetried が true）":
+  test "retries exactly once, and if it still fails becomes fwError (attachRetried is true)":
     withMode("bind-failed", proc() =
       let hs = track(newHostSession("host-fwd-bindfailed"))
       let spec = ForwardSpec(kind: fkLocal, bindAddr: defaultBindAddr,
@@ -245,17 +249,17 @@ suite "attach: bind-failed":
       tick(fw)
       check fw.state == fwError
       check fw.attachRetried
-      check fw.proxy.isNone ## ssh 側が失敗したので powarder 側リスナーは起動されない
+      check fw.proxy.isNone ## The powarder-side listener is not started because the ssh side failed
 
       forward.teardown(fw)
       stopAndCleanup(hs))
 
 # ---------------------------------------------------------------------------
-# 4. ユーザー指定ポートが既に使用中: ekPortInUse + ssh 側 forward の巻き戻し
+# 4. The user-specified port is already in use: ekPortInUse + rollback of the ssh-side forward
 # ---------------------------------------------------------------------------
 
-suite "ユーザー指定ポートが使用中":
-  test "newForwardProxy の bind 失敗で fwError + ekPortInUse になり、ssh 側が cancelForward で巻き戻される":
+suite "user-specified port already in use":
+  test "a bind failure in newForwardProxy results in fwError + ekPortInUse, and the ssh side is rolled back with cancelForward":
     withLog(proc() =
       withMode("ok", proc() =
         let hs = track(newHostSession("host-fwd-portinuse"))
@@ -279,18 +283,18 @@ suite "ユーザー指定ポートが使用中":
         check fw.proxy.isNone
 
         let logged = readFile(testLogFile)
-        check "cancel" in logged ## ssh 側の forward が巻き戻された
+        check "cancel" in logged ## The ssh-side forward was rolled back
 
         blocker.close()
         forward.teardown(fw)
         stopAndCleanup(hs)))
 
 # ---------------------------------------------------------------------------
-# 5. detach: プロキシが閉じる、cancel、UDS 残骸削除、参照カウント減少
+# 5. detach: the proxy closes, cancel, UDS leftovers removed, ref count decreases
 # ---------------------------------------------------------------------------
 
 suite "detach":
-  test "プロキシが閉じてポートに繋がらなくなり、cancel が呼ばれ、UDS が消え、参照カウントが減る":
+  test "the proxy closes so the port can no longer be reached, cancel is called, the UDS disappears, and the ref count decreases":
     withLog(proc() =
       withMode("ok", proc() =
         let hs = track(newHostSession("host-fwd-detach"))
@@ -320,9 +324,9 @@ suite "detach":
           client.close()
           await sleepAsync(30)
 
-          # ssh 側が forward を外した状態を模擬するため、フィクスチャの
-          # エコーサーバを先に片付ける（cancel の副作用確認 = probeUpstream
-          # の対象にする）。
+          # To simulate a state where the ssh side removed the forward,
+          # clean up the fixture's echo server first (this is what
+          # probeUpstream targets, to confirm the side effect of cancel).
           echo.close()
           removeFile(udsPath)
           await sleepAsync(30)
@@ -330,8 +334,9 @@ suite "detach":
           requestDetach(fw)
           check fw.state == fwDetaching
 
-          # 手順1（proxy.close）は requestDetach 内で同期的に行われるので、
-          # 新規接続は即座に拒否されるはず。
+          # Step 1 (proxy.close) happens synchronously inside
+          # requestDetach, so new connections should be rejected
+          # immediately.
           var refused = false
           try:
             discard await newTcpClient(18105)
@@ -353,11 +358,11 @@ suite "detach":
         stopAndCleanup(hs)))
 
 # ---------------------------------------------------------------------------
-# 6. ★M4 の完了条件: 1本の失敗が他の forward もマスターも巻き込まない
+# 6. IMPORTANT: M4 completion criteria: one failure must not drag down other forwards or the master
 # ---------------------------------------------------------------------------
 
-suite "M4 完了条件":
-  test "1本の forward を bind-failed で失敗させても、同じホストの他の forward もマスターも無傷":
+suite "M4 completion criteria":
+  test "failing one forward with bind-failed leaves other forwards on the same host and the master unaffected":
     withMode("ok", proc() =
       let hs = track(newHostSession("host-fwd-m4"))
 
@@ -365,16 +370,16 @@ suite "M4 完了条件":
                               bindPort: Port(18106), targetHost: "db1.internal",
                               targetPort: Port(1))
       let fw1 = newForward("m4-1", spec1, hs)
-      check waitForHostState(hs, hsConnected) ## master は ok モードで起動
+      check waitForHostState(hs, hsConnected) ## The master starts up in ok mode
 
-      # fw1 の attach だけ bind-failed モードで行わせる
+      # Make only fw1's attach happen in bind-failed mode
       putEnv("POWARDER_FAKE_SSH_MODE", "bind-failed")
       tick(fw1)
       check fw1.state == fwError
       check fw1.attachRetried
       putEnv("POWARDER_FAKE_SSH_MODE", "ok")
 
-      check isConnected(hs) ## マスターは無傷
+      check isConnected(hs) ## The master is unaffected
       check hs.state == hsConnected
 
       let spec2 = ForwardSpec(kind: fkLocal, bindAddr: defaultBindAddr,
@@ -383,18 +388,18 @@ suite "M4 完了条件":
       let fw2 = newForward("m4-2", spec2, hs)
       tick(fw2)
       check fw2.state == fwActive
-      check isConnected(hs) ## fw2 の成功後もマスターは無傷
+      check isConnected(hs) ## The master remains unaffected even after fw2 succeeds
 
       forward.teardown(fw1)
       forward.teardown(fw2)
       stopAndCleanup(hs))
 
 # ---------------------------------------------------------------------------
-# 7. feHostLost: ホストが hsConnected を離脱すると全 Forward が fwPending に戻る
+# 7. feHostLost: when the host leaves hsConnected, all Forwards return to fwPending
 # ---------------------------------------------------------------------------
 
 suite "feHostLost":
-  test "ホストが切断すると attach 済みの Forward がすべて fwPending に戻る":
+  test "when the host disconnects, all attached Forwards return to fwPending":
     withMode("ok", proc() =
       let hs = track(newHostSession("host-fwd-hostlost"))
 
@@ -426,11 +431,11 @@ suite "feHostLost":
       hostsession.teardown(hs))
 
 # ---------------------------------------------------------------------------
-# 8. Tier3 ヘルスチェック
+# 8. Tier3 health check
 # ---------------------------------------------------------------------------
 
-suite "Tier3 ヘルスチェック":
-  test "failedConns が増えると consecutiveHealthFailures が増え、degradeThreshold で fwDegraded になる":
+suite "Tier3 health check":
+  test "as failedConns increases, consecutiveHealthFailures increases, and it becomes fwDegraded at degradeThreshold":
     withMode("ok", proc() =
       let hs = track(newHostSession("host-fwd-health"))
       let spec = ForwardSpec(kind: fkLocal, bindAddr: defaultBindAddr,
@@ -444,7 +449,7 @@ suite "Tier3 ヘルスチェック":
       check fw.proxy.isSome
 
       for i in 1 .. statemachine.degradeThreshold:
-        fw.proxy.get().stats.recordFailed() ## 実トラフィックの副産物を手で模擬する
+        fw.proxy.get().stats.recordFailed() ## Manually simulate a byproduct of real traffic
         tick(fw)
         check fw.consecutiveHealthFailures == i
 
@@ -454,11 +459,11 @@ suite "Tier3 ヘルスチェック":
       stopAndCleanup(hs))
 
 # ---------------------------------------------------------------------------
-# 9. fkRemote: プロキシは起動されず、stats は none、それでも fwActive になる
+# 9. fkRemote: the proxy is not started and stats is none, yet it still becomes fwActive
 # ---------------------------------------------------------------------------
 
 suite "fkRemote":
-  test "プロキシを起動せず stats も none だが fwActive になる":
+  test "does not start a proxy and stats is none, but still becomes fwActive":
     withMode("ok", proc() =
       let hs = track(newHostSession("host-fwd-remote"))
       let spec = ForwardSpec(kind: fkRemote, bindAddr: defaultBindAddr,
@@ -477,11 +482,11 @@ suite "fkRemote":
       stopAndCleanup(hs))
 
 # ---------------------------------------------------------------------------
-# 後片付け: すべてのマスターを teardown し、ランタイム/状態ディレクトリを消す
+# Cleanup: tear down all masters and remove the runtime/state directories
 # ---------------------------------------------------------------------------
 
 for hs in allSessions:
-  hostsession.teardown(hs) ## 各テストで既に止めていれば一瞬で終わる安全網
+  hostsession.teardown(hs) ## Safety net that finishes instantly if each test already stopped it
 
 removeDir(testRuntimeDir)
 removeDir(testStateDir)
@@ -490,12 +495,16 @@ delEnv("POWARDER_FAKE_SSH_LOG")
 delEnv("POWARDER_RUNTIME_DIR")
 delEnv("POWARDER_STATE_DIR")
 
-# fake ssh のリスナー（nc / python3 / perl）は、`hostsession.teardown` が最終手段の
-# SIGKILL を送ると fake ssh 側の trap が発火しないため孤児化して残る。残ったままだと
-# 親から継承した pipe が閉じず、`nimble test` が EOF を待って**ハングする**
-# （実測: Linux コンテナで3時間ハングした）。fake ssh 側で fd を閉じる方法は
-# dash の挙動と asyncdispatch の fd 継承の2点で壊れたため、ここで確実に掃除する。
+# The fake ssh listener (nc / python3 / perl) is orphaned when
+# `hostsession.teardown`'s last resort, SIGKILL, is sent, because the fake
+# ssh side's trap does not fire. If it is left behind, the pipe inherited
+# from the parent does not close, and `nimble test` **hangs** waiting for
+# EOF (observed in practice: hung for 3 hours in a Linux container). The
+# approach of closing the fd on the fake ssh side broke due to two issues
+# -- dash's behavior and asyncdispatch's fd inheritance -- so it is
+# reliably cleaned up here instead.
 #
-# `[p]` のブラケットは `pkill` が自分自身のコマンドラインにマッチして自滅するのを
-# 防ぐための定石（実測で踏んだ。exit 144 になる）。
+# The `[p]` bracket trick is the standard way to prevent `pkill` from
+# matching its own command line and killing itself (hit this in practice;
+# it results in exit 144).
 discard execShellCmd("pkill -f '" & testRuntimeDir & "' >/dev/null 2>&1 || true")

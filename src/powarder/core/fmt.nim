@@ -1,27 +1,28 @@
-## `powarder ps` のテーブル表示用フォーマッタ。
+## Formatter for the `powarder ps` table display.
 ##
-## このモジュールは I/O を一切行わない。`std/asyncnet` / `std/osproc` / `std/os` を
-## import しない。
+## This module performs no I/O whatsoever. It does not import `std/asyncnet`,
+## `std/osproc`, or `std/os`.
 
 import std/strutils
 import std/times
 
 # ---------------------------------------------------------------------------
-# バイト数
+# Byte counts
 # ---------------------------------------------------------------------------
 
 const bytesUnits = ["B", "kB", "MB", "GB", "TB", "PB", "EB"]
 
 proc formatBytes*(n: uint64): string =
-  ## バイト数を短く整形する。1024 未満は単位なしでバイト数をそのまま出し、
-  ## それ以上は 1024 進数で単位を繰り上げつつ小数点1桁で丸める
-  ## （例: 1_234_567 -> `"1.2MB"`）。
+  ## Formats a byte count concisely. Below 1024, the raw byte count is printed
+  ## with no unit; above that, the unit is stepped up in base 1024 and rounded
+  ## to one decimal place (e.g. 1_234_567 -> `"1.2MB"`).
   ##
-  ## `std/strutils.formatSize(prefix = bpColloquial)` は小数点以下3桁固定で
-  ## 丸め幅を指定できないため自前で実装している。実測結果:
-  ## `formatSize(1_234_567, prefix = bpColloquial)` は `"1.177MB"` を返した
-  ## （1024 進数で計算されており、1000 進数を仮定した `"1.235MB"` という
-  ## ドキュメント例とは異なった）。
+  ## This is implemented by hand because
+  ## `std/strutils.formatSize(prefix = bpColloquial)` always uses 3 decimal
+  ## places and cannot be told to round to a different width. Empirically
+  ## verified: `formatSize(1_234_567, prefix = bpColloquial)` returned
+  ## `"1.177MB"` (computed in base 1024, which differs from the `"1.235MB"`
+  ## shown in its documentation example, apparently assuming base 1000).
   if n == 0:
     return "0B"
   if n < 1024'u64:
@@ -34,12 +35,12 @@ proc formatBytes*(n: uint64): string =
   formatFloat(value, ffDecimal, precision = 1) & bytesUnits[idx]
 
 # ---------------------------------------------------------------------------
-# 時間
+# Time
 # ---------------------------------------------------------------------------
 
 proc formatDuration*(d: Duration): string =
-  ## Docker 風の短い経過時間表記。上位2つの単位までを出す
-  ## （例: `"2m5s"`, `"3h12m"`, `"2d5h"`）。週は日に繰り込む。
+  ## Docker-style short elapsed-time notation. Shows at most the top two
+  ## units (e.g. `"2m5s"`, `"3h12m"`, `"2d5h"`). Weeks are folded into days.
   let parts = toParts(d)
   let days = parts[Weeks] * 7 + parts[Days]
   if days > 0:
@@ -51,8 +52,9 @@ proc formatDuration*(d: Duration): string =
   $parts[Seconds] & "s"
 
 proc formatAgo*(d: Duration): string =
-  ## 「最終通信からの経過」表示。`formatDuration` と似ているが最上位の単位
-  ## だけを出す（例: `"2s"` / `"4m"` / `"3h"` / `"2d"`）。0 は `"now"`。
+  ## Displays "time since last contact". Similar to `formatDuration` but
+  ## shows only the single largest unit (e.g. `"2s"` / `"4m"` / `"3h"` /
+  ## `"2d"`). Zero is shown as `"now"`.
   let parts = toParts(d)
   let days = parts[Weeks] * 7 + parts[Days]
   if days > 0:
@@ -66,13 +68,15 @@ proc formatAgo*(d: Duration): string =
   "now"
 
 # ---------------------------------------------------------------------------
-# テーブル整形
+# Table formatting
 # ---------------------------------------------------------------------------
 
 proc alignTable*(rows: seq[seq[string]]): seq[string] =
-  ## `ps` のテーブル整形。各列の最大幅に合わせて左詰めし、列間は2スペース。
-  ## 行末の余白は trim する。1行目をヘッダとして特別扱いはしない（呼び出し
-  ## 側が渡す）。列数が行によって違う場合は短い行を空文字列で埋める。
+  ## Formats the `ps` table. Each column is left-aligned to its widest cell,
+  ## with 2 spaces between columns. Trailing whitespace on each line is
+  ## trimmed. The first row is not treated specially as a header (that's the
+  ## caller's job). If rows have differing column counts, short rows are
+  ## padded with empty strings.
   if rows.len == 0:
     return @[]
 

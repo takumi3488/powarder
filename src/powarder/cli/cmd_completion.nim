@@ -1,15 +1,18 @@
-## シェル補完スクリプトの生成。
+## Generation of shell completion scripts.
 ##
-## macOS がメインターゲットなので zsh を最優先で作り込み、bash / fish は
-## サブコマンド名の補完だけができる簡易版にとどめる。
+## Since macOS is the primary target, zsh gets full, first-class support,
+## while bash / fish are kept to a simple version that only completes
+## subcommand names.
 ##
-## トンネル名の動的補完（`powarder start <TAB>` 等）は `powarder ps -q` を
-## 呼び出す形で書けるが、**デーモンが起動していないと失敗する**。補完スクリプト
-## 自体が壊れて他の補完まで巻き添えにしないよう、失敗は `2>/dev/null` で
-## 握りつぶし、結果が空でも単に候補が出ないだけにする。
+## Dynamic completion of tunnel names (e.g. `powarder start <TAB>`) can be
+## written by calling `powarder ps -q`, but **this fails if the daemon isn't
+## running**. To avoid a broken completion script taking down other completions
+## with it, failures are swallowed with `2>/dev/null`; an empty result simply
+## means no candidates are shown.
 ##
-## このモジュールは静的な文字列を返すだけで、自分ではファイルに書き込んだり
-## シェルを呼び出したりしない（`echo` するのは呼び出し側の `cli/dispatch.nim`）。
+## This module only returns static strings; it doesn't write to files or
+## invoke a shell itself (`echo`-ing the result is the caller's job, in
+## `cli/dispatch.nim`).
 
 const
   zshScript = """#compdef powarder
@@ -124,8 +127,8 @@ complete -c powarder -f -n '__fish_seen_subcommand_from completion' -a 'zsh bash
 """
 
 proc completionScript*(shell: string): string =
-  ## `shell`（"zsh" / "bash" / "fish"）向けの補完スクリプトを返す。
-  ## 未知のシェルは `ValueError` を投げる。
+  ## Returns the completion script for `shell` ("zsh" / "bash" / "fish").
+  ## Raises `ValueError` for an unknown shell.
   case shell
   of "zsh": zshScript
   of "bash": bashScript

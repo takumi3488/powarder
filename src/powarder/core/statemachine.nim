@@ -1,58 +1,62 @@
-## HostSession / Forward の状態遷移とバックオフ計算を扱う純粋ロジック層。
+## The pure logic layer handling HostSession / Forward state transitions and
+## backoff calculation.
 ##
-## このモジュールは「この状態でこのイベントが起きたら次はどの状態か」を
-## 返す関数の集まりであり、実際の状態の保持・ssh プロセスの起動や停止・
-## タイマーの管理は daemon 層の責務。`std/asyncnet` / `std/osproc` /
-## `std/os` は import しない。
+## This module is a collection of functions that answer "given this state and
+## this event, what's the next state?" Actually holding the state, starting
+## or stopping the ssh process, and managing timers are the daemon layer's
+## responsibility. It does not import `std/asyncnet` / `std/osproc` /
+## `std/os`.
 
 import std/options
 
 import powarder/core/types
 
 # ---------------------------------------------------------------------------
-# バックオフ
+# Backoff
 # ---------------------------------------------------------------------------
 
 proc nextBackoff*(current: float; maxSeconds = defaultBackoffMaxSeconds): float =
-  ## バックオフ秒数を次の値へ進める。`1 → 2 → 4 → 8 → 16 → 30(上限)` と
-  ## 倍々に増え、`maxSeconds` で頭打ちになる。
-  ## `current` が 0 以下（未設定/初期値）のときは 1 を返す。
+  ## Advances the backoff seconds to the next value. It doubles as
+  ## `1 -> 2 -> 4 -> 8 -> 16 -> 30 (cap)`, capping out at `maxSeconds`.
+  ## Returns 1 when `current` is 0 or less (unset/initial value).
   if current <= 0.0:
     1.0
   else:
     min(current * 2.0, maxSeconds)
 
 proc shouldGiveUp*(consecutiveFailures: int; policy: RetryPolicy): bool =
-  ## `policy.maxConsecutiveFailures == 0` なら常に false（既定は無限リトライ。
-  ## ノート PC のスリープ復帰や VPN の瞬断で `hsFailed` に落ちて手動介入が
-  ## 必要になる事態を避けるため）。
-  ## `> 0` の場合は `consecutiveFailures >= maxConsecutiveFailures` で true。
+  ## Always false if `policy.maxConsecutiveFailures == 0` (the default is
+  ## infinite retry, to avoid falling into `hsFailed` and needing manual
+  ## intervention over a laptop waking from sleep or a brief VPN blip).
+  ## If `> 0`, true when `consecutiveFailures >= maxConsecutiveFailures`.
   if policy.maxConsecutiveFailures == 0:
     false
   else:
     consecutiveFailures >= policy.maxConsecutiveFailures
 
 # ---------------------------------------------------------------------------
-# HostSession の遷移
+# HostSession transitions
 # ---------------------------------------------------------------------------
 
 type
   HostEvent* = enum
-    hePreparedToConnect ## 参照カウントが 0→1 になった / 再接続の backoff が明けた
-    heCheckSucceeded   ## `-O check` が Master running を返した
-    heMasterDied       ## `peekExitCode` で終了を検知、または `-O check` が失敗
-    heReadinessTimeout ## 制御ソケットが出現しないまま上限時間が経過
-    heIdleGraceExpired ## 参照カウント 0 のまま猶予時間が経過
-    heStopRequested    ## `down` / 明示停止
-    heProcessReaped    ## 停止処理後にプロセス終了を確認
-    heRetryLimitReached ## リトライ上限に達した（`shouldGiveUp` が true）
-    heRestartRequested ## `hsFailed` からの復帰。カウンタをリセットする
+    hePreparedToConnect ## refcount went 0 -> 1 / reconnect backoff elapsed
+    heCheckSucceeded    ## `-O check` returned Master running
+    heMasterDied        ## exit detected via `peekExitCode`, or `-O check` failed
+    heReadinessTimeout  ## control socket never appeared before the time limit
+    heIdleGraceExpired  ## grace period elapsed while refcount stayed 0
+    heStopRequested     ## `down` / explicit stop
+    heProcessReaped     ## process exit confirmed after stop processing
+    heRetryLimitReached ## retry limit reached (`shouldGiveUp` is true)
+    heRestartRequested  ## recovery from `hsFailed`. Resets the counter
 
-## HostSession の遷移表
+## HostSession transition table
 ## ==========================
 ##
-## 表の見方: 行 = 現在の状態、列 = イベント。`-` は不正な遷移で `none` を返す。
-## `(self)` は同じ状態にとどまる自己ループ（idempotent な正常系）。
+## How to read the table: row = current state, column = event. `-` is an
+## invalid transition that returns `none`.
+## `(self)` is a self-loop that stays in the same state (an idempotent normal
+## path).
 ##
 ## ```
 ## state \ event      | hePrepared | heCheckOK | heMasterDied | heReadyTO | heIdleGrace | heStopReq   | heProcReaped | heRetryLimit | heRestartReq
@@ -66,16 +70,20 @@ type
 ## hsFailed           | -          | -         | -            | -         | -           | Stopped     | -            | -            | Connecting
 ## ```
 ##
-## 設計メモ:
-## - `hsConnected` で `heCheckSucceeded` を受けても状態は変わらない
-##   （定期ヘルスチェックが「まだ生きている」ことを確認しただけの正常系）。
-## - `heMasterDied` によって配下の全 `Forward` を `fwPending` に戻す処理は
-##   daemon 層の責務（`ForwardState.feHostLost` を各 Forward に配ること）。
-## - `hsReconnecting` / `hsStopped` / `hsFailed` はいずれも実行中の ssh
-##   プロセスを持たない（backoff 待ち、既に停止済み、既に失敗済み）ため、
-##   `heStopRequested` は `hsStopping` を経由せず直接 `hsStopped` に落ちる。
-## - `hsStopping` / `hsStopped` で `heStopRequested` を重ねて受けても
-##   エラーにはせず自己ループする（多重の停止要求を許容する）。
+## Design notes:
+## - `hsConnected` stays in the same state when it receives
+##   `heCheckSucceeded` (this is just the normal path where a periodic health
+##   check confirmed "still alive").
+## - Resetting all `Forward`s under this host to `fwPending` when
+##   `heMasterDied` fires is the daemon layer's responsibility (distributing
+##   `ForwardState.feHostLost` to each Forward).
+## - `hsReconnecting` / `hsStopped` / `hsFailed` all have no running ssh
+##   process (waiting on backoff, already stopped, already failed), so
+##   `heStopRequested` falls straight through to `hsStopped` without going
+##   through `hsStopping`.
+## - Receiving `heStopRequested` repeatedly while in `hsStopping` /
+##   `hsStopped` does not error; it self-loops (multiple stop requests are
+##   tolerated).
 proc nextHostState*(state: HostSessionState; event: HostEvent):
     Option[HostSessionState] =
   case state
@@ -118,28 +126,28 @@ proc nextHostState*(state: HostSessionState; event: HostEvent):
     else: none(HostSessionState)
 
 # ---------------------------------------------------------------------------
-# Forward の遷移
+# Forward transitions
 # ---------------------------------------------------------------------------
 
 type
   ForwardEvent* = enum
-    feHostConnected     ## 所属ホストが `hsConnected` になった
-    feAttachStarted     ## `-O forward` 実行中
-    feAttachSucceeded   ## `-O forward` が成功した
-    feAttachBindFailed  ## `Port forwarding failed`（UDS の残骸が原因）
-    feAttachFailedOther ## bind 失敗以外の理由で attach が失敗した
-    feHealthFailed      ## ヘルスチェックが失敗した
-    feHealthRecovered   ## ヘルスチェックが回復した
-    feHostLost          ## 所属ホストが `hsConnected` を離脱した
-    feDetachRequested   ## 明示的な detach 要求
-    feDetachConfirmed   ## `-O cancel` 後にプロセス側の解除を確認した
-    feDegradeLimitReached ## 劣化が続き強制 re-attach の閾値に達した
+    feHostConnected     ## the owning host became `hsConnected`
+    feAttachStarted     ## `-O forward` in progress
+    feAttachSucceeded   ## `-O forward` succeeded
+    feAttachBindFailed  ## `Port forwarding failed` (caused by a leftover UDS)
+    feAttachFailedOther ## attach failed for a reason other than bind failure
+    feHealthFailed      ## health check failed
+    feHealthRecovered   ## health check recovered
+    feHostLost          ## the owning host left `hsConnected`
+    feDetachRequested   ## an explicit detach request
+    feDetachConfirmed   ## confirmed the process-side release after `-O cancel`
+    feDegradeLimitReached ## sustained degradation reached the forced re-attach threshold
 
-## Forward の遷移表
+## Forward transition table
 ## ==========================
 ##
-## `feHostLost` と `feDetachRequested` は **任意の状態から** 有効
-## （テーブルの他のセルより優先して先に適用される）。
+## `feHostLost` and `feDetachRequested` are valid from **any state** (applied
+## before, and with priority over, the table's other cells).
 ##
 ## ```
 ## state \ event  | feHostConn | feAttachSt | feAttachOK | feBindFail | feOtherFail | feHealthNG | feHealthOK | feHostLost | feDetachReq | feDetachOK | feDegradeLim
@@ -151,27 +159,29 @@ type
 ## fwDetaching    | -          | -          | -          | -          | -           | -          | -          | Pending*   | (self)*     | (discard)  | -
 ## fwError        | -          | -          | -          | -          | -           | -          | -          | Pending*   | Detaching*  | -          | -
 ## ```
-## （`*` は「任意の状態から」ルールにより到達する遷移）
+## (`*` marks transitions reached via the "from any state" rule)
 ##
-## 設計メモ:
-## - `feHealthFailed` / `feHealthRecovered` は「1回のイベントだけでは
-##   `degradeThreshold` / `reattachThreshold` を跨げない」ので自己ループを
-##   返す。実際の閾値判定は `healthVerdict` を使うこと
-##   （daemon 層のヘルスチェックループは `nextForwardState` ではなく
-##   `healthVerdict` を主に使う想定）。ただし `fwDegraded` の
-##   `feHealthRecovered` だけは参考設計どおり単発で `fwActive` に戻す。
-## - `feAttachBindFailed` は「unlink して1回だけ再試行する」設計だが、
-##   その再試行回数のカウントは daemon 層の責務。2回目以降の bind 失敗は
-##   `feAttachBindFailed` ではなく `feAttachFailedOther` を渡して
-##   `fwError` に落とすこと。
-## - `ForwardState` には「破棄済み」に対応する値がないため、
-##   `fwDetaching` が `feDetachConfirmed` を受けたケースは `none` を返す。
-##   これは「不正な遷移」の `none` と区別する必要があるため、
-##   `isDiscard` で判定できるようにしている。
-## - `fwDetaching` 中に `feHostLost` を受けても素直に `fwPending` に戻す
-##   （参考設計の「任意」を素直に適用）。daemon 層は `feDetachRequested`
-##   を出した時点で対象を管理対象から外す実装にすれば、この事象は
-##   実質発生しない想定。
+## Design notes:
+## - `feHealthFailed` / `feHealthRecovered` self-loop, since "a single event
+##   alone cannot cross the `degradeThreshold` / `reattachThreshold`". Use
+##   `healthVerdict` for the actual threshold judgment (the daemon layer's
+##   health-check loop is expected to mainly use `healthVerdict` rather than
+##   `nextForwardState`). The one exception is `fwDegraded`'s
+##   `feHealthRecovered`, which, per the reference design, does revert to
+##   `fwActive` on a single event.
+## - `feAttachBindFailed` is designed to "unlink and retry exactly once", but
+##   counting that retry is the daemon layer's responsibility. A second or
+##   later bind failure must be passed as `feAttachFailedOther` rather than
+##   `feAttachBindFailed`, dropping it into `fwError`.
+## - Since `ForwardState` has no value corresponding to "discarded", the case
+##   where `fwDetaching` receives `feDetachConfirmed` returns `none`. This
+##   needs to be distinguished from the `none` of an "invalid transition",
+##   which is why `isDiscard` is provided for that judgment.
+## - Receiving `feHostLost` while in `fwDetaching` still reverts plainly to
+##   `fwPending` (faithfully applying the reference design's "any state"
+##   rule). If the daemon layer is implemented to remove the target from
+##   management the moment it issues `feDetachRequested`, this case is
+##   expected to essentially never occur.
 proc nextForwardState*(state: ForwardState; event: ForwardEvent):
     Option[ForwardState] =
   if event == feHostLost:
@@ -207,36 +217,38 @@ proc nextForwardState*(state: ForwardState; event: ForwardEvent):
     none(ForwardState)
 
 proc isDiscard*(state: ForwardState; event: ForwardEvent): bool =
-  ## `nextForwardState` が `none` を返したとき、それが「不正な遷移」ではなく
-  ## 「`fwDetaching` が `feDetachConfirmed` を受けて正常に破棄される」
-  ## ケースなのかを区別するためのヘルパ。呼び出し側はまずこれを見て、
-  ## true なら Forward レコード自体を破棄し、false なら不正遷移として
-  ## ログに残すとよい。
+  ## A helper to distinguish, when `nextForwardState` returns `none`, whether
+  ## that is an "invalid transition" or the case of "`fwDetaching` receiving
+  ## `feDetachConfirmed` and being normally discarded". The caller should
+  ## check this first: if true, discard the Forward record itself; if false,
+  ## leave it in the log as an invalid transition.
   state == fwDetaching and event == feDetachConfirmed
 
 # ---------------------------------------------------------------------------
-# ヘルスチェックの閾値判定
+# Health-check threshold judgment
 # ---------------------------------------------------------------------------
 
 const
   degradeThreshold* = 3
-    ## 連続失敗 3 回で `fwActive` -> `fwDegraded`
+    ## 3 consecutive failures moves `fwActive` -> `fwDegraded`
   reattachThreshold* = 9
-    ## さらに続いたら強制 re-attach（`degradeThreshold` の 3 倍）
+    ## further continued failures force a re-attach (3x `degradeThreshold`)
 
 proc healthVerdict*(consecutiveFailures: int;
     current: ForwardState): ForwardState =
-  ## ヘルスチェックの連続失敗回数 `consecutiveFailures` から、
-  ## `fwActive` / `fwDegraded` 間の遷移、および強制 re-attach
-  ## （`fwPending` へのフォールバック）を一括で判定する。
+  ## From the health check's consecutive failure count
+  ## `consecutiveFailures`, judges in one pass the transition between
+  ## `fwActive` / `fwDegraded`, as well as the forced re-attach (falling back
+  ## to `fwPending`).
   ##
-  ## - `consecutiveFailures == 0`: 健全 -> `fwActive`
-  ## - `degradeThreshold` 回以上: 劣化 -> `fwDegraded`
-  ## - `reattachThreshold` 回以上: 強制 re-attach -> `fwPending`
+  ## - `consecutiveFailures == 0`: healthy -> `fwActive`
+  ## - `degradeThreshold` or more: degraded -> `fwDegraded`
+  ## - `reattachThreshold` or more: forced re-attach -> `fwPending`
   ##
-  ## `current` が `fwActive` / `fwDegraded` 以外
-  ## （`fwPending` / `fwAttaching` / `fwDetaching` / `fwError`）の場合は
-  ## ヘルスチェックの対象外の状態なので、`current` をそのまま返す（no-op）。
+  ## If `current` is something other than `fwActive` / `fwDegraded` (i.e.
+  ## `fwPending` / `fwAttaching` / `fwDetaching` / `fwError`), it's a state
+  ## outside the scope of health checking, so `current` is returned as-is
+  ## (no-op).
   if current != fwActive and current != fwDegraded:
     return current
   if consecutiveFailures >= reattachThreshold:

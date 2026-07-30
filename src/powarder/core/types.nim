@@ -1,8 +1,9 @@
-## powarder の全レイヤで共有する型定義。
+## Type definitions shared across every layer of powarder.
 ##
-## このモジュールは I/O を一切行わない。`std/asyncnet` / `std/osproc` / `std/os` を
-## import しないことで、依存するロジックを副作用なしに単体テストできる状態を保つ
-## （`std/json` は純粋なデータ変換なのでこの方針に反しない）。
+## This module performs no I/O. By not importing `std/asyncnet` /
+## `std/osproc` / `std/os`, it keeps the logic that depends on it unit-testable
+## without side effects (`std/json` is pure data conversion, so it doesn't
+## violate this policy).
 
 import std/nativesockets
 import std/json
@@ -10,41 +11,43 @@ import std/json
 export Port
 
 proc `%`*(p: Port): JsonNode =
-  ## `Port` は `distinct uint16` で、`std/json` は `distinct` 型向けの汎用 `%` を
-  ## 持たない。これが無いと `ForwardSpec` のように `Port` を含むあらゆる型の
-  ## `%` / `%*` がコンパイルエラーになる。
+  ## `Port` is a `distinct uint16`, and `std/json` has no generic `%` for
+  ## `distinct` types. Without this, `%` / `%*` for any type containing
+  ## `Port`, such as `ForwardSpec`, fails to compile.
   ##
-  ## **ここ（共有型の定義と同じ場所）に置くのが重要。** 以前は `ipc/protocol.nim` に
-  ## 置いていたが、そうすると「JSON 化したいだけのモジュール」（例:
-  ## `config/statefile.nim`）が `ipc/protocol` を import する必要が生じ、
-  ## しかもこのオーバーロードは generic dispatch 経由でしか使われないため
-  ## コンパイラが `imported and not used` と誤検知する（外すと実際には
-  ## コンパイルエラーになるので、警告に従って外すと壊れるという厄介な状態だった）。
-  ## 型と一緒に置けばその不整合が起きない。
+  ## **Placing this here (alongside the shared type definitions) matters.**
+  ## It used to live in `ipc/protocol.nim`, but that forced any module that
+  ## just wants JSON conversion (e.g. `config/statefile.nim`) to import
+  ## `ipc/protocol`, and since this overload is only ever invoked via generic
+  ## dispatch, the compiler falsely flagged it as `imported and not used`
+  ## (removing it in response to the warning actually broke the build, which
+  ## made for an awkward situation). Placing it together with the type avoids
+  ## that inconsistency.
   ##
-  ## デコード方向は手当てが要らない（`std/json` の `initFromJson[T: distinct]` が
-  ## `distinct` 型を自動的に処理するので `to()` はそのまま動く。実測確認済み）。
+  ## The decode direction needs no extra handling (`std/json`'s
+  ## `initFromJson[T: distinct]` automatically handles `distinct` types, so
+  ## `to()` just works — empirically confirmed).
   % p.uint16.int
 
 type
-  ForwardKind* = enum ## ssh の -L / -R に対応する
-    fkLocal = "L" ## powarder がローカルで listen し、ssh には UDS を張らせる
-    fkRemote = "R" ## リモート側が listen する。powarder はデータパスに介在しない
+  ForwardKind* = enum ## corresponds to ssh's -L / -R
+    fkLocal = "L"     ## powarder listens locally, and has ssh set up a UDS
+    fkRemote = "R"    ## the remote side listens. powarder does not sit in the data path
 
   ForwardSpec* = object
     kind*: ForwardKind
-    bindAddr*: string ## fkLocal: powarder が bind する / fkRemote: リモート側が bind する
+    bindAddr*: string ## fkLocal: powarder binds this / fkRemote: the remote side binds this
     bindPort*: Port
     targetHost*: string
     targetPort*: Port
 
   RetryPolicy* = object
-    maxConsecutiveFailures*: int ## 0 なら無制限にリトライする（既定）
+    maxConsecutiveFailures*: int ## 0 means retry without limit (default)
     backoffMaxSeconds*: float
 
   TunnelConfig* = object
     name*: string
-    host*: string ## ~/.ssh/config の Host エイリアス。接続経路・認証は ssh_config 側の責務
+    host*: string ## Host alias from ~/.ssh/config. Connection route and authentication are ssh_config's responsibility
     spec*: ForwardSpec
     autostart*: bool
     profile*: string
@@ -52,26 +55,27 @@ type
     retry*: RetryPolicy
 
   HostSessionKey* = object
-    ## マスター接続の同一性。`host` 名ではなく `ssh -G` の解決結果から導出した
-    ## fingerprint を含めることで、「host の変更」と「sshExtraArgs の変更」が
-    ## どちらも単なる Add/Remove に落ちる。
-    host*: string ## 表示用
-    fingerprint*: string ## sshgparse.fingerprint() の結果
+    ## The master connection's identity. Including a fingerprint derived from
+    ## `ssh -G`'s resolved result, rather than the `host` name itself, means
+    ## both "a change of host" and "a change of sshExtraArgs" reduce to a
+    ## plain Add/Remove.
+    host*: string ## for display purposes
+    fingerprint*: string ## the result of sshgparse.fingerprint()
 
   HostSessionState* = enum
     hsIdle, hsConnecting, hsConnected, hsReconnecting, hsStopping, hsStopped, hsFailed
 
   ForwardState* = enum
-    fwPending,   ## マスター未接続、または attach 待ち
-    fwAttaching, ## -O forward 実行中
-    fwActive,    ## 張れている
-    fwDegraded,  ## ヘルスチェックが連続失敗している（attach 自体は維持）
-    fwDetaching, ## -O cancel 実行中
-    fwError      ## 自動再試行を止めた状態
+    fwPending,   ## master not connected yet, or waiting to attach
+    fwAttaching, ## -O forward in progress
+    fwActive,    ## attached and up
+    fwDegraded,  ## health check has been failing consecutively (attach itself is still held)
+    fwDetaching, ## -O cancel in progress
+    fwError      ## automatic retry has stopped
 
   UpstreamKind* = enum
-    ukUnix, ## ssh に UDS を張らせる（既定）
-    ukTcp   ## UDS が使えない環境向けのフォールバック
+    ukUnix, ## has ssh set up a UDS (default)
+    ukTcp   ## fallback for environments where UDS is unusable
 
   UpstreamTarget* = object
     case kind*: UpstreamKind
@@ -82,11 +86,12 @@ type
 
 const
   defaultBindAddr* = "127.0.0.1"
-    ## bind_address 省略時の既定。OpenSSH の -L / -R の挙動（GatewayPorts no）と一致させ、
-    ## 「powarder が ssh より緩い」という事故を構造的に防ぐ。
+    ## The default when bind_address is omitted. Matched to OpenSSH's -L / -R
+    ## behavior (GatewayPorts no), structurally preventing the accident of
+    ## "powarder being more permissive than ssh".
 
   defaultBackoffMaxSeconds* = 30.0
-  defaultMaxConns* = 100 ## 1 フォワードあたりの同時接続数上限
+  defaultMaxConns* = 100 ## Upper limit on concurrent connections per forward
 
 func initRetryPolicy*(maxConsecutiveFailures = 0;
                       backoffMaxSeconds = defaultBackoffMaxSeconds): RetryPolicy =
@@ -97,14 +102,15 @@ func isLocal*(spec: ForwardSpec): bool {.inline.} = spec.kind == fkLocal
 func isRemote*(spec: ForwardSpec): bool {.inline.} = spec.kind == fkRemote
 
 func exposesExternally*(spec: ForwardSpec): bool =
-  ## リスナーがループバック以外にバインドされ、外部から到達可能になるか。
-  ## true のときは警告を出す。
+  ## Whether the listener is bound to something other than loopback, making
+  ## it reachable from outside. A warning is emitted when true.
   spec.bindAddr notin ["127.0.0.1", "localhost", "::1", "[::1]"]
 
 func `==`*(a, b: UpstreamTarget): bool =
-  ## `UpstreamTarget` は case を含む variant object で、コンパイラが自動生成する `==` は
-  ## variant object に対応していない
-  ## （"parallel 'fields' iterator does not work for 'case' objects"）ため手書きする。
+  ## `UpstreamTarget` is a variant object containing a case, and the compiler's
+  ## auto-generated `==` does not support variant objects
+  ## (`"parallel 'fields' iterator does not work for 'case' objects"`), so
+  ## this is written by hand.
   if a.kind != b.kind: return false
   case a.kind
   of ukUnix: a.path == b.path

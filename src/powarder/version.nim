@@ -1,12 +1,14 @@
-## powarder のバージョン。
+## powarder's version.
 ##
-## CLI（`cli/dispatch`）・デーモン（`daemon/run`）・エントリポイント（`powarder.nim`）の
-## 3箇所が独立に文字列リテラルを持つと必ずずれるので、ここを唯一の定義とする。
+## If the CLI (`cli/dispatch`), the daemon (`daemon/run`), and the entry point
+## (`powarder.nim`) each kept their own independent string literal, they would
+## inevitably drift out of sync, so this is the single source of truth.
 ##
-## nimble は `-d:NimblePkgVersion=<version>` を渡してビルドするので、
-## `{.strdefine.}` でそれを受け取る。つまり **`powarder.nimble` の `version` が
-## 真の唯一の情報源**になり、Nim 側にバージョンを書く必要が無い。
-## `nimble` を介さない素の `nim c` では下のフォールバック値が使われる。
+## nimble builds by passing `-d:NimblePkgVersion=<version>`, which we receive
+## here via `{.strdefine.}`. That means **`version` in `powarder.nimble` is the
+## true single source of truth**, and there's no need to write the version
+## anywhere in Nim. A plain `nim c` that bypasses `nimble` uses the fallback
+## value below.
 
 const NimblePkgVersion {.strdefine.} = "0.1.0"
 

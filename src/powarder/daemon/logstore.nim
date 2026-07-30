@@ -1,39 +1,45 @@
-## トンネルログのローテーション（M6）。
+## Log rotation for tunnel logs (M6).
 ##
-## ★最重要の罠: ssh マスターは `/bin/sh -c 'exec ssh ... >>logPath 2>&1'`
-## （`daemon/muxclient.masterCommandLine` を参照）で起動され、**シェルが
-## `>>`（`O_APPEND`）で開いた fd を持ち続ける**。fd は inode を指すので、
-## **ログファイルをリネームしても ssh は古い inode に書き続け、新しい
-## `logPath` には誰も書かない。**
+## IMPORTANT: the most critical trap: the ssh master is started via
+## `/bin/sh -c 'exec ssh ... >>logPath 2>&1'` (see
+## `daemon/muxclient.masterCommandLine`), and **the shell keeps holding the
+## fd it opened with `>>` (`O_APPEND`)**. Since an fd points to an inode,
+## **even if the log file is renamed, ssh keeps writing to the old inode,
+## and nobody writes to the new `logPath`.**
 ##
-## したがって `logrotate` の `copytruncate` 方式を採る:
-## 1. 世代をずらす（`.2` -> `.3`、`.1` -> `.2`）
-## 2. **現在のログを `.1` に「コピー」する**（リネームではない）
-## 3. **現在のログを `open(path, fmWrite)` して即座に閉じ、`O_TRUNC` で
-##    0 バイトにする**（同じ inode を開き直して truncate するだけで、
-##    inode 自体を作り直すわけではない）
+## Therefore we adopt `logrotate`'s `copytruncate` scheme:
+## 1. shift the generations (`.2` -> `.3`, `.1` -> `.2`)
+## 2. **"copy" the current log to `.1`** (not a rename)
+## 3. **open the current log with `open(path, fmWrite)`, close it
+##    immediately, and truncate it to 0 bytes via `O_TRUNC`** (this just
+##    reopens the same inode and truncates it; it does not recreate the
+##    inode itself)
 ##
-## ssh の fd は同じ inode を指し続け `O_APPEND` なので、次の write は
-## （truncate 後の）末尾 = 0 バイト目から書かれる。**将来「コピーは無駄
-## だからリネームにしよう」と変更すると、ssh が古い（もう誰も見ない）
-## `.1` に書き続けるようになり、「ローテート後にログが一切増えない」
-## という気付きにくいバグになる。変更しないこと。**
+## Since ssh's fd keeps pointing at the same inode and is `O_APPEND`, the
+## next write lands at the end (= byte 0, after the truncate). **If this
+## is ever changed in the future to "let's rename instead of copy, since
+## copying is wasteful", ssh will keep writing to the old (now unwatched)
+## `.1`, turning into a hard-to-notice bug where "the log never grows
+## again after rotation." Do not change this.**
 
 import std/os
 
 const
   maxLogBytes* = 5 * 1024 * 1024 ## 5MB
-  maxLogGenerations* = 3         ## `.1` `.2` `.3` の3世代を保持
+  maxLogGenerations* = 3         ## keep 3 generations: `.1` `.2` `.3`
 
 proc shiftGenerations(path: string; generations: int) =
-  ## `.{generations-1}` -> `.{generations}` 、... 、`.1` -> `.2` の順に
-  ## リネームで世代をずらす。**降順（大きい世代番号から）に処理しないと、
-  ## 上書きの順序を誤って複数世代が同じ内容に潰れてしまう**（`.1` を先に
-  ## `.2` へ動かすと、後で処理するはずだった元の `.2` の内容を見失う）。
+  ## Shifts generations by renaming, in the order `.{generations-1}` ->
+  ## `.{generations}`, ..., `.1` -> `.2`. **If this is not processed in
+  ## descending order (starting from the largest generation number), the
+  ## overwrite order gets mixed up and multiple generations collapse into
+  ## the same content** (moving `.1` to `.2` first loses the original
+  ## `.2` content that was supposed to be processed afterward).
   ##
-  ## 最古の世代（`.generations`）が既に存在する場合は `moveFile` の
-  ## rename が上書きして自然に破棄される（POSIX の `rename(2)` は宛先が
-  ## 既存でも上書きするため。念のため `removeFile` で先に外しておく）。
+  ## If the oldest generation (`.generations`) already exists, `moveFile`'s
+  ## rename overwrites it and it is naturally discarded (POSIX's
+  ## `rename(2)` overwrites the destination even if it already exists.
+  ## Just in case, we remove it beforehand with `removeFile`).
   for gen in countdown(generations, 2):
     let src = path & "." & $(gen - 1)
     let dst = path & "." & $gen
@@ -43,8 +49,9 @@ proc shiftGenerations(path: string; generations: int) =
 
 proc rotateIfNeeded*(path: string; maxBytes = maxLogBytes;
     generations = maxLogGenerations): bool =
-  ## `path` のサイズが `maxBytes` を超えていればローテートして `true` を
-  ## 返す。ファイルが無い、またはサイズが上限以下なら何もせず `false`。
+  ## If `path`'s size exceeds `maxBytes`, rotates it and returns `true`.
+  ## If the file doesn't exist, or its size is at or below the limit,
+  ## does nothing and returns `false`.
   if not fileExists(path):
     return false
   let size =
@@ -55,16 +62,18 @@ proc rotateIfNeeded*(path: string; maxBytes = maxLogBytes;
 
   shiftGenerations(path, generations)
 
-  # ★ copytruncate の核心: リネームではなくコピーする（モジュール doc
-  # comment を参照）。
-  removeFile(path & ".1") ## generations == 1 のときは shiftGenerations が
-                          ## `.1` をどかさないので、上書き前に明示的に外す
-                          ## （`copyFile` 自体も上書きするが、意図を明確にする）。
+  # IMPORTANT: the core of copytruncate: copy, not rename (see the module
+  # doc comment).
+  removeFile(path & ".1") ## When generations == 1, shiftGenerations does
+                          ## not move `.1` out of the way, so we explicitly
+                          ## remove it before overwriting (`copyFile` itself
+                          ## also overwrites, but this makes the intent
+                          ## explicit).
   copyFile(path, path & ".1")
 
-  # 同じ inode を開き直して `O_TRUNC` で 0 バイトにする（`fmWrite` は
-  # 既存ファイルを truncate して開く。ファイルを作り直すわけではないので
-  # inode は変わらない）。
+  # Reopen the same inode and truncate it to 0 bytes via `O_TRUNC`
+  # (`fmWrite` opens an existing file by truncating it. It does not
+  # recreate the file, so the inode does not change).
   var f: File
   if open(f, path, fmWrite):
     f.close()
@@ -73,9 +82,10 @@ proc rotateIfNeeded*(path: string; maxBytes = maxLogBytes;
 
 proc rotateAll*(dir: string; maxBytes = maxLogBytes;
     generations = maxLogGenerations): int =
-  ## `dir` 直下の `*.log` を全部チェックし、ローテートした件数を返す。
-  ## 既にローテート済みの世代ファイル（`*.log.1` 等）は `*.log` の glob に
-  ## マッチしないので対象にならない。
+  ## Checks every `*.log` directly under `dir` and returns the count of
+  ## files that were rotated. Generation files that have already been
+  ## rotated (e.g. `*.log.1`) do not match the `*.log` glob, so they are
+  ## not targeted.
   result = 0
   if not dirExists(dir):
     return 0

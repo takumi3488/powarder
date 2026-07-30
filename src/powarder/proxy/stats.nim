@@ -1,10 +1,12 @@
-## フォワード1本あたりの接続統計。生の数値と時刻だけを保持し、表示用の整形は
-## 行わない（`core/fmt.nim` の担当）。
+## Connection statistics for a single forward. Holds only raw numbers and
+## timestamps; formatting for display is not done here (that is
+## `core/fmt.nim`'s responsibility).
 ##
-## `asyncdispatch` は単一スレッドの協調的マルチタスクなので、複数の接続ハンドラが
-## 同じ `ForwardStats` の整数フィールドを更新してもデータ競合は起きない
-## （`--threads:on` のスレッドプールは使わない前提。更新は常に await の間の
-## 同期区間で行われ、割り込まれることがない）。
+## Since `asyncdispatch` is single-threaded cooperative multitasking, no
+## data race occurs even when multiple connection handlers update the
+## integer fields of the same `ForwardStats` (this assumes the
+## `--threads:on` thread pool is not used. Updates always happen within a
+## synchronous section between awaits and are never interrupted).
 
 import std/deques
 import std/monotimes
@@ -12,25 +14,26 @@ import std/times
 import powarder/core/types
 
 const
-  maxRecentSources* = 5 ## `recentSources` に保持する直近の接続元の件数
+  maxRecentSources* = 5 ## Number of recent connection sources kept in `recentSources`
 
 type
   SourceEntry* = object
     address*: string
     port*: Port
-    at*: Time ## 表示用（壁時計）
+    at*: Time ## For display (wall clock)
 
   ForwardStats* = ref object
     activeConns*, totalConns*, rejectedConns*, failedConns*: int
     bytesRx*, bytesTx*: uint64
-    lastActivityMono*: MonoTime        ## アイドル判定・経過時間計算用
-    lastActivityWall*: Time            ## 表示用
+    lastActivityMono*: MonoTime ## For idle detection / elapsed-time computation
+    lastActivityWall*: Time     ## For display
     startedAtMono*: MonoTime
     startedAtWall*: Time
-    recentSources*: Deque[SourceEntry] ## 直近 `maxRecentSources` 件
+    recentSources*: Deque[SourceEntry] ## The most recent `maxRecentSources` entries
 
 proc newForwardStats*(): ForwardStats =
-  ## 開始時刻を現在時刻で初期化した空の統計を作る。
+  ## Creates an empty stats object with the start time initialized to the
+  ## current time.
   let nowMono = getMonoTime()
   let nowWall = getTime()
   ForwardStats(
@@ -42,13 +45,14 @@ proc newForwardStats*(): ForwardStats =
   )
 
 proc touch(s: ForwardStats) =
-  ## 最終通信時刻（Mono/Wall 両方）を「今」に更新する内部ヘルパー。
+  ## Internal helper that updates the last-activity time (both Mono/Wall)
+  ## to "now."
   s.lastActivityMono = getMonoTime()
   s.lastActivityWall = getTime()
 
 proc recordConnect*(s: ForwardStats; address: string; port: Port) =
-  ## 新規接続を記録する。`recentSources` に追記し、上限を超えた分は
-  ## 古いものから `popFirst` で捨てる。
+  ## Records a new connection. Appends to `recentSources`, and discards
+  ## the oldest entries via `popFirst` once the limit is exceeded.
   inc s.activeConns
   inc s.totalConns
   s.recentSources.addLast(SourceEntry(address: address, port: port, at: getTime()))
@@ -57,34 +61,38 @@ proc recordConnect*(s: ForwardStats; address: string; port: Port) =
   s.touch()
 
 proc recordDisconnect*(s: ForwardStats) =
-  ## 接続終了を記録する。`activeConns` は 0 未満にはしない。
+  ## Records a connection ending. `activeConns` is never allowed to go
+  ## below 0.
   if s.activeConns > 0:
     dec s.activeConns
   s.touch()
 
 proc recordRx*(s: ForwardStats; n: int) =
-  ## クライアント→上流方向のバイト数を加算する。
+  ## Adds to the byte count in the client -> upstream direction.
   s.bytesRx += n.uint64
   s.touch()
 
 proc recordTx*(s: ForwardStats; n: int) =
-  ## 上流→クライアント方向のバイト数を加算する。
+  ## Adds to the byte count in the upstream -> client direction.
   s.bytesTx += n.uint64
   s.touch()
 
 proc recordRejected*(s: ForwardStats) =
-  ## `maxConns` 超過で即 close された接続を記録する。
+  ## Records a connection that was closed immediately due to exceeding
+  ## `maxConns`.
   inc s.rejectedConns
 
 proc recordFailed*(s: ForwardStats) =
-  ## 上流への接続確立に失敗した回数を記録する。
+  ## Records the number of times establishing a connection to the
+  ## upstream failed.
   inc s.failedConns
 
 proc uptime*(s: ForwardStats): Duration =
-  ## このフォワードが起動してからの経過時間。`MonoTime` 差分なので
-  ## NTP 補正・時刻の手動変更の影響を受けない。
+  ## Elapsed time since this forward started. Since it is a `MonoTime`
+  ## difference, it is unaffected by NTP adjustments or manual clock
+  ## changes.
   getMonoTime() - s.startedAtMono
 
 proc idleFor*(s: ForwardStats): Duration =
-  ## 最後に通信があってからの経過時間。
+  ## Elapsed time since the last communication.
   getMonoTime() - s.lastActivityMono

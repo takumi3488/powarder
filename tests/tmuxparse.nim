@@ -2,108 +2,112 @@ import std/unittest
 import powarder/core/muxparse
 
 # ---------------------------------------------------------------------------
-# 実測データ（2026-07-29, OpenSSH_10.2p1 / macOS）をそのままテストケースにする。
-# これがこのモジュールの存在意義なので、値は一字一句変えないこと。
+# Empirically captured data (2026-07-29, OpenSSH_10.2p1 / macOS) used directly
+# as test cases. This is the whole reason this module exists, so do not
+# change the values by even a single character.
 # ---------------------------------------------------------------------------
 
-suite "parseForwardResult: 実測データ":
+suite "parseForwardResult: empirically captured data":
 
-  test "成功":
+  test "success":
     check parseForwardResult(0, "", "") == moSuccess
 
-  test "既存の同一 forward への再送は冪等成功する":
-    # stdout/stderr ともに空、exitCode 0 のみで新規 bind と区別が付かないのが実測の意味論。
+  test "resending an identical existing forward succeeds idempotently":
+    # Both stdout/stderr are empty and exitCode is 0 alone, which is
+    # empirically indistinguishable from a fresh bind -- that's the observed
+    # semantics.
     check parseForwardResult(0, "", "") == moSuccess
 
-  test "本当の bind 失敗":
+  test "an actual bind failure":
     check parseForwardResult(255, "",
         "mux_client_forward: forwarding request failed: Port forwarding failed\n" &
         "muxclient: master forward request failed\n") == moBindFailed
 
-suite "parseForwardResult: 未実測だがソースから確実な系":
+suite "parseForwardResult: not empirically captured, but certain from the source":
 
-  test "制御ソケットに繋がらない (ENOENT)":
+  test "cannot connect to the control socket (ENOENT)":
     check parseForwardResult(255, "",
         "Control socket connect(/tmp/x.sock): No such file or directory\n") == moNoMaster
 
-  test "制御ソケットに繋がらない (ECONNREFUSED)":
+  test "cannot connect to the control socket (ECONNREFUSED)":
     check parseForwardResult(255, "",
         "Control socket connect(/tmp/x.sock): Connection refused\n") == moNoMaster
 
-  test "ポリシー拒否":
+  test "policy rejection":
     check parseForwardResult(255, "",
         "Master refused forwarding request: administratively prohibited\n") == moRefused
 
-  test "-L 構文エラー":
+  test "-L syntax error":
     check parseForwardResult(255, "",
         "Bad local forwarding specification '0:localhost:22'\n") == moBadSpec
 
-  test "-R 構文エラーも moBadSpec になる（局所性の確認）":
+  test "-R syntax error also becomes moBadSpec (confirms it's not special-cased)":
     check parseForwardResult(255, "",
         "Bad remote forwarding specification '0:localhost:22'\n") == moBadSpec
 
-  test "分類不能な失敗は moUnknownFailure":
+  test "an unclassifiable failure is moUnknownFailure":
     check parseForwardResult(255, "", "something unexpected happened\n") == moUnknownFailure
 
-  test "優先順位: moNoMaster はどの文言より優先される":
-    # 実際には同時に出ないはずだが、フェイルセーフとしての優先順位を確認する。
+  test "priority: moNoMaster takes priority over any other wording":
+    # In practice these shouldn't appear together, but this confirms the
+    # priority order as a fail-safe.
     check parseForwardResult(255, "",
         "Control socket connect(/tmp/x.sock): No such file or directory\n" &
         "Port forwarding failed\n") == moNoMaster
 
-suite "parseCancelResult: 実測データ":
+suite "parseCancelResult: empirically captured data":
 
-  test "成功":
+  test "success":
     check parseCancelResult(0, "", "") == moSuccess
 
-  test "対象が存在しない":
+  test "the target doesn't exist":
     check parseCancelResult(0, "",
         "mux_client_forward: forwarding request failed: port not forwarded\n" &
         "muxclient: master cancel forward request failed\n") == moNotForwarded
 
-suite "parseCancelResult: exitCode は無視される（実測で確定）":
+suite "parseCancelResult: exitCode is ignored (confirmed empirically)":
 
-  test "exitCode が 255 でも stderr が空なら moSuccess":
+  test "exitCode 255 with empty stderr is still moSuccess":
     check parseCancelResult(255, "", "") == moSuccess
 
-  test "exitCode が 0 でも stderr の内容次第で失敗判定になる":
+  test "exitCode 0 can still be a failure, depending on stderr's content":
     check parseCancelResult(0, "",
         "mux_client_forward: forwarding request failed: port not forwarded\n") == moNotForwarded
 
-suite "parseCancelResult: 未実測だがソースから確実な系":
+suite "parseCancelResult: not empirically captured, but certain from the source":
 
-  test "制御ソケットに繋がらない":
+  test "cannot connect to the control socket":
     check parseCancelResult(0, "",
         "Control socket connect(/tmp/x.sock): Connection refused\n") == moNoMaster
 
-  test "ポリシー拒否":
+  test "policy rejection":
     check parseCancelResult(0, "",
         "Master refused forwarding request: administratively prohibited\n") == moRefused
 
-  test "分類不能な非空 stderr は moUnknownFailure":
+  test "an unclassifiable non-empty stderr is moUnknownFailure":
     check parseCancelResult(0, "", "something unexpected happened\n") == moUnknownFailure
 
-  test "空白のみの stderr も成功扱い":
+  test "whitespace-only stderr also counts as success":
     check parseCancelResult(0, "", "   \n\t \n") == moSuccess
 
-suite "parseCheckResult: 実測データ":
+suite "parseCheckResult: empirically captured data":
 
-  test "マスター生存":
+  test "master is alive":
     check parseCheckResult(0, "", "Master running (pid=48916)\r\n") ==
       (alive: true, pid: 48916)
 
-suite "parseCheckResult: stdout ではなく stderr を見る":
+suite "parseCheckResult: looks at stderr, not stdout":
 
-  test "stdout に同じ文言があっても無視する（実測: stderr のみに出る）":
+  test "the same wording on stdout is ignored (empirically: it only appears on stderr)":
     check parseCheckResult(0, "Master running (pid=1)\r\n", "") == (
         alive: false, pid: 0)
 
-suite "parseCheckResult: pid が取れない場合":
+suite "parseCheckResult: when the pid can't be extracted":
 
-  test "Master running (pid= の文言が無ければ alive false":
+  test "alive is false when there's no \"Master running (pid=\" wording":
     check parseCheckResult(255, "",
         "Control socket connect(/tmp/x.sock): No such file or directory\n") ==
       (alive: false, pid: 0)
 
-  test "pid の直後が数字でなければ pid 0 で alive false":
+  test "if what follows pid= isn't a digit, pid is 0 and alive is false":
     check parseCheckResult(0, "", "Master running (pid=)\r\n") == (alive: false, pid: 0)

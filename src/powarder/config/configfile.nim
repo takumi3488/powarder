@@ -1,8 +1,9 @@
-## ユーザーが手で編集する宣言的設定ファイル（`powarder.json` / `~/.config/powarder/config.json`）。
+## A declarative config file the user edits by hand (`powarder.json` /
+## `~/.config/powarder/config.json`).
 ##
-## **JSON のみを使う**（`std/json`）。外部 nimble 依存は追加しない。
+## **Uses JSON only** (`std/json`). No external nimble dependencies are added.
 ##
-## スキーマ:
+## Schema:
 ## ```jsonc
 ## {
 ##   "version": 1,
@@ -12,90 +13,97 @@
 ##   ]
 ## }
 ## ```
-## - `type` は `"L"` / `"R"`（`core/types.ForwardKind` の文字列値と 1:1 対応）。
-## - `forward` は ssh 完全互換の `[bind_address:]port:host:hostport` 文字列。
-##   `core/forwardspec.parseForwardSpec()` でパースする。
-## - `autostart` / `profile` / `sshExtraArgs` / `retry` は省略可能（既定値あり）。
+## - `type` is `"L"` / `"R"` (corresponds 1:1 to `core/types.ForwardKind`'s string values).
+## - `forward` is an ssh-fully-compatible `[bind_address:]port:host:hostport` string.
+##   Parsed by `core/forwardspec.parseForwardSpec()`.
+## - `autostart` / `profile` / `sshExtraArgs` / `retry` are optional (they have defaults).
 ##
-## **意図的に `user` / `port` / `identityFile` / `proxyJump` に相当するフィールドを
-## 持たせていない。** 接続経路・認証は `~/.ssh/config` の責務、転送トポロジ
-## （どのローカルポートをどこへ転送するか）は powarder の責務、という役割分担を
-## スキーマのレベルで構造的に強制するための設計判断。これらのキーが JSON に
-## 書かれていても致命的エラーにはせず、`~/.ssh/config` へ書くよう誘導する警告
-## （`ConfigFile.forbiddenKeyWarnings`）として検出する。
+## **Deliberately does not have fields corresponding to `user` / `port` /
+## `identityFile` / `proxyJump`.** This is a design decision to structurally
+## enforce, at the schema level, a division of responsibility: connection
+## routing and authentication are the responsibility of `~/.ssh/config`,
+## while forwarding topology (which local port forwards to where) is the
+## responsibility of powarder. If these keys do appear in the JSON, it is
+## not treated as a fatal error; instead it is detected as a warning
+## (`ConfigFile.forbiddenKeyWarnings`) that steers the user toward writing
+## them into `~/.ssh/config`.
 
 import std/[json, os, strutils, tables]
 import powarder/core/types
 import powarder/core/forwardspec
 import powarder/core/paths
-import powarder/ipc/protocol ## RetryPolicy の JSON 変換 (retryPolicyFromJson/toJson) を再利用する
+import powarder/ipc/protocol ## Reuses RetryPolicy's JSON conversion (retryPolicyFromJson/toJson).
 
 type
   ConfigFile* = object
     version*: int
     tunnels*: seq[TunnelConfig]
     forbiddenKeyWarnings*: seq[string]
-      ## `user` / `port` / `identityFile` / `proxyJump` など、意図的にサポートしない
-      ## フィールドが JSON に書かれていた場合の警告メッセージ（"warning: " 接頭辞付き）。
-      ## `TunnelConfig`（core/types.nim）にはこれらのフィールド自体が存在せず、
-      ## パース後には情報が失われてしまうため、生の JSON を持っている `loadConfig` の
-      ## 時点で検出してここへ退避しておく。`validateConfig` はこれをそのまま
-      ## 結果に含める。
+      ## Warning messages (prefixed with "warning: ") for cases where a
+      ## deliberately unsupported field -- `user` / `port` / `identityFile` /
+      ## `proxyJump`, etc. -- was written in the JSON. `TunnelConfig`
+      ## (core/types.nim) has no such fields at all, so the information
+      ## would otherwise be lost after parsing; it is therefore detected at
+      ## the point where `loadConfig` still holds the raw JSON and stashed
+      ## here. `validateConfig` includes these as-is in its result.
 
   ConfigError* = object of CatchableError
-    ## 設定ファイルの構文エラー・スキーマ不正を表す。メッセージには常に
-    ## ファイルパスと問題のあるトンネル（インデックス・name）・フィールド名を含める。
+    ## Represents a config file syntax error or schema violation. The
+    ## message always includes the file path, the offending tunnel
+    ## (index/name), and the field name.
 
 const
   forbiddenKeys = ["user", "port", "identityFile", "proxyJump"]
-    ## powarder が意図的にサポートしないフィールド一覧。上のモジュール doc comment を参照。
+    ## The list of fields powarder deliberately does not support. See the
+    ## module doc comment above.
 
 # ---------------------------------------------------------------------------
-# 内部ヘルパー
+# Internal helpers
 # ---------------------------------------------------------------------------
 
 proc tunnelLabel(idx: int; name: string): string =
-  ## エラーメッセージ用にトンネルを特定する文字列。name が読めていればそれも含める。
+  ## A string identifying a tunnel for use in error messages. Includes the
+  ## name too if it could be read.
   if name.len > 0: "tunnels[" & $idx & "] (name=\"" & name & "\")"
   else: "tunnels[" & $idx & "]"
 
 proc configErr(path, label, field, msg: string): ref ConfigError =
   newException(ConfigError,
-    path & ": " & label & " の \"" & field & "\" が不正です: " & msg)
+    path & ": " & label & ": \"" & field & "\" is invalid: " & msg)
 
 proc parseTunnelNode(path: string; idx: int; node: JsonNode): (TunnelConfig,
     seq[string]) =
-  ## `tunnels` 配列の1要素をパースする。戻り値は (TunnelConfig, 禁止キー警告)。
+  ## Parses one element of the `tunnels` array. Returns (TunnelConfig, forbidden-key warnings).
   if node.kind != JObject:
     raise newException(ConfigError,
-      path & ": tunnels[" & $idx & "] はオブジェクトである必要があります")
+      path & ": tunnels[" & $idx & "] must be an object")
 
   # name
   if not node.hasKey("name") or node["name"].kind != JString:
-    raise configErr(path, "tunnels[" & $idx & "]", "name", "文字列の \"name\" が必要です")
+    raise configErr(path, "tunnels[" & $idx & "]", "name", "must be a string")
   let name = node["name"].getStr
   let label = tunnelLabel(idx, name)
 
   # host
   if not node.hasKey("host") or node["host"].kind != JString:
-    raise configErr(path, label, "host", "文字列の \"host\" が必要です")
+    raise configErr(path, label, "host", "must be a string")
   let host = node["host"].getStr
 
   # type
   if not node.hasKey("type") or node["type"].kind != JString:
-    raise configErr(path, label, "type", "文字列の \"type\" (\"L\" または \"R\") が必要です")
+    raise configErr(path, label, "type", "must be a string (\"L\" or \"R\")")
   let typeStr = node["type"].getStr
   var kind: ForwardKind
   try:
     kind = parseEnum[ForwardKind](typeStr)
   except ValueError:
     raise configErr(path, label, "type",
-      "\"L\" または \"R\" である必要があります（実際: \"" &
-      typeStr & "\"）")
+      "must be \"L\" or \"R\" (got: \"" &
+      typeStr & "\")")
 
   # forward
   if not node.hasKey("forward") or node["forward"].kind != JString:
-    raise configErr(path, label, "forward", "文字列の \"forward\" が必要です")
+    raise configErr(path, label, "forward", "must be a string")
   let forwardStr = node["forward"].getStr
   var spec: ForwardSpec
   try:
@@ -103,31 +111,31 @@ proc parseTunnelNode(path: string; idx: int; node: JsonNode): (TunnelConfig,
   except ValueError as e:
     raise configErr(path, label, "forward", e.msg)
 
-  # autostart（省略可能。既定 false）
+  # autostart (optional, defaults to false)
   var autostart = false
   if node.hasKey("autostart"):
     if node["autostart"].kind != JBool:
-      raise configErr(path, label, "autostart", "真偽値である必要があります")
+      raise configErr(path, label, "autostart", "must be a boolean")
     autostart = node["autostart"].getBool
 
-  # profile（省略可能。既定 ""）
+  # profile (optional, defaults to "")
   var profile = ""
   if node.hasKey("profile"):
     if node["profile"].kind != JString:
-      raise configErr(path, label, "profile", "文字列である必要があります")
+      raise configErr(path, label, "profile", "must be a string")
     profile = node["profile"].getStr
 
-  # sshExtraArgs（省略可能。既定 @[]）
+  # sshExtraArgs (optional, defaults to @[])
   var sshExtraArgs: seq[string] = @[]
   if node.hasKey("sshExtraArgs"):
     if node["sshExtraArgs"].kind != JArray:
-      raise configErr(path, label, "sshExtraArgs", "文字列の配列である必要があります")
+      raise configErr(path, label, "sshExtraArgs", "must be an array of strings")
     for elemNode in node["sshExtraArgs"]:
       if elemNode.kind != JString:
-        raise configErr(path, label, "sshExtraArgs", "要素は全て文字列である必要があります")
+        raise configErr(path, label, "sshExtraArgs", "all elements must be strings")
       sshExtraArgs.add elemNode.getStr
 
-  # retry（省略可能。既定 initRetryPolicy()）
+  # retry (optional, defaults to initRetryPolicy())
   var retry = initRetryPolicy()
   if node.hasKey("retry"):
     try:
@@ -135,25 +143,27 @@ proc parseTunnelNode(path: string; idx: int; node: JsonNode): (TunnelConfig,
     except CatchableError as e:
       raise configErr(path, label, "retry", e.msg)
 
-  # 禁止キー（エラーではなく警告）
+  # Forbidden keys (warnings, not errors)
   var warnings: seq[string] = @[]
   for fk in forbiddenKeys:
     if node.hasKey(fk):
       warnings.add "warning: " & label & ": \"" & fk &
-        "\" は powarder ではサポートしていません。~/.ssh/config の Host " &
-        host & " セクションに書いてください"
+        "\" is not supported by powarder. Please put it in the Host " &
+        host & " section of ~/.ssh/config instead"
 
   let cfg = TunnelConfig(name: name, host: host, spec: spec, autostart: autostart,
                           profile: profile, sshExtraArgs: sshExtraArgs, retry: retry)
   (cfg, warnings)
 
 proc tunnelToJson(t: TunnelConfig): JsonNode =
-  ## `TunnelConfig` をユーザー向けスキーマ（flat な "type"/"forward"）の JSON にする。
-  ## `ipc/protocol.toJson(TunnelConfig)` は "spec": {...} のネストした内部表現を
-  ## 作るため（デーモン間 IPC 用）、ここでは使わずファイル用に手書きする。
-  ## 既定値と等しいフィールドは省略し、人間が読んだときに差分が分かりやすい
-  ## 最小限の JSON にする（loadConfig 側で省略時の既定値と揃えてあるので
-  ## 往復変換は保たれる）。
+  ## Converts a `TunnelConfig` to JSON in the user-facing schema (a flat
+  ## "type"/"forward"). `ipc/protocol.toJson(TunnelConfig)` produces a
+  ## nested internal representation with a "spec": {...} field (for
+  ## daemon-to-daemon IPC), so it isn't used here; this is hand-written for
+  ## the file format instead. Fields equal to their default value are
+  ## omitted, keeping the JSON minimal so a human reading it can easily spot
+  ## the differences (round-tripping is preserved because `loadConfig` uses
+  ## the same defaults for omitted fields).
   result = newJObject()
   result["name"] = %t.name
   result["host"] = %t.host
@@ -169,29 +179,30 @@ proc tunnelToJson(t: TunnelConfig): JsonNode =
     result["retry"] = toJson(t.retry)
 
 # ---------------------------------------------------------------------------
-# 公開 API
+# Public API
 # ---------------------------------------------------------------------------
 
 proc loadConfig*(path: string): ConfigFile =
-  ## JSON を読んで `ConfigFile` にする。パースエラー・スキーマ不正は `ConfigError` を
-  ## 投げる。例外メッセージには常にファイルパスと問題のあるトンネル
-  ## （インデックス・分かっていれば name）・フィールド名を含める。
+  ## Reads JSON and builds a `ConfigFile`. Parse errors and schema
+  ## violations raise `ConfigError`. The exception message always includes
+  ## the file path, the offending tunnel (index, and name if known), and
+  ## the field name.
   var content: string
   try:
     content = readFile(path)
   except IOError as e:
     raise newException(ConfigError, path &
-        ": 設定ファイルを読み込めません: " & e.msg)
+        ": failed to read the config file: " & e.msg)
 
   var root: JsonNode
   try:
     root = parseJson(content)
   except JsonParsingError as e:
     raise newException(ConfigError, path &
-        ": JSON の構文解析に失敗しました: " & e.msg)
+        ": failed to parse JSON: " & e.msg)
 
   if root.kind != JObject:
-    raise newException(ConfigError, path & ": トップレベルはオブジェクトである必要があります")
+    raise newException(ConfigError, path & ": the top level must be an object")
 
   let version =
     if root.hasKey("version") and root["version"].kind == JInt: root[
@@ -203,7 +214,7 @@ proc loadConfig*(path: string): ConfigFile =
 
   if root.hasKey("tunnels"):
     if root["tunnels"].kind != JArray:
-      raise newException(ConfigError, path & ": \"tunnels\" は配列である必要があります")
+      raise newException(ConfigError, path & ": \"tunnels\" must be an array")
     let arr = root["tunnels"]
     for idx in 0 ..< arr.len:
       let (cfg, w) = parseTunnelNode(path, idx, arr[idx])
@@ -213,9 +224,10 @@ proc loadConfig*(path: string): ConfigFile =
   ConfigFile(version: version, tunnels: tunnels, forbiddenKeyWarnings: warnings)
 
 proc saveConfig*(path: string; cfg: ConfigFile) =
-  ## 人間が読める形（インデント付き）で書く。一時ファイルへ書いてから
-  ## `moveFile` でアトミックに置き換える（一時ファイルは `path` と同一ディレクトリに
-  ## 作る。別ファイルシステムをまたぐと rename がアトミックでなくなるため）。
+  ## Writes the config in a human-readable form (with indentation). Writes
+  ## to a temporary file first, then atomically replaces it with
+  ## `moveFile` (the temp file is created in the same directory as `path`,
+  ## because crossing filesystems would make rename non-atomic).
   var root = newJObject()
   root["version"] = %cfg.version
   var arr = newJArray()
@@ -229,71 +241,80 @@ proc saveConfig*(path: string; cfg: ConfigFile) =
 
   let tmpPath = path & ".tmp." & $getCurrentProcessId()
   writeFile(tmpPath, root.pretty())
-  # 0600 にしてから rename する（`config/statefile.saveState` と同じ理由）。
-  # 設定ファイルには踏み台や内部ネットワークのホスト名・ポートが並ぶので、
-  # 他ユーザーから読める必要が無い。rename の**前**に落とすことで
-  # 一瞬 644 になる窓を作らない。
+  # Set permissions to 0600 before renaming (same reason as
+  # `config/statefile.saveState`). The config file lists bastion hosts and
+  # internal network hostnames/ports, so there's no reason for it to be
+  # readable by other users. Dropping permissions **before** the rename
+  # avoids a brief window where the file would be world-readable (644).
   setFilePermissions(tmpPath, {fpUserRead, fpUserWrite})
   moveFile(tmpPath, path)
 
 proc validateConfig*(cfg: ConfigFile): seq[string] =
-  ## 設定の意味的な問題を全部集めて返す（1つ見つけて即エラーにせず、まとめて報告する）。
+  ## Collects and returns every semantic problem with the config, rather
+  ## than stopping at the first one found -- everything is reported
+  ## together.
   ##
-  ## 戻り値の各要素はメッセージ文字列で、**"warning: " で始まるものは警告**
-  ## （起動・保存を妨げない）、それ以外は致命的な問題（呼び出し側はここで
-  ## 弾くべき）という規約にする。警告扱いにしているのは:
-  ## - 禁止キー（`user`/`port`/`identityFile`/`proxyJump`）が書かれていた場合
-  ##   （`loadConfig` が収集した `cfg.forbiddenKeyWarnings` をそのまま含める）
-  ## - `bindAddr` がループバック以外（`exposesExternally`）の場合
-  ##   （外部公開が意図的なこともあるため、エラーで弾くと正当な用途を壊す）
-  ## それ以外（name/forwardId の重複、name/host が空、version 不正）は
-  ## 設定として成立し得ないため常にエラー扱いにする。
+  ## Each element of the returned sequence is a message string, under the
+  ## following contract: **anything starting with "warning: " is a
+  ## warning** (it doesn't block startup or saving); everything else is a
+  ## fatal problem that the caller should reject here. The following are
+  ## treated as warnings:
+  ## - A forbidden key (`user`/`port`/`identityFile`/`proxyJump`) was
+  ##   present (`cfg.forbiddenKeyWarnings`, collected by `loadConfig`, is
+  ##   included as-is)
+  ## - `bindAddr` is anything other than loopback (`exposesExternally`)
+  ##   (since exposing externally can be intentional, rejecting it as an
+  ##   error would break legitimate use cases)
+  ## Everything else (duplicate name/forwardId, empty name/host, invalid
+  ## version) can never be a valid config, so it is always treated as an
+  ## error.
   result = @[]
 
   for w in cfg.forbiddenKeyWarnings:
     result.add w
 
   if cfg.version != 1:
-    result.add "version は 1 のみサポートしています（実際の値: " &
-        $cfg.version & "）"
+    result.add "only version 1 is supported (got: " &
+        $cfg.version & ")"
 
   var namesSeen = initTable[string, int]()
   var forwardGroups = initTable[string, seq[string]]()
 
   for idx, t in cfg.tunnels:
     if t.name.strip().len == 0:
-      result.add "tunnels[" & $idx & "] (host=\"" & t.host & "\"): name が空です"
+      result.add "tunnels[" & $idx & "] (host=\"" & t.host & "\"): name is empty"
     else:
       namesSeen[t.name] = namesSeen.getOrDefault(t.name, 0) + 1
 
     if t.host.len == 0:
-      result.add "tunnels[" & $idx & "] (name=\"" & t.name & "\"): host が空です"
+      result.add "tunnels[" & $idx & "] (name=\"" & t.name & "\"): host is empty"
 
     if exposesExternally(t.spec):
-      result.add "warning: トンネル \"" & t.name &
-          "\" はループバック以外 (" &
-        t.spec.bindAddr & ") にバインドし、外部に公開されます。意図した設定か確認してください"
+      result.add "warning: tunnel \"" & t.name &
+          "\" binds to a non-loopback address (" &
+        t.spec.bindAddr & ") and will be exposed externally. Please confirm this is intentional"
 
     let fid = forwardId(t.spec, t.host)
     forwardGroups[fid] = forwardGroups.getOrDefault(fid, @[]) & t.name
 
   for name, cnt in namesSeen:
     if cnt > 1:
-      result.add "トンネル名 \"" & name &
-          "\" が重複しています（" & $cnt & " 件）"
+      result.add "tunnel name \"" & name &
+          "\" is duplicated (" & $cnt & " occurrences)"
 
   for fid, names in forwardGroups:
     if names.len > 1:
-      result.add "同じ転送先 (" & fid &
-          ") を複数のトンネルが取り合っています: " &
-        names.join(", ")
+      result.add "multiple tunnels are competing for the same forward target (" &
+          fid & "): " & names.join(", ")
 
 proc findConfigFile*(explicit = ""): string =
-  ## 設定ファイルの探索。優先順位:
-  ## 1. `explicit`（`--file`/`-f` で明示指定されたパス）
-  ## 2. `./powarder.json`（プロジェクトローカル。存在する場合のみ。`paths.localConfigFile()`）
-  ## 3. `~/.config/powarder/config.json`（`paths.configFile()`。`POWARDER_CONFIG` でも上書き可）
-  ## どれも無ければ 3. のパスを返す（存在しないパスを返してよい。呼び出し側が扱う）。
+  ## Searches for the config file. Priority order:
+  ## 1. `explicit` (path explicitly given via `--file`/`-f`)
+  ## 2. `./powarder.json` (project-local; only if it exists. `paths.localConfigFile()`)
+  ## 3. `~/.config/powarder/config.json` (`paths.configFile()`; can also be
+  ##    overridden via `POWARDER_CONFIG`)
+  ## If none of these exist, returns the path from 3 (it's fine to return a
+  ## non-existent path -- the caller handles that).
   if explicit.len > 0:
     return expandTilde(explicit)
 
@@ -304,5 +325,6 @@ proc findConfigFile*(explicit = ""): string =
   configFile()
 
 proc defaultConfig*(): ConfigFile =
-  ## `version: 1, tunnels: @[]` の空設定。設定ファイルが無いときの初期値。
+  ## An empty config with `version: 1, tunnels: @[]`. The initial value used
+  ## when there is no config file.
   ConfigFile(version: 1, tunnels: @[], forbiddenKeyWarnings: @[])

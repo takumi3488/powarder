@@ -1,7 +1,8 @@
-## proxy 層（stats / upstream / relay / listener）の単体テスト。
+## Unit tests for the proxy layer (stats / upstream / relay / listener).
 ##
-## ssh も実 SSH サーバも使わない。「内部エンドポイント役」として `asyncnet` で
-## ダミーのエコーサーバを立て、プロキシ経由でデータを送って折り返しを確認する。
+## Uses neither ssh nor a real SSH server. Sets up a dummy echo server with
+## `asyncnet` as the "internal endpoint," sends data through the proxy, and
+## checks that it echoes back.
 
 import std/unittest
 import std/asyncdispatch
@@ -15,7 +16,7 @@ import powarder/proxy/listener
 import powarder/proxy/relay
 
 # ---------------------------------------------------------------------------
-# テスト用ヘルパー
+# Test helpers
 # ---------------------------------------------------------------------------
 
 proc tcpTarget(port: int): UpstreamTarget =
@@ -26,8 +27,8 @@ proc unixTarget(path: string): UpstreamTarget =
 
 proc waitUntil(cond: proc(): bool {.closure.}; tries = 200;
                delayMs = 10): Future[bool] {.async.} =
-  ## 条件が満たされるまでポーリングする。非同期処理のタイミング差を
-  ## 吸収するためのテスト専用ヘルパー。
+  ## Polls until the condition is satisfied. A test-only helper for
+  ## absorbing timing differences in asynchronous processing.
   for i in 0 ..< tries:
     if cond():
       return true
@@ -35,7 +36,7 @@ proc waitUntil(cond: proc(): bool {.closure.}; tries = 200;
   result = cond()
 
 proc echoConn(sock: AsyncSocket) {.async.} =
-  ## 受け取ったバイト列をそのまま送り返す1接続分のハンドラ。
+  ## A single-connection handler that sends back whatever bytes it received.
   var buf = newString(65536)
   while true:
     let n = await sock.recvInto(addr buf[0], buf.len)
@@ -45,7 +46,7 @@ proc echoConn(sock: AsyncSocket) {.async.} =
 
 type
   EchoServer = ref object
-    ## テストの「内部エンドポイント役」。ssh の代わりにこれを target にする。
+    ## The test's "internal endpoint." Used as the target in place of ssh.
     listener: AsyncSocket
     closing: bool
 
@@ -57,8 +58,9 @@ proc newEchoServerTcp(port: int): EchoServer =
   EchoServer(listener: l, closing: false)
 
 proc newEchoServerUnix(path: string): EchoServer =
-  # fileExists は正規ファイルのみを見るため UDS には常に false を返す。
-  # removeFile はファイルが存在しなくても失敗しないので無条件に呼ぶ。
+  # fileExists only looks at regular files, so it always returns false for a
+  # UDS. removeFile does not fail even if the file doesn't exist, so call it
+  # unconditionally.
   removeFile(path)
   let l = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_NONE, buffered = false)
   l.bindUnix(path)
@@ -83,10 +85,10 @@ proc newTcpClient(port: int): Future[AsyncSocket] {.async.} =
   await result.connect("127.0.0.1", Port(port))
 
 # ---------------------------------------------------------------------------
-# 1. 中継が通る & 2. バイト数が計上される
+# 1. Relaying works & 2. byte counts are tallied
 # ---------------------------------------------------------------------------
 
-test "中継が通る & バイト数が計上される":
+test "relaying works & byte counts are tallied":
   proc scenario() {.async.} =
     let echo = newEchoServerTcp(17312)
     asyncCheck echo.serve()
@@ -113,10 +115,10 @@ test "中継が通る & バイト数が計上される":
   waitFor scenario()
 
 # ---------------------------------------------------------------------------
-# 3. 接続数
+# 3. Connection counts
 # ---------------------------------------------------------------------------
 
-test "接続数: activeConns / totalConns":
+test "connection counts: activeConns / totalConns":
   proc scenario() {.async.} =
     let echo = newEchoServerTcp(17313)
     asyncCheck echo.serve()
@@ -139,12 +141,12 @@ test "接続数: activeConns / totalConns":
   waitFor scenario()
 
 # ---------------------------------------------------------------------------
-# 4. 上流が死んでいる
+# 4. Upstream is dead
 # ---------------------------------------------------------------------------
 
-test "上流が死んでいる: クライアントは即 EOF、failedConns が増える":
+test "upstream is dead: client gets immediate EOF, failedConns increases":
   proc scenario() {.async.} =
-    # 17314 は誰も listen していない TCP ポート
+    # 17314 is a TCP port nobody is listening on
     let proxy = newForwardProxy("127.0.0.1", Port(17304), tcpTarget(17314))
     asyncCheck proxy.serve()
 
@@ -161,10 +163,10 @@ test "上流が死んでいる: クライアントは即 EOF、failedConns が�
   waitFor scenario()
 
 # ---------------------------------------------------------------------------
-# 5. maxConns 超過
+# 5. Exceeding maxConns
 # ---------------------------------------------------------------------------
 
-test "maxConns 超過: 2本目が即 close され rejectedConns が増える":
+test "exceeding maxConns: the 2nd connection is closed immediately and rejectedConns increases":
   proc scenario() {.async.} =
     let echo = newEchoServerTcp(17315)
     asyncCheck echo.serve()
@@ -181,7 +183,7 @@ test "maxConns 超過: 2本目が即 close され rejectedConns が増える":
     let n = await client2.recvInto(addr buf[0], 16)
     check n == 0
     check proxy.stats.rejectedConns == 1
-    # 2本目は拒否されただけで activeConns にはカウントされない
+    # The 2nd connection was merely rejected, so it isn't counted in activeConns
     check proxy.stats.activeConns == 1
 
     client1.close()
@@ -193,10 +195,10 @@ test "maxConns 超過: 2本目が即 close され rejectedConns が増える":
   waitFor scenario()
 
 # ---------------------------------------------------------------------------
-# 6. UDS 経路
+# 6. UDS path
 # ---------------------------------------------------------------------------
 
-test "UDS 経路でも中継・バイト数・接続数が成立する":
+test "relaying, byte counts, and connection counts also hold over the UDS path":
   proc scenario() {.async.} =
     let sockPath = "/tmp/pwt-t6.sock"
     let echo = newEchoServerUnix(sockPath)
@@ -228,10 +230,10 @@ test "UDS 経路でも中継・バイト数・接続数が成立する":
   waitFor scenario()
 
 # ---------------------------------------------------------------------------
-# 7. 大きめのデータ（RelayBufSize 超え）
+# 7. Larger data (exceeding RelayBufSize)
 # ---------------------------------------------------------------------------
 
-test "RelayBufSize を超えるデータが壊れずに往復する":
+test "data exceeding RelayBufSize round-trips without corruption":
   proc scenario() {.async.} =
     let echo = newEchoServerTcp(17317)
     asyncCheck echo.serve()
@@ -241,7 +243,8 @@ test "RelayBufSize を超えるデータが壊れずに往復する":
 
     let client = await newTcpClient(17307)
 
-    # RelayBufSize の倍数からずらしたサイズにして、境界をまたぐ挙動も含める
+    # Use a size offset from a multiple of RelayBufSize so boundary-crossing
+    # behavior is also covered
     let payloadSize = RelayBufSize * 4 + 37
     var payload = newString(payloadSize)
     for i in 0 ..< payloadSize:
@@ -272,7 +275,7 @@ test "RelayBufSize を超えるデータが壊れずに往復する":
 # 8. retarget
 # ---------------------------------------------------------------------------
 
-test "retarget: 新規接続だけが新しい target に向く":
+test "retarget: only new connections go to the new target":
   proc scenario() {.async.} =
     let echoOld = newEchoServerTcp(17318)
     asyncCheck echoOld.serve()
@@ -282,13 +285,13 @@ test "retarget: 新規接続だけが新しい target に向く":
     let proxy = newForwardProxy("127.0.0.1", Port(17308), tcpTarget(17318))
     asyncCheck proxy.serve()
 
-    # 旧 target 宛の接続を張ったままにする
+    # Keep a connection open to the old target
     let clientOld = await newTcpClient(17308)
     check await waitUntil(proc(): bool = proxy.stats.activeConns == 1)
 
     proxy.retarget(tcpTarget(17319))
 
-    # 新規接続は新 target に向く
+    # A new connection goes to the new target
     let clientNew = await newTcpClient(17308)
     check await waitUntil(proc(): bool = proxy.stats.activeConns == 2)
 
@@ -298,7 +301,7 @@ test "retarget: 新規接続だけが新しい target に向く":
     buf.setLen(n)
     check buf == "new"
 
-    # 旧接続はまだ生きていて旧 target と話せる
+    # The old connection is still alive and can talk to the old target
     await clientOld.send("old")
     var bufOld = newString(3)
     let nOld = await clientOld.recvInto(addr bufOld[0], 3)
@@ -315,10 +318,10 @@ test "retarget: 新規接続だけが新しい target に向く":
   waitFor scenario()
 
 # ---------------------------------------------------------------------------
-# 9. 接続元の記録 (recentSources)
+# 9. Recording connection sources (recentSources)
 # ---------------------------------------------------------------------------
 
-test "recentSources に接続元が記録され maxRecentSources を超えると古いものが落ちる":
+test "connection sources are recorded in recentSources, and older ones are dropped past maxRecentSources":
   proc scenario() {.async.} =
     let echo = newEchoServerTcp(17320)
     asyncCheck echo.serve()
@@ -326,7 +329,7 @@ test "recentSources に接続元が記録され maxRecentSources を超えると
     let proxy = newForwardProxy("127.0.0.1", Port(17309), tcpTarget(17320))
     asyncCheck proxy.serve()
 
-    let total = maxRecentSources + 2 # 5 + 2 = 7本、うち先頭2本が落ちるはず
+    let total = maxRecentSources + 2 # 5 + 2 = 7, the first 2 should be dropped
     var clients: seq[AsyncSocket] = @[]
     var expectedPorts: seq[Port] = @[]
 
@@ -345,7 +348,8 @@ test "recentSources に接続元が記録され maxRecentSources を超えると
       check entry.address == "127.0.0.1"
       recordedPorts.add entry.port
 
-    # 先頭 (total - maxRecentSources) 本は落ち、直近 maxRecentSources 本だけ残る
+    # The first (total - maxRecentSources) entries are dropped, leaving only
+    # the most recent maxRecentSources entries
     let dropCount = expectedPorts.len - maxRecentSources
     var expectedRemaining: seq[Port] = @[]
     for i in dropCount ..< expectedPorts.len:

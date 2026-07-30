@@ -1,15 +1,16 @@
-## デーモン側の IPC トランスポート: Unix domain socket 上の accept ループと
-## リクエストディスパッチ。
+## The daemon-side IPC transport: the accept loop and request dispatch over
+## a Unix domain socket.
 ##
-## メッセージの JSON エンコード/デコードは一切ここでは行わない
-## （`ipc/protocol` の `decodeRequest` / `encodeSuccess` / `encodeError` に完全委譲する）。
-## このモジュールの責務は
-## - ソケットの bind / listen / accept
-## - 1行読んで1行書く（改行がフレーミング）
-## - 登録されたハンドラへのディスパッチとエラーの JSON-RPC への変換
-## - ハンドラが何を投げてもデーモンプロセスを道連れにしない
-## の4点だけに絞る。デーモンはシングルスレッドの非同期イベントループ
-## （`std/asyncdispatch`）上で動く前提。
+## No JSON encoding/decoding of messages happens here at all (that's fully
+## delegated to `ipc/protocol`'s `decodeRequest` / `encodeSuccess` /
+## `encodeError`). This module's responsibility is limited to just these
+## four things:
+## - bind / listen / accept on the socket
+## - reading one line and writing one line (newlines are the framing)
+## - dispatching to registered handlers and converting errors into JSON-RPC
+## - making sure nothing a handler throws takes the daemon process down with it
+## The daemon is assumed to run on a single-threaded async event loop
+## (`std/asyncdispatch`).
 
 import std/[asyncdispatch, asyncnet, nativesockets, json, options, os, tables]
 import powarder/ipc/protocol
@@ -17,17 +18,18 @@ import powarder/core/paths
 
 type
   RpcHandler* = proc (params: JsonNode): JsonNode {.closure, gcsafe.}
-    ## 成功時は response の `result` になる `JsonNode` を返す。
-    ## 失敗時は `RpcError` を投げる（コードを指定したいエラー）か、
-    ## それ以外の例外を投げる（`rpcInternalError` に丸められる）。
+    ## On success, returns the `JsonNode` that becomes the response's
+    ## `result`. On failure, either raises `RpcError` (for an error where
+    ## you want to specify a code), or raises some other exception (which
+    ## gets rounded down to `rpcInternalError`).
 
   RpcError* = object of CatchableError
     code*: int
     data*: JsonNode
-    ## ハンドラが「JSON-RPC のエラー応答として返したい」ときに投げる例外。
-    ## `code` には `ipc/protocol` のエラーコード定数
-    ## （`errTunnelNotFound` 等）を入れる。`msg`（`CatchableError` 由来）が
-    ## そのままエラー応答の `message` になる。
+    ## The exception a handler raises when it wants to return a JSON-RPC
+    ## error response. `code` holds one of `ipc/protocol`'s error code
+    ## constants (`errTunnelNotFound`, etc.). `msg` (inherited from
+    ## `CatchableError`) becomes the error response's `message` as-is.
 
   IpcServer* = ref object
     socket*: AsyncSocket
@@ -35,46 +37,51 @@ type
     handlers*: Table[string, RpcHandler]
     closing*: bool
     conns: seq[Future[void]]
-      ## 実行中の `handleClient` の Future。`serve()` の accept ループの先頭で
-      ## 完了済みのものを間引く（`asyncCheck` ではなくこちらを使う理由は
-      ## `serve()` の doc comment を参照）。
+      ## Futures for in-flight `handleClient` calls. Finished ones are
+      ## pruned at the top of `serve()`'s accept loop (see `serve()`'s doc
+      ## comment for why this is used instead of `asyncCheck`).
 
 proc newRpcError*(code: int; message: string;
     data: JsonNode = nil): ref RpcError =
-  ## ハンドラ側で `raise newRpcError(errTunnelNotFound, "...")` のように使う
-  ## 補助コンストラクタ（`ipc/protocol` の `newRpcParseError` と同じ形）。
+  ## A helper constructor used on the handler side like
+  ## `raise newRpcError(errTunnelNotFound, "...")` (the same shape as
+  ## `ipc/protocol`'s `newRpcParseError`).
   result = (ref RpcError)(msg: message, code: code, data: data)
 
 proc newIpcServer*(path = ""): IpcServer =
-  ## `path` が空なら `paths.ipcSocketPath()` を使う。
+  ## If `path` is empty, uses `paths.ipcSocketPath()`.
   ##
-  ## **セキュリティ境界に関する注記**: このバージョンの powarder の IPC は
-  ## 認証機構を一切持たない。ソケットファイルのパーミッションを 0600 にし、
-  ## 所有者本人だけが接続できることだけを認証の代わりにしている
-  ## （UDS はファイルシステムのパーミッションで到達可否が決まるため、これは
-  ## Docker の `/var/run/docker.sock` と同じ設計判断である）。したがって
-  ## ランタイムディレクトリ自体のパーミッションも重要になる
-  ## （`core/paths.ensureRuntimeDir` が 0700 で作る前提に依存している）。
+  ## **Note on the security boundary**: this version of powarder's IPC has
+  ## no authentication mechanism at all. Setting the socket file's
+  ## permissions to 0600, so that only the owner can connect, stands in
+  ## for authentication (since a UDS's reachability is determined by
+  ## filesystem permissions, this is the same design decision as Docker's
+  ## `/var/run/docker.sock`). This means the runtime directory's own
+  ## permissions matter too (this relies on `core/paths.ensureRuntimeDir`
+  ## creating it with 0700).
   let p = if path.len > 0: path else: ipcSocketPath()
 
   if path.len == 0:
-    # 既定のソケットパスを使う場合のみ、ランタイムディレクトリの存在を保証する。
-    # 呼び出し側が明示的な `path`（テスト用の短いパス等）を渡した場合は
-    # そのパスの親ディレクトリの用意は呼び出し側の責務とみなし、ここでは
-    # `runtimeDir()` とは無関係なディレクトリ作成を行わない。
+    # Only ensure the runtime directory exists when using the default
+    # socket path. If the caller passes an explicit `path` (e.g. a short
+    # path for tests), preparing that path's parent directory is
+    # considered the caller's responsibility, and no directory creation
+    # unrelated to `runtimeDir()` happens here.
     ensureRuntimeDir()
 
-  # 既存ソケットの残骸を消す。`os.fileExists` は S_ISREG だけを見るので
-  # ソケットには常に false を返す ―― 必ず `socketExists` を使うこと
-  # （`core/paths.nim` の doc comment 参照）。
+  # Remove any leftover remnant of an existing socket. `os.fileExists`
+  # only checks S_ISREG, so it always returns false for a socket --
+  # always use `socketExists` instead (see the doc comment in
+  # `core/paths.nim`).
   if socketExists(p):
     removeFile(p)
 
   let sock = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP)
   sock.bindUnix(p)
-  # bind 直後にパーミッションを絞る。bind から setFilePermissions までの間は
-  # 理論上 window があるが、ランタイムディレクトリ自体が 0700
-  # （所有者以外は辿れない）である前提なので実害は無い。
+  # Tighten permissions right after bind. There is theoretically a window
+  # between bind and setFilePermissions, but since the runtime directory
+  # itself is assumed to be 0700 (unreachable by anyone but the owner),
+  # there's no real-world harm.
   setFilePermissions(p, {fpUserRead, fpUserWrite})
   sock.listen()
 
@@ -85,27 +92,30 @@ proc register*(s: IpcServer; methodName: string; handler: RpcHandler) =
   s.handlers[methodName] = handler
 
 proc handleClient(s: IpcServer; client: AsyncSocket) {.async.} =
-  ## 1つの接続を処理する。
+  ## Handles a single connection.
   ##
-  ## **設計選択**: 「1 UDS 接続 = 1 論理コマンド」が基本設計だが、将来の拡張
-  ## （同一接続での複数リクエスト）に備え、ここでは「接続が閉じられるまで
-  ## 複数のリクエストを処理できるループ」として実装した。現状の CLI 側
-  ## `client.call()` は毎回新しい接続を張って1リクエスト後に切断するので、
-  ## 実際の通信パターンは変わらず「1接続=1コマンド」のまま動作する。
+  ## **Design choice**: "1 UDS connection = 1 logical command" is the
+  ## basic design, but to prepare for future extension (multiple requests
+  ## on the same connection), this is implemented as a loop that can
+  ## process multiple requests until the connection closes. The CLI side's
+  ## current `client.call()` opens a new connection each time and
+  ## disconnects after one request, so the actual communication pattern is
+  ## unchanged and still behaves as "1 connection = 1 command".
   try:
     while not s.closing:
       let line = await client.recvLine()
       if line.len == 0:
-        break # 切断（`recvLine` は切断時に空文字列を返す）
+        break # disconnected (`recvLine` returns an empty string on disconnect)
 
       var req: RpcRequest
       var parseFailed = false
       try:
         req = decodeRequest(line)
       except RpcParseError as e:
-        # id が分からない（壊れた行なので request の中身自体を復元できない）ため
-        # 0 を使う。JSON-RPC 2.0 の仕様では null が正だが、`ipc/protocol` の
-        # `encodeError` が `id: int` を必須にしているためこの妥協をする。
+        # The id is unknown (the line is malformed, so the request's
+        # contents can't be recovered), so 0 is used. The JSON-RPC 2.0
+        # spec says null is correct here, but `ipc/protocol`'s
+        # `encodeError` requires `id: int`, so this compromise is made.
         parseFailed = true
         await client.send(encodeError(0, rpcParseError, e.msg) & "\n")
 
@@ -116,7 +126,7 @@ proc handleClient(s: IpcServer; client: AsyncSocket) {.async.} =
         if req.id.isSome:
           await client.send(encodeError(req.id.get, rpcMethodNotFound,
               "method not found: " & req.methodName) & "\n")
-        continue # notification なら応答自体を返さない
+        continue # a notification returns no response at all
 
       var resJson: JsonNode = nil
       var errCode = 0
@@ -131,33 +141,36 @@ proc handleClient(s: IpcServer; client: AsyncSocket) {.async.} =
         errMsg = e.msg
         errData = e.data
       except CatchableError as e:
-        # ハンドラが想定外の例外を投げてもデーモンを落とさない。
-        # 1リクエストの失敗で常駐プロセスが死ぬのは論外なので、ここで確実に
-        # 握り潰して `rpcInternalError` に変換する。
+        # Even if a handler raises an unexpected exception, the daemon
+        # must not go down with it. A resident process dying because a
+        # single request failed is out of the question, so it's reliably
+        # caught here and converted into `rpcInternalError`.
         handlerFailed = true
         errCode = rpcInternalError
         errMsg = e.msg
         errData = nil
 
       if req.id.isNone:
-        continue # notification には応答を返さない
+        continue # no response is returned for a notification
 
       if handlerFailed:
         await client.send(encodeError(req.id.get, errCode, errMsg, errData) & "\n")
       else:
         await client.send(encodeSuccess(req.id.get, resJson) & "\n")
   except CatchableError:
-    # 送受信そのものが失敗した（クライアントが読み取り前に接続を切った等）。
-    # この接続だけを諦めてサーバは動き続ける。
+    # Sending/receiving itself failed (e.g. the client disconnected
+    # before reading). Give up on just this connection; the server keeps
+    # running.
     discard
   finally:
     client.close()
 
 proc pruneFinished(s: IpcServer) =
-  ## 完了済みの `handleClient` Future を `s.conns` から取り除く。
-  ## `handleClient` は自分自身で全ての例外を握り潰す設計だが、念のため
-  ## 失敗した Future があればここで `readError` を読んで
-  ## 「Future の例外が回収されなかった」という追加の警告を防ぐ。
+  ## Removes finished `handleClient` Futures from `s.conns`.
+  ## `handleClient` is designed to swallow all of its own exceptions, but
+  ## just in case, if a Future did fail, its `readError` is read here to
+  ## prevent an additional warning about "a Future's exception was never
+  ## retrieved".
   var alive: seq[Future[void]] = @[]
   for f in s.conns:
     if f.finished:
@@ -168,17 +181,19 @@ proc pruneFinished(s: IpcServer) =
   s.conns = alive
 
 proc serve*(s: IpcServer) {.async.} =
-  ## accept ループ。
+  ## The accept loop.
   ##
-  ## 1接続ごとに `handleClient` を `asyncCheck` ではなくこの `Future` 自体を
-  ## `s.conns` に保持する形で起動する。`asyncCheck` だと Future への参照を
-  ## 持たないため、`close()` 後に残っている接続を待ちたくなったときに手が
-  ## 出せない。接続数は不定なので、ループの先頭で完了済みの Future を
-  ## 間引く方式にした（`pruneFinished`）。
+  ## For each connection, `handleClient` is started by keeping the
+  ## `Future` itself in `s.conns`, rather than using `asyncCheck`.
+  ## `asyncCheck` doesn't retain a reference to the Future, so there would
+  ## be no way to wait for connections still outstanding after `close()`.
+  ## Since the number of connections is unbounded, finished Futures are
+  ## pruned at the top of the loop instead (`pruneFinished`).
   ##
-  ## `close()` でリスナーソケットを閉じると、待機中の `accept()` は
-  ## OSError で失敗する。これを `s.closing` フラグで「意図した shutdown」と
-  ## 区別し、shutdown ならループを正常に抜ける。
+  ## When `close()` closes the listener socket, a pending `accept()` fails
+  ## with an OSError. This is distinguished from an "intentional
+  ## shutdown" via the `s.closing` flag, and the loop exits normally when
+  ## it is indeed a shutdown.
   while true:
     pruneFinished(s)
     var client: AsyncSocket
@@ -188,14 +203,15 @@ proc serve*(s: IpcServer) {.async.} =
       if s.closing:
         break
       else:
-        # リスナー自体が壊れた（想定外）。呼び出し元に伝播させる。
+        # The listener itself is broken (unexpected). Propagate to the caller.
         raise
     s.conns.add handleClient(s, client)
 
 proc close*(s: IpcServer) =
-  ## `closing` を立ててからソケットを閉じ、ソケットファイルを削除する。
-  ## 順序が重要: 先に `closing = true` にしないと、`socket.close()` が
-  ## 引き起こす `accept()` の失敗を `serve()` が「異常」と誤判定してしまう。
+  ## Sets `closing`, then closes the socket and removes the socket file.
+  ## Order matters here: unless `closing = true` is set first, `serve()`
+  ## will mistake the `accept()` failure caused by `socket.close()` for an
+  ## "abnormal" error.
   s.closing = true
   s.socket.close()
   if socketExists(s.path):

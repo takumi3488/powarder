@@ -1,16 +1,19 @@
-## `powarder/daemon/orphan` のテスト。
+## Tests for `powarder/daemon/orphan`.
 ##
-## 実 SSH サーバなしにテストするため、`tests/fixtures/ssh` という fake ssh を
-## `PATH` の先頭に置いて powarder に `ssh` として掴ませる（`tdaemon.nim` /
-## `thostsession.nim` と同じ手法。環境構築もそのまま踏襲する）。
+## To test without a real SSH server, we place the fake ssh at
+## `tests/fixtures/ssh` at the front of `PATH` and let powarder pick it up
+## as `ssh` (the same technique as `tdaemon.nim` / `thostsession.nim`; the
+## environment setup is carried over as-is).
 ##
-## 「生きているマスター」を作る必要があるテスト（aoAdopted / aoMismatch /
-## fkLocal の adopt）は、`daemon/hostsession.spawnMaster` と同じ手順
-## （`muxclient.masterCommandLine` を組んで `startProcess`）を自前で行い、
-## fake ssh の `-M -N` モードで実際に UDS 制御ソケットを持つプロセスを
-## 立ち上げる。テストプロセス自身がその子プロセスの親になるので、後始末は
-## `terminate` + `waitForExit` で確実に行う（adopt 側が「自分の子ではない」
-## 前提で動くこととは独立に、テスト自身はちゃんと親として刈り取る）。
+## Tests that need to create a "live master" (aoAdopted / aoMismatch /
+## the fkLocal adopt) do this by hand, following the same procedure as
+## `daemon/hostsession.spawnMaster` (build the command via
+## `muxclient.masterCommandLine` and `startProcess`), and launch a real
+## process holding a UDS control socket using fake ssh's `-M -N` mode. The
+## test process itself becomes the parent of that child process, so
+## cleanup is done reliably with `terminate` + `waitForExit` (independent
+## of the adopt side operating on the premise of "not my own child", the
+## test itself properly reaps it as the parent).
 
 import std/[unittest, os, options, monotimes, times, strutils, osproc, tables]
 import std/asyncnet
@@ -29,11 +32,11 @@ const fixturesDir = currentSourcePath().parentDir() / "fixtures"
 const testRuntimeDir = "/tmp/pw-orp-rt"
 
 # ---------------------------------------------------------------------------
-# セットアップ / ヘルパー
+# Setup / helpers
 # ---------------------------------------------------------------------------
 
 proc withMode(mode: string; body: proc()) =
-  ## `POWARDER_FAKE_SSH_MODE` を一時的に切り替えてテスト本体を実行する。
+  ## Temporarily switches `POWARDER_FAKE_SSH_MODE` and runs the test body.
   let had = existsEnv("POWARDER_FAKE_SSH_MODE")
   let old = getEnv("POWARDER_FAKE_SSH_MODE")
   putEnv("POWARDER_FAKE_SSH_MODE", mode)
@@ -56,17 +59,19 @@ proc setupSuite() =
 setupSuite()
 
 var allMasters: seq[Process]
-  ## 後片付け漏れを防ぐため、テストで自前起動した fake ssh マスターを
-  ## 全部覚えておいてファイルの末尾で確実に terminate する。
+  ## To avoid missing cleanup, remember every fake ssh master that the
+  ## test launched by hand, and reliably terminate them all at the end of
+  ## the file.
 
 proc trackMaster(p: Process): Process =
   allMasters.add(p)
   p
 
 proc startFakeMaster(host, ctlPath, logPath: string): Process =
-  ## `hostsession.spawnMaster` と同じ手順で fake ssh の `-M -N` マスターを
-  ## 直接起動する（`adoptOrphans` の対象は「デーモンが管理していない
-  ## 既存プロセス」なので、`HostSession` は経由せずここで自前に起動する）。
+  ## Directly launches a fake ssh `-M -N` master using the same procedure
+  ## as `hostsession.spawnMaster` (since what `adoptOrphans` targets is "an
+  ## existing process the daemon doesn't manage", we launch it by hand here
+  ## rather than going through `HostSession`).
   let cmd = masterCommandLine(ctlPath, logPath, host)
   result = trackMaster(startProcess(cmd[0], args = cmd[1 .. ^1], options = {}))
 
@@ -92,18 +97,20 @@ proc waitForSocket(path: string; timeoutMs = 3000): bool =
   true
 
 proc touchDeadSocket(path: string) =
-  ## `bind` だけして `listen` しない UNIX ソケットファイルを作る。
-  ## listen していない UDS への `connect` は `ECONNREFUSED` になる
-  ## （実測どおりの「マスター死亡・ソケットファイルは残っている」を模擬する）。
+  ## Creates a UNIX socket file that only `bind`s and never `listen`s.
+  ## `connect`ing to a UDS that isn't listening results in `ECONNREFUSED`
+  ## (this simulates the "master is dead, but the socket file remains"
+  ## situation, matching what was observed in practice).
   removeFile(path)
   let s = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_NONE, buffered = false)
   s.bindUnix(path)
   s.close()
 
 proc newUnixListener(path: string): AsyncSocket =
-  ## `bind` + `listen` する UNIX ソケット。`accept` を回さなくても、
-  ## listen backlog があるので `connect` はカーネルレベルで即座に成立する
-  ## （`probeUpstream` は connect + 即 close だけなのでこれで十分）。
+  ## A UNIX socket that does `bind` + `listen`. Even without running
+  ## `accept`, the listen backlog means `connect` succeeds immediately at
+  ## the kernel level (since `probeUpstream` only does connect + an
+  ## immediate close, this is sufficient).
   removeFile(path)
   result = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_NONE, buffered = false)
   result.bindUnix(path)
@@ -115,11 +122,11 @@ proc nextPort(): Port =
   Port(portCounter)
 
 # ---------------------------------------------------------------------------
-# 1. 制御ソケットが無い記録 -> aoNoSocket
+# 1. A record with no control socket -> aoNoSocket
 # ---------------------------------------------------------------------------
 
 suite "aoNoSocket":
-  test "制御ソケットが無い記録は aoNoSocket になり、記録が捨てられる":
+  test "a record with no control socket becomes aoNoSocket, and the record is discarded":
     let reg = newRegistry()
     let st = PersistedState(version: 1, savedAt: "", hosts: @[
       PersistedHostSession(host: "h-nosocket", fingerprint: "fp-nosocket",
@@ -136,11 +143,11 @@ suite "aoNoSocket":
     check reg.hosts.len == 0
 
 # ---------------------------------------------------------------------------
-# 2. -O check が失敗する記録 -> aoDeadReclaimed、残骸ソケット削除
+# 2. A record where -O check fails -> aoDeadReclaimed, stale socket removed
 # ---------------------------------------------------------------------------
 
 suite "aoDeadReclaimed":
-  test "-O check が失敗する記録は aoDeadReclaimed になり、残骸ソケットが削除される":
+  test "a record where -O check fails becomes aoDeadReclaimed, and the stale socket is removed":
     withMode("no-master", proc() =
       let ctlPath = testRuntimeDir / "dead.sock"
       touchDeadSocket(ctlPath)
@@ -162,13 +169,13 @@ suite "aoDeadReclaimed":
       check reg.hosts.len == 0)
 
 # ---------------------------------------------------------------------------
-# 3. 生きているマスター -> aoAdopted、adopted=true で登録
-# 8. adopted ホストは process.isNone。tick を繰り返しても peekExitCode を
-#    使わない（クラッシュしない）
+# 3. A live master -> aoAdopted, registered with adopted=true
+# 8. An adopted host has process.isNone. Repeatedly calling tick does not
+#    use peekExitCode (does not crash)
 # ---------------------------------------------------------------------------
 
 suite "aoAdopted":
-  test "生きているマスターが aoAdopted になり、reg.hosts に adopted=true で登録される。process.isNone で tick してもクラッシュしない":
+  test "a live master becomes aoAdopted and is registered into reg.hosts with adopted=true; tick does not crash with process.isNone":
     withMode("ok", proc() =
       let host = "adopt-host-alive"
       let ctlPath = testRuntimeDir / "alive.sock"
@@ -195,13 +202,16 @@ suite "aoAdopted":
         adoptedHs = hs
       check adoptedHs != nil
       check adoptedHs.adopted
-      check adoptedHs.process.isNone ## ★項目8: 自分の子ではないので process は常に none
+      check adoptedHs.process.isNone ## IMPORTANT: item 8: process is
+                                      ## always none since this is not our
+                                      ## own child
       check adoptedHs.state == hsConnected
       check adoptedHs.pid == pid
 
-      # ★項目8続き: `process` が none でも `tick` を繰り返し呼んでクラッシュ
-      # しないこと（`ownProcessExited` が `peekExitCode` を呼ぼうとすると
-      # `Option` の unpack で例外になる）。
+      # IMPORTANT: item 8 continued: repeatedly calling `tick` does not
+      # crash even when `process` is none (if `ownProcessExited` tried to
+      # call `peekExitCode`, unpacking the `Option` would raise an
+      # exception).
       for i in 0 ..< 5:
         tick(adoptedHs)
         check adoptedHs.state == hsConnected
@@ -209,11 +219,11 @@ suite "aoAdopted":
       stopFakeMaster(p, ctlPath))
 
 # ---------------------------------------------------------------------------
-# 4. cmdline が一致しない -> aoMismatch、何もしない
+# 4. cmdline doesn't match -> aoMismatch, do nothing
 # ---------------------------------------------------------------------------
 
 suite "aoMismatch":
-  test "cmdlineMatches が一致しない記録は aoMismatch になり、何もしない":
+  test "a record whose cmdlineMatches doesn't match becomes aoMismatch, and nothing is done":
     withMode("ok", proc() =
       let host = "adopt-host-mismatch"
       let ctlPath = testRuntimeDir / "mismatch.sock"
@@ -234,18 +244,18 @@ suite "aoMismatch":
 
       check report.hosts.len == 1
       check report.hosts[0].outcome == aoMismatch
-      check reg.hosts.len == 0 ## adopt していない
+      check reg.hosts.len == 0 ## Not adopted
 
       stopFakeMaster(p, ctlPath))
 
 # ---------------------------------------------------------------------------
-# 5. UDS が生きている fkLocal Forward -> fwActive として引き継がれる
-# 6. UDS が死んでいる fkLocal Forward -> 残骸削除 + fwPending
-# 7. fkRemote Forward -> 楽観的に fwPending
+# 5. An fkLocal Forward whose UDS is alive -> taken over as fwActive
+# 6. An fkLocal Forward whose UDS is dead -> debris removed + fwPending
+# 7. An fkRemote Forward -> optimistically fwPending
 # ---------------------------------------------------------------------------
 
-suite "forward の adopt":
-  test "UDS が生きている fkLocal は fwActive として引き継がれる":
+suite "adopting a forward":
+  test "an fkLocal with a live UDS is taken over as fwActive":
     withMode("ok", proc() =
       let host = "adopt-host-fwd-alive"
       let ctlPath = testRuntimeDir / "fwd-alive-host.sock"
@@ -274,9 +284,11 @@ suite "forward の adopt":
       let report = adoptOrphans(reg, st)
 
       check report.hosts[0].outcome == aoAdopted
-      # `report.adoptedForwards` には `forward.adoptForward` が決定的に導出した
-      # `fw.id`（`forwardId(spec, host)`）が入る。persisted 側の id
-      # （"fwd-alive-id"）とは無関係なので、内容ではなく件数だけを見る。
+      # `report.adoptedForwards` contains the `fw.id` that
+      # `forward.adoptForward` deterministically derives
+      # (`forwardId(spec, host)`). It has nothing to do with the persisted
+      # side's id ("fwd-alive-id"), so we check only the count, not the
+      # content.
       check report.adoptedForwards.len == 1
       check report.reattachForwards.len == 0
 
@@ -290,7 +302,7 @@ suite "forward の adopt":
       forward.teardown(fws[0])
       stopFakeMaster(p, ctlPath))
 
-  test "UDS が死んでいる fkLocal は残骸が削除されて fwPending になる":
+  test "an fkLocal with a dead UDS has its debris removed and becomes fwPending":
     withMode("ok", proc() =
       let host = "adopt-host-fwd-dead"
       let ctlPath = testRuntimeDir / "fwd-dead-host.sock"
@@ -321,7 +333,7 @@ suite "forward の adopt":
 
       check report.adoptedForwards.len == 0
       check report.reattachForwards == @["fwd-dead-id"]
-      check not socketExists(udsPath) ## 残骸が削除されている
+      check not socketExists(udsPath) ## The debris has been removed
 
       let fws = forwardsOfTunnel(reg, "t-dead")
       check fws.len == 1
@@ -330,7 +342,7 @@ suite "forward の adopt":
       forward.teardown(fws[0])
       stopFakeMaster(p, ctlPath))
 
-  test "fkRemote は楽観的に fwPending になる":
+  test "fkRemote optimistically becomes fwPending":
     withMode("ok", proc() =
       let host = "adopt-host-fwd-remote"
       let ctlPath = testRuntimeDir / "fwd-remote-host.sock"
@@ -368,7 +380,7 @@ suite "forward の adopt":
       stopFakeMaster(p, ctlPath))
 
 # ---------------------------------------------------------------------------
-# 後片付け
+# Cleanup
 # ---------------------------------------------------------------------------
 
 for p in allMasters:
@@ -385,12 +397,16 @@ delEnv("POWARDER_FAKE_SSH_MODE")
 delEnv("POWARDER_FAKE_SSH_LOG")
 delEnv("POWARDER_RUNTIME_DIR")
 
-# fake ssh のリスナー（nc / python3 / perl）は、`hostsession.teardown` が最終手段の
-# SIGKILL を送ると fake ssh 側の trap が発火しないため孤児化して残る。残ったままだと
-# 親から継承した pipe が閉じず、`nimble test` が EOF を待って**ハングする**
-# （実測: Linux コンテナで3時間ハングした）。fake ssh 側で fd を閉じる方法は
-# dash の挙動と asyncdispatch の fd 継承の2点で壊れたため、ここで確実に掃除する。
+# The fake ssh listener (nc / python3 / perl) is orphaned and left behind
+# when `hostsession.teardown`'s last resort, SIGKILL, is sent, because the
+# fake ssh's trap never fires. If it's left behind, the pipe inherited from
+# the parent never closes, and `nimble test` **hangs** waiting for EOF
+# (observed in practice: hung for 3 hours in a Linux container). The
+# approach of closing the fd on the fake ssh side broke on two points --
+# dash's behavior and asyncdispatch's fd inheritance -- so we clean it up
+# reliably here instead.
 #
-# `[p]` のブラケットは `pkill` が自分自身のコマンドラインにマッチして自滅するのを
-# 防ぐための定石（実測で踏んだ。exit 144 になる）。
+# The `[p]` bracket trick is the standard idiom for preventing `pkill` from
+# matching its own command line and killing itself (hit this in practice;
+# it results in exit 144).
 discard execShellCmd("pkill -f '" & testRuntimeDir & "' >/dev/null 2>&1 || true")

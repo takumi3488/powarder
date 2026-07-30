@@ -1,37 +1,43 @@
-## `ssh` を ControlMaster として起動し、`-O forward` / `-O cancel` / `-O check` /
-## `-O exit` / `-G` を短命プロセスとして起動して結果を取得する層。
+## The layer that runs `ssh` as a ControlMaster, and runs `-O forward` /
+## `-O cancel` / `-O check` / `-O exit` / `-G` as short-lived processes to
+## obtain their results.
 ##
-## **判定ロジックはここには置かない。** `ssh -O ...` の成否判定
-## （文言マッチ・優先順位）は `core/muxparse.nim` に、`ssh -G` の出力パースは
-## `core/sshgparse.nim` に、それぞれ純粋関数として既に実装済みなので、この
-## モジュールは「プロセスを起動して `(exitCode, stdout, stderr)` を得る」ことと
-## 「その3つ組を上記モジュールへそのまま渡す」ことだけに専念する。
+## **Judgement logic is not placed here.** The success/failure judgement
+## for `ssh -O ...` (message matching, priority order) is already
+## implemented as pure functions in `core/muxparse.nim`, and the parsing
+## of `ssh -G` output is in `core/sshgparse.nim`. This module focuses
+## solely on "start the process and obtain `(exitCode, stdout, stderr)`"
+## and "pass that triple through to the modules above as-is".
 ##
-## ## stdout / stderr を分離して取る際の注意（このモジュールの核心）
+## ## Care taken when capturing stdout / stderr separately (the core of this module)
 ##
-## `std/osproc` で子プロセスの標準出力・標準エラーをそれぞれ別の pipe として
-## 受け取り、`waitForExit` を先に呼んでから読もうとすると、パイプの
-## バッファが埋まった時点で子プロセスがブロックし、親はいつまでも
-## `waitForExit` から返ってこないというデッドロックが起きる
-## (https://github.com/nim-lang/Nim/issues/956)。
+## When you receive a child process's stdout and stderr as separate pipes
+## with `std/osproc`, and call `waitForExit` before reading from them, the
+## child process blocks once a pipe's buffer fills up, and the parent
+## never returns from `waitForExit` -- a deadlock
+## (https://github.com/nim-lang/Nim/issues/956).
 ##
-## かといって `poStdErrToStdOut` で1本のストリームにまとめてしまうと、
-## stdout と stderr を区別できなくなる。これは powarder にとって許容できない:
-## - `-O check` が生存中のマスターについて出す `Master running (pid=N)` は
-##   **stderr** に出る（実測確認済み）
-## - `-R 0:...` のような動的割り当てポート番号は `mux.c` が
-##   `fprintf(stdout, ...)` で出すため **stdout** に出る
+## On the other hand, if we merge them into a single stream with
+## `poStdErrToStdOut`, we lose the ability to distinguish stdout from
+## stderr. That is not acceptable for powarder:
+## - The `Master running (pid=N)` that `-O check` prints for a live
+##   master comes out on **stderr** (verified empirically)
+## - A dynamically-assigned port number like `-R 0:...` comes out on
+##   **stdout**, because `mux.c` prints it via `fprintf(stdout, ...)`
 ##
-## そこで pipe を一切使わず、`/bin/sh -c '... >outfile 2>errfile'` という
-## シェルリダイレクトでファイルに落として実行し、`waitForExit` の後にそれぞれの
-## ファイルを読む方式を採る。子プロセスの出力は pipe ではなくファイルに向かうため、
-## pipe バッファが埋まるという状況そのものが発生せず、#956 のデッドロックは
-## 原理的に起こらない。（powarder はマスターのログ出力も同じ理由でシェル
-## リダイレクトにしている。`masterCommandLine` を参照。方式を揃えている。）
+## So we avoid pipes entirely and instead run via a shell redirect --
+## `/bin/sh -c '... >outfile 2>errfile'` -- dropping the output into
+## files, then read each file after `waitForExit` returns. Since the
+## child process's output goes to files rather than pipes, the situation
+## of a pipe buffer filling up never arises in the first place, so the
+## #956 deadlock cannot happen by construction. (powarder also redirects
+## the master's log output via a shell redirect for the same reason. See
+## `masterCommandLine`. The approach is kept consistent.)
 ##
-## `args` はすべて `quoteShell` / `quoteShellCommand` でエスケープしてから
-## シェルコマンド文字列に埋め込む。ホスト名やパスに空白・シェル特殊文字が
-## 含まれていても壊れないようにするため。
+## All `args` are escaped with `quoteShell` / `quoteShellCommand` before
+## being embedded into the shell command string, so that things don't
+## break even if a host name or path contains whitespace or shell special
+## characters.
 
 import std/[os, osproc]
 import powarder/core/types
@@ -49,35 +55,40 @@ type
     stderr*: string
 
 var callCounter = 0
-  ## `runSsh` の呼び出しごとに一意な一時ファイル名を作るための単調増加カウンタ。
-  ## powarder デーモンはシングルスレッドの非同期イベントループで動く前提だが、
-  ## 同一プロセス内で PID だけに頼ると衝突しうるためこれと組み合わせる。
+  ## Monotonically increasing counter used to build a unique temp file
+  ## name for each `runSsh` call. The powarder daemon is premised on
+  ## running as a single-threaded async event loop, but relying on the
+  ## PID alone within the same process could still collide, hence this is
+  ## combined with it.
 
 proc nextTmpId(): string =
   inc callCounter
   $getCurrentProcessId() & "-" & $callCounter
 
 proc ensureTmpDir(): string =
-  ## 一時ファイルの置き場を用意する。
+  ## Prepares a place to put temp files.
   ##
-  ## `core/paths.ensureRuntimeDir()` は ControlPath / forward UDS 用に
-  ## `sun_path` の長さまで検証するが、ここに置くのは普通のファイル（UDS ではない）
-  ## なのでその検証は不要かつ無関係。ディレクトリを作るだけにとどめる。
+  ## `core/paths.ensureRuntimeDir()` validates against the `sun_path`
+  ## length limit for ControlPath / forward UDS use, but what we put here
+  ## is a plain file (not a UDS), so that validation is unnecessary and
+  ## irrelevant. We just create the directory.
   result = runtimeDir()
   createDir(result)
 
 proc runSsh*(args: openArray[string]): MuxResult =
-  ## `ssh` を短命プロセスとして実行し、終了コードと stdout/stderr を分離して返す。
-  ## pipe を使わずシェルリダイレクト経由でファイルに落とすので #956 の
-  ## デッドロックが起きない（詳細はモジュール doc comment を参照）。
+  ## Runs `ssh` as a short-lived process and returns the exit code and
+  ## stdout/stderr separately. Since we drop the output into files via a
+  ## shell redirect instead of using pipes, the #956 deadlock cannot occur
+  ## (see the module doc comment for details).
   let dir = ensureTmpDir()
   let id = nextTmpId()
   let outPath = dir / ("mux-" & id & ".out")
   let errPath = dir / ("mux-" & id & ".err")
 
   let sshArgs = @["ssh"] & @args
-  # `exec` を付けて sh 自身を ssh に置き換える必然性はここでは無いが、
-  # masterCommandLine と方式を揃えるため同じイディオムを使う。
+  # There's no strict necessity here for `exec` to replace the sh process
+  # itself with ssh, but we use the same idiom to keep the approach
+  # consistent with masterCommandLine.
   let cmd = "exec " & quoteShellCommand(sshArgs) &
     " >" & quoteShell(outPath) & " 2>" & quoteShell(errPath)
 
@@ -93,92 +104,109 @@ proc runSsh*(args: openArray[string]): MuxResult =
     let errData = if fileExists(errPath): readFile(errPath) else: ""
     result = MuxResult(exitCode: exitCode, stdout: outData, stderr: errData)
   finally:
-    # `os.removeFile` は unlink なので対象が無くてもエラーにならない。
-    # try/finally で確実に消し、一時ファイルが残留しないようにする。
+    # `os.removeFile` is unlink, so it's not an error if the target
+    # doesn't exist. We use try/finally to reliably remove it so no temp
+    # file is left behind.
     removeFile(outPath)
     removeFile(errPath)
 
 proc checkMaster*(ctlPath, host: string): tuple[alive: bool, pid: int] =
-  ## `ssh -S <ctlPath> -O check <host>`。
-  ## 判定は `core/muxparse.parseCheckResult` に委譲する。
+  ## `ssh -S <ctlPath> -O check <host>`.
+  ## Judgement is delegated to `core/muxparse.parseCheckResult`.
   let r = runSsh(["-S", ctlPath, "-O", "check", host])
   parseCheckResult(r.exitCode, r.stdout, r.stderr)
 
 proc addForward*(ctlPath, host: string; spec: ForwardSpec;
     udsPath = ""): MuxOutcome =
-  ## `ssh -S <ctlPath> -O forward -L|-R <arg> <host>`。
-  ## 引数文字列は `core/forwardspec.toSshForwardArg` で組む。`spec.kind` は
-  ## `ForwardKind` の enum 値そのものが `"L"` / `"R"` の文字列表現を持つため
-  ## `$spec.kind` でそのまま `-L` / `-R` のフラグ文字が得られる。
-  ## 判定は `core/muxparse.parseForwardResult` に委譲する。
+  ## `ssh -S <ctlPath> -O forward -L|-R <arg> <host>`.
+  ## The argument string is built via `core/forwardspec.toSshForwardArg`.
+  ## `spec.kind` is such that the `ForwardKind` enum value itself carries
+  ## the string representation of `"L"` / `"R"`, so `$spec.kind` directly
+  ## yields the `-L` / `-R` flag character. Judgement is delegated to
+  ## `core/muxparse.parseForwardResult`.
   let arg = toSshForwardArg(spec, udsPath)
   let r = runSsh(["-S", ctlPath, "-O", "forward", "-" & $spec.kind, arg, host])
   parseForwardResult(r.exitCode, r.stdout, r.stderr)
 
 proc cancelForward*(ctlPath, host: string; spec: ForwardSpec;
     udsPath = ""): MuxOutcome =
-  ## `ssh -S <ctlPath> -O cancel -L|-R <arg> <host>`。
-  ## **exit code は一切信用できない**（実測: cancel は正常系・失敗系のいずれも
-  ## 0 を返す）。判定は stderr の文言だけを見る
-  ## `core/muxparse.parseCancelResult` に委譲する。
+  ## `ssh -S <ctlPath> -O cancel -L|-R <arg> <host>`.
+  ## **The exit code cannot be trusted at all** (measured in practice:
+  ## cancel returns 0 both on success and on failure). Judgement is
+  ## delegated to `core/muxparse.parseCancelResult`, which looks only at
+  ## the stderr message.
   let arg = toSshForwardArg(spec, udsPath)
   let r = runSsh(["-S", ctlPath, "-O", "cancel", "-" & $spec.kind, arg, host])
   parseCancelResult(r.exitCode, r.stdout, r.stderr)
 
 proc exitMaster*(ctlPath, host: string): MuxOutcome =
-  ## `ssh -S <ctlPath> -O exit <host>`。マスターを終了させる。
+  ## `ssh -S <ctlPath> -O exit <host>`. Terminates the master.
   ##
-  ## `core/muxparse.nim` に `-O exit` 専用の判定関数は無い。`-O exit` の
-  ## 終了コードは `-O forward` と同様に信用できる（成功 0 / 制御ソケットに
-  ## 繋がらなければ 255）ため、`parseCancelResult`（exit code を無視し stderr が
-  ## 空かどうかで判定する）ではなく `parseForwardResult` に委譲する。こうすると
-  ## 成功時に stderr へ出る `Exit request sent.` のような付随メッセージが
-  ## あっても exitCode 0 を優先して `moSuccess` と判定でき、かつ制御ソケットに
-  ## 繋がらない場合は `moNoMaster` に正しく分類される。
+  ## `core/muxparse.nim` has no dedicated judgement function for `-O
+  ## exit`. The exit code for `-O exit` can be trusted the same way as
+  ## for `-O forward` (0 on success / 255 if it can't connect to the
+  ## control socket), so we delegate to `parseForwardResult` rather than
+  ## `parseCancelResult` (which ignores the exit code and judges based on
+  ## whether stderr is empty). This way, even if an incidental message
+  ## like `Exit request sent.` appears on stderr on success, we can still
+  ## correctly judge `moSuccess` by prioritizing exitCode 0, and the case
+  ## where the control socket can't be reached is still correctly
+  ## classified as `moNoMaster`.
   let r = runSsh(["-S", ctlPath, "-O", "exit", host])
   parseForwardResult(r.exitCode, r.stdout, r.stderr)
 
 proc resolveSshConfig*(host: string; extraArgs: openArray[string] = []): SshConfigResolved =
-  ## `ssh -G <host> <extraArgs>` を実行し `core/sshgparse.parseSshG` でパースする。
+  ## Runs `ssh -G <host> <extraArgs>` and parses it with
+  ## `core/sshgparse.parseSshG`.
   ##
-  ## **stdout のみをパースする。** stderr には
-  ## `Pseudo-terminal will not be allocated because stdin is not a terminal.` が
-  ## 混ざることがある（実測確認済み）。`runSsh` がファイルリダイレクト方式で
-  ## 両者を分離しているので、ここで `r.stdout` だけを渡せば自然に対処できる。
+  ## **Only stdout is parsed.** stderr can have `Pseudo-terminal will not
+  ## be allocated because stdin is not a terminal.` mixed into it
+  ## (verified empirically). Since `runSsh` separates the two via the
+  ## file-redirect approach, this is handled naturally simply by passing
+  ## `r.stdout` alone here.
   let r = runSsh(@["-G", host] & @extraArgs)
   parseSshG(r.stdout)
 
 proc masterCommandLine*(ctlPath, logPath, host: string;
                         extraArgs: openArray[string] = []): seq[string] =
-  ## ControlMaster を起動する `/bin/sh -c 'exec ssh ...'` のコマンドライン全体を
-  ## 組み立てる。**プロセスの起動自体はしない**（それは hostsession 層の責務）。
-  ## adopt 時（既存プロセスへの再接続）の `ps` 出力との照合にも使うので、
-  ## 常に決定的な文字列を返す。
+  ## Builds the full command line for `/bin/sh -c 'exec ssh ...'` that
+  ## starts the ControlMaster. **Does not start the process itself** (that
+  ## is the responsibility of the hostsession layer). Also used to match
+  ## against `ps` output during adopt (reconnecting to an existing
+  ## process), so it always returns a deterministic string.
   ##
-  ## 各オプションの理由（実機検証で確定済み。変更しないこと）:
+  ## Rationale for each option (confirmed via on-machine verification; do not change):
   ##
-  ## - `exec`: `sh` プロセス自身を `ssh` で置き換える。これにより監視対象の
-  ##   PID がラッパーの sh ではなく ssh 本体になる（実測確認済み）
-  ## - `-M -S <ctlPath>`: ControlMaster として起動し、以後 `-O forward` で
-  ##   フォワードを後付けできるようにする
-  ## - `-N`: リモートコマンドを実行しない
-  ## - `-v`: stderr にエラー分類の材料（`core/errorclass` が使う）を出させる
-  ## - `BatchMode=yes`: TTY の無いデーモンで対話プロンプトにハングしない
-  ## - `ControlPersist=no`: **これが無いとマスターがバックグラウンドに移行して
-  ##   `ssh -f` と同じく PPID=1 に孤児化し、`peekExitCode` で追跡できなくなる。**
-  ##   ユーザーの ssh_config に `ControlPersist` が書かれている場合に備えて
-  ##   常に明示的に上書きする
-  ## - `StreamLocalBindUnlink=yes`: **必須。** `-O cancel` してもソケット
-  ##   ファイルは残る（ssh は unlink しない）ため、デフォルトの `no` では
-  ##   同じ UDS パスへの再 attach が exit 255 + `Port forwarding failed` で
-  ##   **必ず失敗する**（実測確認済み）。マスター再接続後の再 attach で毎回
-  ##   通る経路なので、無いと再接続が永久に失敗する
-  ## - `StreamLocalBindMask=0177`: forward の UDS を 0600 相当で作らせる
-  ## - `ExitOnForwardFailure` は付けない: マスターのコマンドラインに
-  ##   `-L`/`-R` を書かず全て `-O forward` で後付けする設計なので、このオプ
-  ##   ションが効く経路（起動時の初期フォワード設定）を通らない。付けても
-  ##   無意味であり、「1本の forward 失敗がマスターを巻き込まない」性質は
-  ##   OpenSSH の実装として既に保証されている
+  ## - `exec`: replaces the `sh` process itself with `ssh`. This makes the
+  ##   monitored PID the ssh binary itself rather than the wrapper sh
+  ##   (verified empirically)
+  ## - `-M -S <ctlPath>`: starts it as a ControlMaster, so forwards can be
+  ##   attached afterward via `-O forward`
+  ## - `-N`: don't execute a remote command
+  ## - `-v`: makes ssh emit material on stderr for error classification
+  ##   (used by `core/errorclass`)
+  ## - `BatchMode=yes`: so a TTY-less daemon doesn't hang on an
+  ##   interactive prompt
+  ## - `ControlPersist=no`: **without this, the master would move to the
+  ##   background just like `ssh -f`, get orphaned under PPID=1, and
+  ##   become untrackable via `peekExitCode`.** Always explicitly
+  ##   overridden in case the user's ssh_config has `ControlPersist` set
+  ## - `StreamLocalBindUnlink=yes`: **required.** Even after `-O cancel`,
+  ##   the socket file is left behind (ssh does not unlink it), so with
+  ##   the default of `no`, re-attaching to the same UDS path would
+  ##   **always fail** with exit 255 + `Port forwarding failed` (verified
+  ##   empirically). This is a path we go through every time on re-attach
+  ##   after a master reconnect, so without this, reconnection would fail
+  ##   forever
+  ## - `StreamLocalBindMask=0177`: makes the forward's UDS get created
+  ##   with the equivalent of 0600
+  ## - `ExitOnForwardFailure` is not set: since we never write `-L`/`-R`
+  ##   into the master's command line and always attach everything
+  ##   afterward via `-O forward`, we never go through the path where
+  ##   this option would take effect (initial forward setup at startup).
+  ##   Setting it would be meaningless, and the property that "a single
+  ##   forward's failure doesn't take down the master" is already
+  ##   guaranteed by OpenSSH's implementation regardless
   let sshArgs = @["ssh", "-M", "-S", ctlPath, "-N", "-v",
                   "-o", "BatchMode=yes",
                   "-o", "ControlPersist=no",

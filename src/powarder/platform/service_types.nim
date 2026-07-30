@@ -1,51 +1,55 @@
-## `platform/service*` 群が共有する型・定数・純粋ヘルパのみを集めたモジュール。
+## A module that only collects the types, constants, and pure helpers
+## shared by the `platform/service*` family.
 ##
-## ### なぜこのモジュールが存在するか（循環 import の解消）
+## ### Why this module exists (resolving the circular import)
 ##
-## 以前は `service.nim` がこれらの型を直接持ち、`service_darwin` /
-## `service_linux` がその型を使うために `service.nim` を import する一方、
-## `service.nim` 自身も OS 判定で `service_darwin` / `service_linux` を
-## import していた（= 3モジュールの相互 import）。
+## Previously, `service.nim` held these types directly, and while
+## `service_darwin` / `service_linux` imported `service.nim` to use those
+## types, `service.nim` itself also imported `service_darwin` /
+## `service_linux` based on OS detection (= a mutual import among all
+## three modules).
 ##
-## Nim はこの手の循環 import を許容するが、**どのモジュールを最初に
-## コンパイルするか（エントリモジュール）によって結果が変わる**という
-## 罠がある。`service_darwin` / `service_linux` を先に import したり、
-## それらを単独でルートモジュールとしてコンパイルすると、Nim は循環を
-## 「部分的にコンパイルされた空のモジュール」として解決してしまい、
-## "undeclared identifier" で失敗する。
+## Nim tolerates this kind of circular import, but there is a trap where
+## **the result changes depending on which module is compiled first (the
+## entry module)**. If `service_darwin` / `service_linux` are imported
+## first, or compiled standalone as the root module, Nim resolves the
+## cycle as a "partially compiled empty module," and it fails with
+## "undeclared identifier."
 ##
-## そこで型・定数・純粋ヘルパをこの `service_types` に切り出し、
-## 依存の向きを
+## So the types, constants, and pure helpers were extracted into this
+## `service_types`, making the dependency direction
 ##
 ##   service_types  ←  service_darwin / service_linux  ←  service
 ##
-## という一方向にした。`service_types` は他の `powarder/platform/service*`
-## を一切 import しない（`std/*` のみ）ので、ここを起点に何をどの順番で
-## import しても循環は発生しない。
+## one-way. `service_types` never imports any other
+## `powarder/platform/service*` module at all (only `std/*`), so no matter
+## what order things are imported starting from here, no cycle occurs.
 ##
-## ★このモジュールに手を入れる人へ: **型やヘルパを `service.nim` 側に
-## 戻すと、この一方向の依存構造が壊れて循環 import が復活する。**
-## 新しい型・定数・純粋ヘルパを追加する場合は、`service_darwin` /
-## `service_linux` の双方から必要とされるものだけをここに置くこと。
+## IMPORTANT for anyone touching this module: **moving types or helpers
+## back into `service.nim` breaks this one-way dependency structure and
+## brings back the circular import.** When adding a new type, constant, or
+## pure helper, place here only what is needed by both `service_darwin`
+## and `service_linux`.
 
 type
   ServiceStatus* = enum
-    ssNotInstalled ## unit/plist ファイルが無い
-    ssInstalled    ## 登録されているが起動していない
-    ssRunning      ## 登録されていて起動中
-    ssUnknown      ## launchctl / systemctl の問い合わせ自体に失敗した
+    ssNotInstalled ## No unit/plist file exists
+    ssInstalled    ## Registered but not running
+    ssRunning      ## Registered and running
+    ssUnknown      ## The launchctl / systemctl query itself failed
 
   ServiceInfo* = object
-    label*: string    ## "dev.powarder.daemon"
-    unitPath*: string ## plist / unit ファイルのパス
+    label*: string      ## "dev.powarder.daemon"
+    unitPath*: string   ## Path to the plist / unit file
     status*: ServiceStatus
-    notes*: seq[string] ## ユーザーへの案内（loginctl enable-linger など）
+    notes*: seq[string] ## Guidance for the user (loginctl enable-linger, etc.)
 
 const
   commonServiceLabel = "dev.powarder.daemon"
 
 proc serviceLabel*(): string =
-  ## OS に依らず同じラベル文字列。macOS の plist `Label` キーや、案内メッセージ中の
-  ## 識別子として使う（systemd 側は unit ファイル名自体は `powarder.service` に
-  ## なるが、`Label` に相当する概念としてこの文字列を流用する）。
+  ## The same label string regardless of OS. Used as macOS's plist `Label`
+  ## key, and as an identifier within guidance messages (on the systemd
+  ## side, the unit file name itself becomes `powarder.service`, but this
+  ## string is reused as the concept corresponding to `Label`).
   commonServiceLabel

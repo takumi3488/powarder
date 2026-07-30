@@ -1,6 +1,7 @@
-## `powarder/core/sshgparse` のユニットテスト。
-## サンプルは 2026-07-29 に OpenSSH_10.2p1 (macOS) の `ssh -G localhost` を
-## 実測した出力形式に基づく（stdout のみ。stderr の警告文は含めない）。
+## Unit tests for `powarder/core/sshgparse`.
+## The sample is based on the output format empirically captured on
+## 2026-07-29 from `ssh -G localhost` on OpenSSH_10.2p1 (macOS) (stdout only;
+## stderr warning lines are not included).
 
 import std/unittest
 import std/strutils
@@ -60,94 +61,96 @@ sendenv LC_*
 """
 
 suite "parseSshG":
-  test "88行相当のサンプルを行数どおりにパースできる":
+  test "can parse a sample equivalent to 88 lines, with the correct line count":
     let r = parseSshG(sampleStdout)
     check r.has("host")
     check r.has("hostname")
     check r.has("identityfile")
 
-  test "単一値キーは getFirst で取れる":
+  test "single-value keys can be read with getFirst":
     let r = parseSshG(sampleStdout)
     check r.getFirst("host") == "localhost"
     check r.getFirst("user") == "takumi.mori"
     check r.getFirst("port") == "22"
     check r.getFirst("pubkeyauthentication") == "true"
 
-  test "identityfile は複数行が seq[string] に集約される":
+  test "identityfile's multiple lines are collected into a seq[string]":
     let r = parseSshG(sampleStdout)
     let files = r.get("identityfile")
     check files.len == 5
     check files == @["~/.ssh/id_rsa", "~/.ssh/id_ecdsa", "~/.ssh/id_ecdsa_sk",
                       "~/.ssh/id_ed25519", "~/.ssh/id_ed25519_sk"]
 
-  test "sendenv も複数行が seq[string] に集約される":
+  test "sendenv's multiple lines are also collected into a seq[string]":
     let r = parseSshG(sampleStdout)
     check r.get("sendenv") == @["LANG", "LC_*"]
 
-  test "値の中に空白があっても maxsplit=1 で丸ごと保持される（globalknownhostsfile）":
+  test "a value containing whitespace is kept whole via maxsplit=1 (globalknownhostsfile)":
     let r = parseSshG(sampleStdout)
     check r.getFirst("globalknownhostsfile") ==
       "/etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2"
 
-  test "存在しないキーは get で空 seq, getFirst で既定値":
+  test "a missing key returns an empty seq from get, and the default from getFirst":
     let r = parseSshG(sampleStdout)
     check r.get("nosuchkey").len == 0
     check r.getFirst("nosuchkey") == ""
     check r.getFirst("nosuchkey", "fallback") == "fallback"
     check not r.has("nosuchkey")
 
-  test "キーは大文字小文字を区別せずに問い合わせできる":
+  test "keys can be queried case-insensitively":
     let r = parseSshG(sampleStdout)
     check r.getFirst("HOST") == "localhost"
     check r.has("Hostname")
 
-  test "空行は無視される":
+  test "blank lines are ignored":
     let r = parseSshG("host localhost\n\n\nport 22\n")
     check r.getFirst("host") == "localhost"
     check r.getFirst("port") == "22"
 
-  test "キーだけで値のない行（フォーマット不一致）は黙って無視される":
+  test "a key-only line with no value (format mismatch) is silently ignored":
     let r = parseSshG("host localhost\nthisisabrokenline\nport 22\n")
     check r.getFirst("host") == "localhost"
     check r.getFirst("port") == "22"
     check not r.has("thisisabrokenline")
 
-  test "stderr の警告文が誤って混入しても形式不一致として無視される":
-    # 実測: `ssh -G` は stderr に
+  test "a stray stderr warning line mixed in is ignored as a format mismatch":
+    # Empirically, `ssh -G` can emit a line like
     # "Pseudo-terminal will not be allocated because stdin is not a terminal."
-    # のような行を出すことがある。パース対象は stdout のみであるべきだが、
-    # 万一混ざっても壊れないことを保証する。
+    # on stderr. Only stdout should be parsed, but this guarantees nothing
+    # breaks even if such a line accidentally gets mixed in.
     let contaminated = sampleStdout &
       "Pseudo-terminal will not be allocated because stdin is not a terminal.\n"
     let r = parseSshG(contaminated)
     check r.getFirst("host") == "localhost"
-    # 警告文の1語目 "Pseudo-terminal" をキーとして誤登録していないこと
+    # Confirms the warning line's first word "Pseudo-terminal" was not
+    # mistakenly registered as a key.
     check not r.has("pseudo-terminal")
 
-  test "完全な空文字列を渡しても例外を投げない":
+  test "passing a completely empty string does not raise":
     let r = parseSshG("")
     check r.get("host").len == 0
 
 suite "fingerprint":
-  test "同じ内容なら行の出現順が違っても同じ fingerprint になる":
+  test "the same content produces the same fingerprint even if line order differs":
     let a = parseSshG("host x\nport 22\nuser bob\n")
     let b = parseSshG("user bob\nhost x\nport 22\n")
     check a.fingerprint() == b.fingerprint()
 
-  test "1つでも値が違えば別の fingerprint になる":
+  test "a single differing value produces a different fingerprint":
     let a = parseSshG("host x\nport 22\nuser bob\n")
     let b = parseSshG("host x\nport 23\nuser bob\n")
     check a.fingerprint() != b.fingerprint()
 
-  test "fingerprint は先頭16文字の小文字16進数":
+  test "fingerprint is the first 16 characters, lowercase hex":
     let r = parseSshG(sampleStdout)
     let fp = r.fingerprint()
     check fp.len == 16
     check fp == fp.toLowerAscii()
     check fp.allCharsInSet(HexDigits)
 
-  test "除外キー(sessiontype/requesttty/stdinnull/forkafterauthentication)のみの" &
-      "変化では fingerprint が変わらない":
+  test "a change touching only excluded keys " &
+      "(sessiontype/requesttty/stdinnull/forkafterauthentication) " &
+      "does not change the fingerprint":
     let a = parseSshG(sampleStdout)
     let modified = sampleStdout
       .replace("sessiontype default", "sessiontype none")
@@ -157,13 +160,13 @@ suite "fingerprint":
     let b = parseSshG(modified)
     check a.fingerprint() == b.fingerprint()
 
-  test "除外対象外のキー(hostname)が変われば fingerprint も変わる":
+  test "a change to a non-excluded key (hostname) does change the fingerprint":
     let a = parseSshG(sampleStdout)
     let modified = sampleStdout.replace("hostname localhost", "hostname example.com")
     let b = parseSshG(modified)
     check a.fingerprint() != b.fingerprint()
 
-  test "identityfile など seq 値の内容が変われば fingerprint も変わる":
+  test "a change to a seq-valued key's content (e.g. identityfile) changes the fingerprint":
     let a = parseSshG(sampleStdout)
     let modified = sampleStdout.replace("identityfile ~/.ssh/id_rsa\n", "")
     let b = parseSshG(modified)

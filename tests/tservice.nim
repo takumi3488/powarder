@@ -1,35 +1,38 @@
-## `powarder/platform/service`（OS サービス登録）のテスト。
+## Tests for `powarder/platform/service` (OS service registration).
 ##
-## **`launchctl` / `systemctl` を実際に呼ぶテストはしない。** ユーザーの実環境
-## （`~/Library/LaunchAgents/` や `~/.config/systemd/user/`、実際のサービス登録
-## 状態）を汚してしまうため。`installService` / `uninstallService` /
-## `serviceStatus` はここでは一切呼ばない。
+## **No test actually calls `launchctl` / `systemctl`,** since that would
+## pollute the user's real environment (`~/Library/LaunchAgents/` or
+## `~/.config/systemd/user/`, and the actual service registration state).
+## `installService` / `uninstallService` / `serviceStatus` are never called
+## here.
 ##
-## `renderUnitFile` / `unitFilePath` / `lingerNote` を純粋関数にしてあるので、
-## **生成される文字列だけ** を検証する方針にする。
+## `renderUnitFile` / `unitFilePath` / `lingerNote` have been made pure
+## functions, so the policy here is to verify **only the generated string**.
 ##
-## macOS/Linux 両方の出力を検証したいので、`platform/service`（現在の OS に
-## 応じて振り分けるフロントエンド）だけでなく `platform/service_darwin` /
-## `platform/service_linux` を **直接** import する。この2つのモジュールは
-## `launchctl`/`systemctl` バイナリの実体には一切依存しない（`osproc` 越しに
-## コマンド名を呼ぶだけの副作用関数を除けば、文字列組み立てのみの
-## クロスプラットフォームな Nim コード）ため、開発機が macOS でも Linux でも
-## 両方コンパイル・実行できる。
+## Since we want to verify both macOS and Linux output, this imports not
+## only `platform/service` (the frontend that dispatches based on the
+## current OS) but also `platform/service_darwin` / `platform/service_linux`
+## **directly**. Neither of these two modules depends at all on the actual
+## `launchctl`/`systemctl` binaries (aside from the side-effecting procs
+## that merely invoke a command name via `osproc`, they are cross-platform
+## Nim code that only assembles strings), so this compiles and runs on a dev
+## machine whether it's macOS or Linux.
 ##
-## **注意（このモジュールを読む上での罠）**: `powarder/platform/service` /
-## `service_darwin` / `service_linux` は、共通の型・`serviceLabel` を
-## `platform/service_types` から一方向に import する構成になっており
-## （`service_types` ← `service_darwin`/`service_linux` ← `service`）、
-## モジュール間の循環 import は無い。だが
-## **`unitFilePath` / `renderUnitFile` / `installService` / `uninstallService` /
-## `serviceStatus` は `service` / `service_darwin` / `service_linux` の
-## 3モジュールすべてに同名の proc として存在する**ため、このテストファイルの
-## ようにすべてを同時に import すると **必ず `service_darwin.xxx` /
-## `service_linux.xxx` のように修飾して呼ぶ必要がある**（非修飾で呼ぶと
-## `ambiguous call` になる。これは循環 import とは無関係な、単なる同名 proc の
-## 曖昧性の問題）。`serviceLabel` / `ServiceInfo` / `ServiceStatus` は
-## `service_types` にしか定義が無く、`service_darwin` / `service_linux` は
-## それを import しているだけ（再定義していない）ので修飾は不要。
+## **Caution (a pitfall when reading this module)**: `powarder/platform/service`
+## / `service_darwin` / `service_linux` are structured to import the shared
+## types and `serviceLabel` from `platform/service_types` in one direction
+## only (`service_types` <- `service_darwin`/`service_linux` <- `service`),
+## so there is no circular import between modules. However,
+## **`unitFilePath` / `renderUnitFile` / `installService` / `uninstallService`
+## / `serviceStatus` exist as identically-named procs in all three of
+## `service` / `service_darwin` / `service_linux`**, so when importing all of
+## them at once as this test file does, **they must always be called
+## qualified, like `service_darwin.xxx` / `service_linux.xxx`** (calling them
+## unqualified results in an `ambiguous call`. This is a plain same-name-proc
+## ambiguity issue unrelated to circular imports). `serviceLabel` /
+## `ServiceInfo` / `ServiceStatus` are defined only in `service_types`, and
+## `service_darwin` / `service_linux` merely import it (they don't
+## redefine it), so no qualification is needed for those.
 
 import std/[unittest, os, strutils]
 import powarder/platform/service
@@ -38,7 +41,8 @@ import powarder/platform/service_linux
 import powarder/core/paths
 
 proc withEnv(pairs: openArray[(string, string)], body: proc()) =
-  ## 環境変数を一時的に差し替える（`tests/tpaths.nim` のヘルパーを踏襲）。
+  ## Temporarily swaps environment variables (follows the helper pattern in
+  ## `tests/tpaths.nim`).
   var saved: seq[(string, bool, string)]
   for (k, v) in pairs:
     saved.add (k, existsEnv(k), getEnv(k))
@@ -50,8 +54,8 @@ proc withEnv(pairs: openArray[(string, string)], body: proc()) =
       if existed: putEnv(k, old) else: delEnv(k)
 
 proc extractPlistString(content, key: string): string =
-  ## `<key>K</key><string>V</string>` の V 部分を取り出す簡易パーサ
-  ## （フルの plist パーサは要らないので、テスト用にこれで十分）。
+  ## A simple parser that extracts the V part of `<key>K</key><string>V</string>`
+  ## (a full plist parser isn't needed, so this is good enough for testing).
   let marker = "<key>" & key & "</key><string>"
   let idx = content.find(marker)
   if idx < 0: return ""
@@ -61,14 +65,14 @@ proc extractPlistString(content, key: string): string =
   content[valueStart ..< valueEnd]
 
 # ===========================================================================
-# serviceLabel / unitFilePath（`platform/service` の OS 振り分け）
+# serviceLabel / unitFilePath (the OS dispatch in `platform/service`)
 # ===========================================================================
 
 suite "service: serviceLabel / unitFilePath":
-  test "serviceLabel は OS に依らず \"dev.powarder.daemon\"":
+  test "serviceLabel is \"dev.powarder.daemon\" regardless of OS":
     check serviceLabel() == "dev.powarder.daemon"
 
-  test "unitFilePath は現在の OS に応じた期待パスを返す":
+  test "unitFilePath returns the expected path for the current OS":
     when defined(macosx):
       check service.unitFilePath() ==
           getHomeDir() / "Library" / "LaunchAgents" / "dev.powarder.daemon.plist"
@@ -77,24 +81,25 @@ suite "service: serviceLabel / unitFilePath":
           getHomeDir() / ".config" / "systemd" / "user" / "powarder.service"
 
 # ===========================================================================
-# macOS: plist の生成（service_darwin.renderUnitFile）
+# macOS: plist generation (service_darwin.renderUnitFile)
 # ===========================================================================
 
 suite "service_darwin: renderUnitFile":
-  test "unitFilePath は ~/Library/LaunchAgents/dev.powarder.daemon.plist":
+  test "unitFilePath is ~/Library/LaunchAgents/dev.powarder.daemon.plist":
     check service_darwin.unitFilePath() ==
         getHomeDir() / "Library" / "LaunchAgents" / "dev.powarder.daemon.plist"
 
-  test "★最重要: KeepAlive の SuccessfulExit が false になっている":
-    # これが逆（true や無し）だと `powarder daemon stop`（exit 0）が
-    # launchd に即座に再起動されてしまい、デーモンを止められなくなる。
+  test "IMPORTANT: KeepAlive's SuccessfulExit is false":
+    # If this were reversed (true, or absent), `powarder daemon stop` (exit
+    # 0) would get immediately restarted by launchd, and the daemon could
+    # never be stopped.
     let plist = service_darwin.renderUnitFile("/usr/local/bin/powarder")
     check "<key>KeepAlive</key>" in plist
     check "<dict><key>SuccessfulExit</key><false/></dict>" in plist
-    # 素朴な <true/> 一発の KeepAlive になっていないことも明示的に確認する
+    # Also explicitly confirm it isn't a naive single <true/> KeepAlive
     check "<key>KeepAlive</key><true/>" notin plist
 
-  test "RunAtLoad / Label / ProgramArguments（実行ファイルパスと daemon）を含む":
+  test "includes RunAtLoad / Label / ProgramArguments (the executable path and daemon)":
     let plist = service_darwin.renderUnitFile("/opt/homebrew/bin/powarder")
     check "<key>RunAtLoad</key><true/>" in plist
     check "<key>Label</key><string>dev.powarder.daemon</string>" in plist
@@ -102,17 +107,17 @@ suite "service_darwin: renderUnitFile":
     check "<string>/opt/homebrew/bin/powarder</string>" in plist
     check "<string>daemon</string>" in plist
 
-  test "configPath を渡すと ProgramArguments に --config が追加される":
+  test "passing configPath adds --config to ProgramArguments":
     let plist = service_darwin.renderUnitFile("/usr/local/bin/powarder",
         "/home/x/.config/powarder/config.json")
     check "<string>--config</string>" in plist
     check "<string>/home/x/.config/powarder/config.json</string>" in plist
 
-  test "configPath 省略時は --config が出てこない":
+  test "--config does not appear when configPath is omitted":
     let plist = service_darwin.renderUnitFile("/usr/local/bin/powarder")
     check "--config" notin plist
 
-  test "EnvironmentVariables に PATH が含まれる（launchd は対話シェルの PATH を継承しないため）":
+  test "EnvironmentVariables includes PATH (since launchd doesn't inherit an interactive shell's PATH)":
     let plist = service_darwin.renderUnitFile("/usr/local/bin/powarder")
     check "<key>EnvironmentVariables</key>" in plist
     let pathValue = extractPlistString(plist, "PATH")
@@ -120,7 +125,7 @@ suite "service_darwin: renderUnitFile":
     check "/usr/bin" in pathValue
     check "/opt/homebrew/bin" in pathValue
 
-  test "StandardOutPath / StandardErrorPath は絶対パス（~ は展開されないため）":
+  test "StandardOutPath / StandardErrorPath are absolute paths (since ~ isn't expanded)":
     withEnv({envStateDir: "/tmp/pw-service-state"}, proc() =
       let plist = service_darwin.renderUnitFile("/usr/local/bin/powarder")
       let outPath = extractPlistString(plist, "StandardOutPath")
@@ -133,22 +138,23 @@ suite "service_darwin: renderUnitFile":
       check not outPath.startsWith("~"))
 
 # ===========================================================================
-# Linux: systemd unit の生成（service_linux.renderUnitFile）
+# Linux: systemd unit generation (service_linux.renderUnitFile)
 # ===========================================================================
 
 suite "service_linux: renderUnitFile":
-  test "unitFilePath は ~/.config/systemd/user/powarder.service":
+  test "unitFilePath is ~/.config/systemd/user/powarder.service":
     check service_linux.unitFilePath() ==
         getHomeDir() / ".config" / "systemd" / "user" / "powarder.service"
 
-  test "★最重要: Restart=on-failure が含まれ、Restart=always は含まれない":
-    # これが `always` だと `powarder daemon stop`（exit 0）でも systemd が
-    # すぐさま再起動してしまい、デーモンを止められなくなる。
+  test "IMPORTANT: includes Restart=on-failure, and does not include Restart=always":
+    # If this were `always`, systemd would restart it immediately even on
+    # `powarder daemon stop` (exit 0), and the daemon could never be
+    # stopped.
     let unit = service_linux.renderUnitFile("/usr/local/bin/powarder")
     check "Restart=on-failure" in unit
     check "Restart=always" notin unit
 
-  test "ExecStart / WantedBy=default.target を含む":
+  test "includes ExecStart / WantedBy=default.target":
     let unit = service_linux.renderUnitFile("/usr/local/bin/powarder")
     check "ExecStart=/usr/local/bin/powarder daemon" in unit
     check "WantedBy=default.target" in unit
@@ -156,20 +162,21 @@ suite "service_linux: renderUnitFile":
     check "[Service]" in unit
     check "[Install]" in unit
 
-  test "configPath を渡すと ExecStart に --config が追加される":
+  test "passing configPath adds --config to ExecStart":
     let unit = service_linux.renderUnitFile("/usr/local/bin/powarder",
         "/home/x/.config/powarder/config.json")
     check "ExecStart=/usr/local/bin/powarder daemon --config " &
         "/home/x/.config/powarder/config.json" in unit
 
-  test "RestartSec も設定されている":
+  test "RestartSec is also set":
     let unit = service_linux.renderUnitFile("/usr/local/bin/powarder")
     check "RestartSec=5" in unit
 
 suite "service_linux: lingerNote":
-  test "loginctl enable-linger の案内を含む":
-    # `installService` / `serviceStatus` の `notes` に必ず含まれる文言。
-    # 実際に systemctl を呼ばずにテストできるよう、純粋関数として分離してある。
+  test "includes guidance for loginctl enable-linger":
+    # Wording that must always be included in the `notes` returned by
+    # `installService` / `serviceStatus`. Separated out as a pure function
+    # so it can be tested without actually calling systemctl.
     let note = lingerNote()
     check "loginctl" in note
     check "enable-linger" in note

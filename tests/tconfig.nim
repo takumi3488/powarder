@@ -1,4 +1,4 @@
-## `powarder/config/configfile` と `powarder/config/statefile` のテスト。
+## Tests for `powarder/config/configfile` and `powarder/config/statefile`.
 
 import std/[unittest, os, strutils, sequtils, nativesockets]
 import powarder/core/types
@@ -7,11 +7,12 @@ import powarder/config/configfile
 import powarder/config/statefile
 
 # ---------------------------------------------------------------------------
-# ヘルパー
+# Helpers
 # ---------------------------------------------------------------------------
 
 proc withEnv(pairs: openArray[(string, string)], body: proc()) =
-  ## 環境変数を一時的に差し替える。テスト間で状態が漏れないようにする。
+  ## Temporarily overrides environment variables, restoring them afterward
+  ## so state doesn't leak across tests.
   var saved: seq[(string, bool, string)]
   for (k, v) in pairs:
     saved.add (k, existsEnv(k), getEnv(k))
@@ -40,8 +41,8 @@ const sampleJson = """
 # configfile
 # ===========================================================================
 
-suite "configfile: loadConfig - スキーマ例":
-  test "スキーマ例の3トンネルをそのままパースできる":
+suite "configfile: loadConfig - schema example":
+  test "can parse the 3 tunnels from the schema example as-is":
     let path = "/tmp/pw-tcfg-sample.json"
     writeFile(path, sampleJson)
     defer: removeFile(path)
@@ -79,11 +80,11 @@ suite "configfile: loadConfig - スキーマ例":
     check t2.spec.bindPort == Port(8443)
     check t2.spec.targetHost == "localhost"
     check t2.spec.targetPort == Port(3000)
-    check t2.autostart == false ## 省略時の既定値
-    check t2.profile == "" ## 省略時の既定値
+    check t2.autostart == false ## default value when omitted
+    check t2.profile == "" ## default value when omitted
 
-suite "configfile: 往復変換":
-  test "saveConfig -> loadConfig で内容が保たれる":
+suite "configfile: round trip":
+  test "saveConfig -> loadConfig preserves the content":
     let path = "/tmp/pw-tcfg-roundtrip.json"
     removeFile(path)
     defer: removeFile(path)
@@ -105,8 +106,8 @@ suite "configfile: 往復変換":
     let loaded = loadConfig(path)
     check loaded == cfg
 
-suite "configfile: 省略可能フィールドの既定値":
-  test "autostart / profile / sshExtraArgs / retry が既定値になる":
+suite "configfile: defaults for optional fields":
+  test "autostart / profile / sshExtraArgs / retry get their default values":
     let path = "/tmp/pw-tcfg-defaults.json"
     writeFile(path,
       """{"version":1,"tunnels":[{"name":"x","host":"h","type":"L","forward":"1234:h:80"}]}""")
@@ -119,8 +120,8 @@ suite "configfile: 省略可能フィールドの既定値":
     check t.sshExtraArgs == newSeq[string]()
     check t.retry == initRetryPolicy()
 
-suite "configfile: type フィールドの変換":
-  test "\"L\" は fkLocal、\"R\" は fkRemote になる":
+suite "configfile: type field conversion":
+  test "\"L\" becomes fkLocal, \"R\" becomes fkRemote":
     let path = "/tmp/pw-tcfg-type.json"
     writeFile(path, """
     {"version":1,"tunnels":[
@@ -134,7 +135,7 @@ suite "configfile: type フィールドの変換":
     check cfg.tunnels[0].spec.kind == fkLocal
     check cfg.tunnels[1].spec.kind == fkRemote
 
-  test "不正な type は ConfigError":
+  test "an invalid type raises ConfigError":
     let path = "/tmp/pw-tcfg-badtype.json"
     writeFile(path,
       """{"version":1,"tunnels":[{"name":"x","host":"h","type":"X","forward":"1:h:1"}]}""")
@@ -142,8 +143,8 @@ suite "configfile: type フィールドの変換":
     expect ConfigError:
       discard loadConfig(path)
 
-suite "configfile: 異常系":
-  test "forward のパースエラーは ConfigError になりトンネル名を含む":
+suite "configfile: error cases":
+  test "a forward parse error raises ConfigError and includes the tunnel name":
     let path = "/tmp/pw-tcfg-badforward.json"
     writeFile(path, """
     {"version":1,"tunnels":[{"name":"broken-fwd","host":"h","type":"L","forward":"not-a-valid-forward"}]}
@@ -156,7 +157,7 @@ suite "configfile: 異常系":
       check "broken-fwd" in e.msg
       check path in e.msg
 
-  test "壊れた JSON は ConfigError になる":
+  test "broken JSON raises ConfigError":
     let path = "/tmp/pw-tcfg-brokenjson.json"
     writeFile(path, "{ this is not json")
     defer: removeFile(path)
@@ -164,7 +165,7 @@ suite "configfile: 異常系":
       discard loadConfig(path)
 
 suite "configfile: validateConfig":
-  test "1. name の重複を検出する":
+  test "1. detects duplicate names":
     let cfg = ConfigFile(version: 1, tunnels: @[
       TunnelConfig(name: "dup", host: "h1",
         spec: parseForwardSpec("1000:a:80", fkLocal), retry: initRetryPolicy()),
@@ -174,7 +175,7 @@ suite "configfile: validateConfig":
     let problems = validateConfig(cfg)
     check problems.anyIt("dup" in it and not it.startsWith("warning:"))
 
-  test "2. forwardId の重複を検出し、衝突する両方のトンネル名を含む（最重要）":
+  test "2. detects duplicate forwardId and includes both colliding tunnel names (most important)":
     let cfg = ConfigFile(version: 1, tunnels: @[
       TunnelConfig(name: "web-a", host: "h1",
         spec: parseForwardSpec("8080:x:80", fkLocal), retry: initRetryPolicy()),
@@ -186,7 +187,7 @@ suite "configfile: validateConfig":
     check hits.len == 1
     check not hits[0].startsWith("warning:")
 
-  test "3. name が空、または空白のみ":
+  test "3. name is empty, or whitespace only":
     let cfg = ConfigFile(version: 1, tunnels: @[
       TunnelConfig(name: "", host: "h",
         spec: parseForwardSpec("1:a:1", fkLocal), retry: initRetryPolicy()),
@@ -194,22 +195,22 @@ suite "configfile: validateConfig":
         spec: parseForwardSpec("2:a:2", fkLocal), retry: initRetryPolicy())
     ])
     let problems = validateConfig(cfg)
-    check problems.filterIt("name が空です" in it).len == 2
+    check problems.filterIt("name is empty" in it).len == 2
 
-  test "4. host が空":
+  test "4. host is empty":
     let cfg = ConfigFile(version: 1, tunnels: @[
       TunnelConfig(name: "x", host: "",
         spec: parseForwardSpec("3:a:3", fkLocal), retry: initRetryPolicy())
     ])
     let problems = validateConfig(cfg)
-    check problems.anyIt("host が空です" in it)
+    check problems.anyIt("host is empty" in it)
 
-  test "5. version が1以外":
+  test "5. version is other than 1":
     let cfg = ConfigFile(version: 2, tunnels: @[])
     let problems = validateConfig(cfg)
     check problems.anyIt("version" in it)
 
-  test "6. 外部公開は warning: 接頭辞で区別される":
+  test "6. external exposure is distinguished by the warning: prefix":
     let cfg = ConfigFile(version: 1, tunnels: @[
       TunnelConfig(name: "open", host: "h",
         spec: parseForwardSpec("0.0.0.0:8443:localhost:3000", fkLocal),
@@ -221,10 +222,10 @@ suite "configfile: validateConfig":
     check "open" in warns[0]
 
 suite "configfile: findConfigFile":
-  test "explicit が最優先される":
+  test "explicit takes top priority":
     check findConfigFile("/tmp/pw-tcfg-explicit.json") == "/tmp/pw-tcfg-explicit.json"
 
-  test "./powarder.json が存在すればそれを使う":
+  test "uses ./powarder.json if it exists":
     let oldCwd = getCurrentDir()
     let dir = "/tmp/pw-tcfg-cwd-a"
     removeDir(dir)
@@ -232,9 +233,10 @@ suite "configfile: findConfigFile":
     writeFile(dir / "powarder.json", sampleJson)
     setCurrentDir(dir)
     try:
-      # macOS では /tmp が /private/tmp のシンボリックリンクで、getCurrentDir() は
-      # 解決済みの絶対パスを返す。dir 文字列とそのまま比較すると解決前後で
-      # 食い違うため、期待値も getCurrentDir() 経由で組み立てる。
+      # On macOS, /tmp is a symlink to /private/tmp, and getCurrentDir()
+      # returns the resolved absolute path. Comparing directly against the
+      # dir string would mismatch before/after resolution, so the expected
+      # value is also built via getCurrentDir().
       let localPath = getCurrentDir() / "powarder.json"
       withEnv({"POWARDER_CONFIG": "/tmp/pw-tcfg-should-not-be-used.json"}, proc() =
         check findConfigFile() == localPath)
@@ -242,7 +244,7 @@ suite "configfile: findConfigFile":
       setCurrentDir(oldCwd)
       removeDir(dir)
 
-  test "ローカルファイルが無ければ POWARDER_CONFIG が使われる":
+  test "uses POWARDER_CONFIG if there's no local file":
     let oldCwd = getCurrentDir()
     let dir = "/tmp/pw-tcfg-cwd-b"
     removeDir(dir)
@@ -255,8 +257,8 @@ suite "configfile: findConfigFile":
       setCurrentDir(oldCwd)
       removeDir(dir)
 
-suite "configfile: 禁止キーの警告":
-  test "user / identityFile が書かれていれば警告が返る（エラーにはしない）":
+suite "configfile: forbidden key warnings":
+  test "returns a warning (not an error) when user / identityFile are present":
     let path = "/tmp/pw-tcfg-forbidden.json"
     writeFile(path, """
     {"version":1,"tunnels":[
@@ -266,7 +268,7 @@ suite "configfile: 禁止キーの警告":
     """)
     defer: removeFile(path)
 
-    let cfg = loadConfig(path) ## エラーにならず読み込めること自体も確認
+    let cfg = loadConfig(path) ## also confirms it loads without erroring
     check cfg.tunnels.len == 1
     check cfg.forbiddenKeyWarnings.len == 2
     check cfg.forbiddenKeyWarnings.anyIt("user" in it and it.startsWith("warning:"))
@@ -279,8 +281,8 @@ suite "configfile: 禁止キーの警告":
 # statefile
 # ===========================================================================
 
-suite "statefile: 往復変換":
-  test "saveState -> loadState で全フィールドが保たれる（savedAt は保存時刻に上書きされる）":
+suite "statefile: round trip":
+  test "saveState -> loadState preserves every field (savedAt is overwritten with the save time)":
     let path = "/tmp/pw-tst-roundtrip.json"
     removeFile(path)
     defer: removeFile(path)
@@ -316,22 +318,22 @@ suite "statefile: 往復変換":
     check loaded.savedAt.len > 0
     check loaded.savedAt != "placeholder-should-be-overwritten"
 
-suite "statefile: 破損耐性":
-  test "破損した JSON を読んでも例外を投げず空の state を返す":
+suite "statefile: corruption resilience":
+  test "reading broken JSON doesn't raise and returns an empty state":
     let path = "/tmp/pw-tst-broken.json"
     writeFile(path, "{ broken")
     defer: removeFile(path)
     let st = loadState(path)
     check st == emptyState()
 
-  test "ファイルが存在しない場合も空の state を返す":
+  test "also returns an empty state when the file doesn't exist":
     let path = "/tmp/pw-tst-missing.json"
     removeFile(path)
     let st = loadState(path)
     check st == emptyState()
 
-suite "statefile: アトミック書き込み":
-  test "saveState 後に一時ファイルが残っていない":
+suite "statefile: atomic writes":
+  test "no temp file remains after saveState":
     let dir = "/tmp/pw-tst-atomic"
     removeDir(dir)
     createDir(dir)

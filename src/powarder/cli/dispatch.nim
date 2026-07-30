@@ -1,14 +1,16 @@
-## `powarder` CLI 本体: サブコマンドをデーモンへの RPC / ファイル読み込みに配線し、
-## 標準出力への書き込みと終了コードの決定を行う。
+## The core of the `powarder` CLI: wires subcommands up to RPC calls to the
+## daemon / file reads, writes to stdout, and determines the exit code.
 ##
-## テストしやすさのため、「文字列を組み立てる関数」（`renderPsTable` /
-## `renderHostsTable` / `tailLines` / `readIncrement` 等、すべて `*` で公開）と
-## 「実際に `echo` して RPC を呼ぶ関数」（`cmdXxx` 群、`dispatch*` から呼ばれる）を
-## 分離してある。前者は純粋関数としてデーモン無しでテストできる。
+## For testability, this separates "functions that build strings"
+## (`renderPsTable` / `renderHostsTable` / `tailLines` / `readIncrement`, etc.,
+## all exported with `*`) from "functions that actually `echo` and call RPCs"
+## (the `cmdXxx` group, called from `dispatch*`). The former are pure functions
+## that can be tested without the daemon.
 ##
-## デーモン本体（`daemon/run.nim`）へは依存しない。`daemon --foreground` の実行は
-## `DaemonRunner` 型の関数を `dispatch*` の引数として受け取ることで注入する
-## （呼び出し元の `src/powarder.nim` が実体を渡す）。
+## Does not depend on the daemon itself (`daemon/run.nim`). Running `daemon
+## --foreground` is injected by receiving a function of type `DaemonRunner` as
+## an argument to `dispatch*` (the caller, `src/powarder.nim`, supplies the
+## real implementation).
 
 import std/[json, os, times, strutils, options]
 import powarder/version
@@ -27,7 +29,7 @@ import powarder/core/types
 import powarder/platform/lock
 import powarder/platform/service
 import powarder/config/configfile
-import std/nativesockets ## `Port` の `$` を使うために必要（core/types は型のみ export する）
+import std/nativesockets ## needed for `Port`'s `$` (core/types only exports the type)
 
 type
   ExitCode* = enum
@@ -35,38 +37,42 @@ type
     ecConflict = 5, ecSshFailed = 6, ecDaemonUnreachable = 7
 
   DaemonRunner* = proc (): int {.closure.}
-    ## `powarder daemon`（サブサブコマンド無し = フォアグラウンド起動）のときに
-    ## デーモン本体を起動する関数。`src/powarder.nim` から注入される
-    ## （`daemon/run.nim` への直接依存を避けるための依存性注入）。
-    ## `nil` の場合は「デーモン本体が組み込まれていません」と表示して
-    ## `ecGeneral` を返す。
+    ## The function that starts the daemon itself when `powarder daemon` is
+    ## invoked with no subsubcommand (= foreground startup). Injected from
+    ## `src/powarder.nim` (dependency injection to avoid a direct dependency on
+    ## `daemon/run.nim`). If `nil`, prints a message saying the daemon isn't
+    ## built into this binary and returns `ecGeneral`.
 
 const
   cliVersion* = powarderVersion
-    ## `src/powarder.nim` の `powarderVersion` は import すると循環参照になる
-    ## （`powarder.nim` が最終的に `cli/dispatch` を import する構成のため）ため、
-    ## ここに独立した定数として持つ。`src/powarder.nim` 側で両者を同じ値に
-    ## 保つ責務を負う（このモジュールの担当エージェントが `powarder.nim` を
-    ## 変更できないため）。
+    ## Importing `powarderVersion` from `src/powarder.nim` here would create a
+    ## circular import (since `powarder.nim` ultimately imports
+    ## `cli/dispatch`), so this holds its own independent constant instead.
+    ## `src/powarder.nim` is responsible for keeping the two values in sync
+    ## (since the agent responsible for this module cannot modify
+    ## `powarder.nim`).
 
   daemonUnreachableMsg =
     "could not reach the powarder daemon " &
     "(try 'powarder daemon start', or drop --no-autostart)"
 
-  # `tunnel.start` / `tunnel.stop` は `protocol.nim` の `mTunnelStart` /
-  # `mTunnelStop` を使う（デーモン側と同じ定数を参照することで、
-  # 片方だけ文字列を変えても気付けないという事故を防ぐ）。
+  # `tunnel.start` / `tunnel.stop` use `mTunnelStart` / `mTunnelStop` from
+  # `protocol.nim` (referencing the same constants the daemon side uses
+  # prevents the accident of changing the string on only one side without
+  # noticing).
 
 # ---------------------------------------------------------------------------
-# RpcRemoteError.code -> 終了コードのマッピング（唯一の箇所）
+# RpcRemoteError.code -> exit code mapping (the single source of truth)
 # ---------------------------------------------------------------------------
 
 proc exitCodeForRpcError*(code: int): ExitCode =
-  ## `RpcRemoteError.code` から CLI の終了コードへのマッピングテーブル。
-  ## デーモンから返るエラーコードの定義自体は `ipc/protocol` を参照。
+  ## The mapping table from `RpcRemoteError.code` to the CLI's exit code. See
+  ## `ipc/protocol` for the definitions of the error codes returned by the
+  ## daemon itself.
   ##
-  ## `DaemonNotRunningError` はこのテーブルの対象外（`RpcRemoteError` ではない
-  ## 別の例外型）。呼び出し側は捕まえたら常に `ecDaemonUnreachable`（7）にする。
+  ## `DaemonNotRunningError` is not covered by this table (it's a different
+  ## exception type, not `RpcRemoteError`). Callers that catch it should always
+  ## use `ecDaemonUnreachable` (7).
   case code
   of errTunnelNotFound: ecNotFound
   of errTunnelNameConflict: ecConflict
@@ -75,7 +81,7 @@ proc exitCodeForRpcError*(code: int): ExitCode =
   else: ecGeneral
 
 # ---------------------------------------------------------------------------
-# テーブル整形（純粋関数。デーモン無しでテスト可能）
+# Table formatting (pure functions; testable without the daemon)
 # ---------------------------------------------------------------------------
 
 const
@@ -84,11 +90,14 @@ const
   hostsHeader = @["HOST", "STATE", "TUNNELS", "PID", "UPTIME", "RETRIES"]
 
 proc renderPsTable*(rows: JsonNode; w: Writer): string =
-  ## `tunnel.list` の結果（JsonNode の配列）をテーブル文字列に整形する。
+  ## Formats the result of `tunnel.list` (an array of JsonNode) into a table
+  ## string.
   ##
-  ## `-R` のフォワードは統計（`conns` / `total_conns` / `rx` / `tx` /
-  ## `last_activity_seconds`）が原理的に取れず、デーモンは常に `null` を返す
-  ## （M5 の RPC スキーマの契約）。ここではそれを見て該当列を `"-"` にする。
+  ## Statistics (`conns` / `total_conns` / `rx` / `tx` /
+  ## `last_activity_seconds`) can't in principle be collected for `-R`
+  ## forwards, so the daemon always returns `null` for them (a contract of the
+  ## M5 RPC schema). Here we detect that and render `"-"` in the relevant
+  ## columns.
   var body: seq[seq[string]] = @[]
   for row in rows:
     let typeCol = "-" & row["type"].getStr
@@ -121,7 +130,7 @@ proc renderPsTable*(rows: JsonNode; w: Writer): string =
   table(w, psHeader, body)
 
 proc renderHostsTable*(rows: JsonNode; w: Writer): string =
-  ## `host.list` の結果をテーブル文字列に整形する。
+  ## Formats the result of `host.list` into a table string.
   var body: seq[seq[string]] = @[]
   for row in rows:
     let pidCol =
@@ -139,8 +148,9 @@ proc renderHostsTable*(rows: JsonNode; w: Writer): string =
   table(w, hostsHeader, body)
 
 proc renderInspect*(node: JsonNode): string =
-  ## `tunnel.inspect` の結果を `key: value` の羅列に整形する。
-  ## ネストしたオブジェクト・配列は `pretty()` してインデントして埋め込む。
+  ## Formats the result of `tunnel.inspect` as a list of `key: value` lines.
+  ## Nested objects/arrays are pretty-printed with `pretty()` and embedded with
+  ## indentation.
   var lines: seq[string] = @[]
   for k, v in node.pairs:
     case v.kind
@@ -151,18 +161,20 @@ proc renderInspect*(node: JsonNode): string =
   lines.join("\n")
 
 # ---------------------------------------------------------------------------
-# ログの tail（純粋関数。デーモン無しでテスト可能）
+# Log tailing (pure functions; testable without the daemon)
 # ---------------------------------------------------------------------------
 
 proc tailLines*(path: string; n: int): seq[string] =
-  ## ファイル全体を読んで末尾 `n` 行を返す。ファイルが無ければ空 seq。
-  ## powarder のトンネルログはトンネルごとに分かれ既定でさほど大きくならない
-  ## ため、末尾からシークして読む最適化はせず素直に全読みする。
+  ## Reads the whole file and returns the last `n` lines. Returns an empty seq
+  ## if the file doesn't exist. powarder's tunnel logs are split per tunnel and
+  ## typically stay small by default, so we skip the optimization of seeking
+  ## from the end and just read the whole file.
   if not fileExists(path):
     return @[]
   var lines = readFile(path).splitLines()
-  # `splitLines` は末尾に改行がある入力だと最後に空文字列の要素を1つ足す。
-  # 表示上はノイズなので、末尾が空文字列なら取り除く。
+  # `splitLines` appends one extra empty-string element at the end if the
+  # input ends with a newline. That's just visual noise, so strip it if the
+  # last element is empty.
   if lines.len > 0 and lines[^1].len == 0:
     lines.setLen(lines.len - 1)
   if lines.len <= n:
@@ -171,14 +183,15 @@ proc tailLines*(path: string; n: int): seq[string] =
 
 proc readIncrement*(path: string; offset: int64): tuple[data: string;
     newOffset: int64] =
-  ## `logs -f` のポーリングループが使う純粋な増分読み取り関数。
+  ## The pure incremental-read function used by the `logs -f` polling loop.
   ##
-  ## - ファイルが存在しない: 増分無し。`offset` はそのまま返す
-  ##   （ファイルがまだ生まれていない/一時的に消えているだけかもしれないので
-  ##   0 にリセットしない。復活したときに続きから読める）。
-  ## - 現在のファイルサイズが `offset` より小さい: **ローテーション（truncate）**
-  ##   と判断し、先頭 (0) から読み直す。
-  ## - それ以外: `offset` から末尾までを読んで返す。
+  ## - File doesn't exist: no increment. Returns `offset` unchanged (the file
+  ##   might just not have been created yet, or might be temporarily gone, so
+  ##   we don't reset to 0; this lets us pick up where we left off if it
+  ##   reappears).
+  ## - Current file size is smaller than `offset`: treated as a **rotation
+  ##   (truncate)**, so we re-read from the start (0).
+  ## - Otherwise: reads from `offset` to the end and returns it.
   if not fileExists(path):
     return ("", offset)
   let size = getFileSize(path)
@@ -197,15 +210,15 @@ proc readIncrement*(path: string; offset: int64): tuple[data: string;
   (buf, startOffset + bytesRead.int64)
 
 var followInterrupted = false
-  ## `followFile` の Ctrl-C 検出フラグ。`setControlCHook` が要求する
-  ## `proc () {.noconv.}` はクロージャ（ローカル変数のキャプチャ）を作れない
-  ## （呼び出し規約 `noconv` に環境ポインタが無いため）ので、モジュールレベルの
-  ## 変数を介す必要がある。`logs -f` は1プロセスにつき高々1回しか流れないので
-  ## これで問題ない。
+  ## `followFile`'s Ctrl-C detection flag. The `proc () {.noconv.}` required by
+  ## `setControlCHook` can't be a closure (can't capture local variables),
+  ## since the `noconv` calling convention has no environment pointer, so this
+  ## has to go through a module-level variable instead. `logs -f` runs at most
+  ## once per process, so this is fine.
 
 proc followFile(path: string): int =
-  ## ファイルサイズを覚えて 200ms 間隔でポーリングし、増分を出力し続ける。
-  ## Ctrl-C（SIGINT）を受けたらループを抜けて 130 を返す。
+  ## Remembers the file size, polls every 200ms, and keeps printing the
+  ## increment. Exits the loop and returns 130 on Ctrl-C (SIGINT).
   var offset = if fileExists(path): getFileSize(path) else: 0'i64
   followInterrupted = false
   setControlCHook(proc () {.noconv.} = followInterrupted = true)
@@ -227,14 +240,14 @@ proc printTailAndMaybeFollow(path: string; n: int; follow: bool): int =
     ecOk.int
 
 # ---------------------------------------------------------------------------
-# RPC エラー表示の共通ヘルパー
+# Common helper for rendering RPC errors
 # ---------------------------------------------------------------------------
 
 proc extractRawStderr(e: ref RpcRemoteError): string =
-  ## `data` フィールドに ssh の生 stderr が入っていればそれを取り出す。
-  ## 文字列そのもの・`{"stderr": "..."}` の両方の形を受け付ける
-  ## （デーモン側の実装がどちらの形にするか厳密には決め切れていないため）。
-  ## 何も見つからなければ `RpcRemoteError.msg` にフォールバックする。
+  ## Extracts ssh's raw stderr from the `data` field, if present. Accepts
+  ## either a bare string or a `{"stderr": "..."}` object (since it isn't
+  ## strictly settled which form the daemon side will use). Falls back to
+  ## `RpcRemoteError.msg` if nothing is found.
   if e.data == nil:
     return e.msg
   case e.data.kind
@@ -248,11 +261,12 @@ proc extractRawStderr(e: ref RpcRemoteError): string =
 
 proc renderRpcErrorBody(w: Writer; e: ref RpcRemoteError; lang: Lang;
     host = ""): string =
-  ## `output.renderError` は3段構成の1段目に汎用的な見出し
-  ## （"Failed to set up forwarding to X."）を含めてしまうが、呼び出し側
-  ## （`cmdXxx`）はそれぞれの文脈に応じた具体的な見出しを既に `output.failure()`
-  ## で別に出している。ここでは `renderError` の出力から先頭の見出し行と直後の
-  ## 空行を取り除き、原因・対処・生ログの部分だけを返す。
+  ## `output.renderError` includes a generic headline ("Failed to set up
+  ## forwarding to X.") as the first of its three sections, but callers
+  ## (`cmdXxx`) already print their own context-specific headline separately
+  ## via `output.failure()`. Here we strip the leading headline line and the
+  ## blank line right after it from `renderError`'s output, and return only
+  ## the cause / remedy / raw-log parts.
   let rawStderr = extractRawStderr(e)
   let kind = classify(rawStderr)
   let ctx = initErrorContext(host = host, rawStderr = rawStderr)
@@ -261,19 +275,20 @@ proc renderRpcErrorBody(w: Writer; e: ref RpcRemoteError; lang: Lang;
   if lines.len > 2: lines[2 .. ^1].join("\n") else: full
 
 proc jarr(node: JsonNode; key: string): JsonNode =
-  ## `node[key]` を安全に取り出す。キーが無ければ空配列。
+  ## Safely extracts `node[key]`. Returns an empty array if the key is absent.
   if node != nil and node.hasKey(key): node[key] else: newJArray()
 
 proc prunableNames*(rows: JsonNode): seq[string] =
-  ## `tunnel.list` の結果（`JsonNode` の配列）から、`prune` の削除対象となる
-  ## 名前だけを集める。
+  ## Collects only the names that are targets for removal by `prune` from the
+  ## result of `tunnel.list` (an array of `JsonNode`).
   ##
-  ## 「停止中」の判定は `status == "stopped"` で行う。デーモンは無効化中の
-  ## トンネルを `state: "fwPending"` + `status: "stopped"` で返す契約になって
-  ## いる（`daemon/run.nim` の `tunnelEntryFromConfig` 参照。このモジュールは
-  ## `daemon/` に依存しないため、契約を JSON の文字列値として直接見る）。
-  ## `state` 側は実行中の `ForwardState` の値をそのまま使う設計上「無効化済み」
-  ## を表す専用の値を持たないため、`state` では判定できない点に注意。
+  ## "Stopped" is determined via `status == "stopped"`. The daemon has a
+  ## contract of returning disabled tunnels as `state: "fwPending"` + `status:
+  ## "stopped"` (see `tunnelEntryFromConfig` in `daemon/run.nim`; since this
+  ## module doesn't depend on `daemon/`, we look at the contract directly as
+  ## JSON string values). Note that `state` cannot be used for this check,
+  ## since by design it reuses the live `ForwardState` values directly and has
+  ## no dedicated value meaning "disabled".
   result = @[]
   if rows == nil: return
   for row in rows:
@@ -295,20 +310,23 @@ proc cmdRun(args: ParsedArgs; w: Writer; lang: Lang): int =
     return ecUsage.int
   let host = args.positional[0]
 
-  # `-L` を先にすべて処理してから `-R` を処理する。argv.parseArgv は `-L` /
-  # `-R` を別々の seq に蓄積するため、実際の入力上の混在順序（例:
-  # `-L a -R b -L c`）は失われている（argv.nim は変更できない制約）。
+  # All `-L` flags are processed before any `-R` flags. argv.parseArgv
+  # accumulates `-L` / `-R` into separate seqs, so the actual interleaved
+  # order on the input (e.g. `-L a -R b -L c`) is lost (a constraint we can't
+  # change, since argv.nim is off-limits here).
   let allSpecs = args.localForwards & args.remoteForwards
   if allSpecs.len == 0:
     stderr.writeLine("powarder run: at least one -L or -R is required")
     return ecUsage.int
 
   let baseName = if args.name.len > 0: args.name else: randomName()
-  ## **複数フォワードの命名規則**: 1トンネル = 1フォワードという設計なので、
-  ## `-L`/`-R` が複数あれば `tunnel.create` を複数回呼ぶ。1本目は `baseName`
-  ## そのまま、2本目以降は `"<baseName>-2"`, `"<baseName>-3"`, ... と連番を振る
-  ## （それぞれ独立したランダム名にする案もあったが、同じ `run` 呼び出しで
-  ## 作られたトンネル群だと `ps` の一覧で見て分かる方が実用上勝ると判断した）。
+  ## **Naming rule for multiple forwards**: since the design is one tunnel =
+  ## one forward, if there are multiple `-L`/`-R` flags, `tunnel.create` is
+  ## called multiple times. The first uses `baseName` as-is; subsequent ones
+  ## get a sequence number appended: `"<baseName>-2"`, `"<baseName>-3"`, etc.
+  ## (Giving each an independent random name was considered, but being able to
+  ## tell at a glance in the `ps` listing that a group of tunnels came from the
+  ## same `run` call was judged more practically useful.)
 
   if not ensureDaemon(args.noAutostart):
     echo w.failure(daemonUnreachableMsg)
@@ -400,13 +418,14 @@ proc cmdDown(args: ParsedArgs; w: Writer; lang: Lang): int =
     ecDaemonUnreachable.int
 
 # ---------------------------------------------------------------------------
-# start / stop / restart / rm （共通のRPC呼び出しパターン）
+# start / stop / restart / rm (common RPC-calling pattern)
 # ---------------------------------------------------------------------------
 
 proc cmdSimpleNamesAction(args: ParsedArgs; w: Writer; lang: Lang;
     methodName, verb, pastVerb, resultKey: string): int =
-  ## `{"names": [...]}` を渡して1回 RPC を呼び、結果配列を `success()` で
-  ## 1行ずつ出す、という `start` / `stop` / `restart` / `rm` に共通の処理。
+  ## The processing common to `start` / `stop` / `restart` / `rm`: call an RPC
+  ## once with `{"names": [...]}`, then print each item in the result array on
+  ## its own line via `success()`.
   if args.positional.len == 0:
     stderr.writeLine("powarder " & verb & ": at least one tunnel name is required")
     return ecUsage.int
@@ -439,10 +458,11 @@ proc cmdPs(args: ParsedArgs; w: Writer; lang: Lang): int =
     return ecDaemonUnreachable.int
   try:
     if args.probe:
-      # `tunnel.list` 自体には probe パラメータが無い。`--probe`
-      # （能動的な Tier2 ヘルスチェックへのオプトイン）は、一覧を取る前に
-      # `tunnel.check` を probe 付きで呼んでデーモン側の status を更新させる
-      # ことで実現する。結果自体は使わず、単にトリガーとして呼ぶ。
+      # `tunnel.list` itself has no probe parameter. `--probe` (opting into an
+      # active Tier2 health check) is implemented by calling `tunnel.check`
+      # with probe before fetching the list, which updates the daemon's status
+      # as a side effect. The result itself is discarded; this call is purely
+      # a trigger.
       discard call(mTunnelCheck, %*{"names": newJArray(), "probe": true})
     let res = call(mTunnelList, %*{"all": args.all})
     if w.mode == omJson:
@@ -559,12 +579,12 @@ proc cmdHosts(args: ParsedArgs; w: Writer; lang: Lang): int =
 # ---------------------------------------------------------------------------
 
 proc cmdPrune(args: ParsedArgs; w: Writer; lang: Lang): int =
-  ## 停止中のトンネルをまとめて削除する。
+  ## Removes all stopped tunnels in one go.
   ##
-  ## **`-a`/`--all` の指定有無に関わらず、常に `{"all": true}` で
-  ## `tunnel.list` を問い合わせる。** `prune` の意味そのものが「停止中を
-  ## 掃除する」ことなので、`ps` の既定フィルタ（実行中のみ表示。`-a` で
-  ## 停止中も表示）とは無関係に全件を見る必要がある。
+  ## **Regardless of whether `-a`/`--all` is given, this always queries
+  ## `tunnel.list` with `{"all": true}`.** Since the whole point of `prune` is
+  ## "clean up what's stopped", it needs to see every tunnel regardless of
+  ## `ps`'s default filter (running only, or also stopped with `-a`).
   if not ensureDaemon(args.noAutostart):
     echo w.failure(daemonUnreachableMsg)
     return ecDaemonUnreachable.int
@@ -575,7 +595,7 @@ proc cmdPrune(args: ParsedArgs; w: Writer; lang: Lang): int =
       if w.mode == omJson:
         echo (%*{"removed": newJArray()}).pretty()
       else:
-        echo w.info(if lang == langJa: "削除対象がありません"
+        echo w.info(if lang == langJa: "nothing to prune"
                      else: "nothing to prune")
       return ecOk.int
 
@@ -595,21 +615,23 @@ proc cmdPrune(args: ParsedArgs; w: Writer; lang: Lang): int =
     ecDaemonUnreachable.int
 
 # ---------------------------------------------------------------------------
-# logs（★デーモンを経由しない）
+# logs (IMPORTANT: does not go through the daemon)
 # ---------------------------------------------------------------------------
 
 proc cmdLogs(args: ParsedArgs): int =
-  ## ログの実体は **ホスト単位**（1 ControlMaster = 1 ログファイル）に書かれる。
-  ## powarder は同じ `host` を指す複数トンネルで1つのマスターを共有するので、
-  ## ログもトンネル単位ではなくマスター単位になり、ファイル名には
-  ## ホストの fingerprint が入る（例 `logs/localhost-5f675d2b.log`）。
-  ## つまり**トンネル名だけからパスを決定できない**ので、`tunnel.inspect` で
-  ## `log_path` を問い合わせる。
+  ## Logs are actually written **per host** (1 ControlMaster = 1 log file).
+  ## Since powarder shares a single master across multiple tunnels pointing at
+  ## the same `host`, logs are keyed by master rather than by tunnel, and the
+  ## filename includes the host's fingerprint (e.g.
+  ## `logs/localhost-5f675d2b.log`). In other words, **the path can't be
+  ## determined from the tunnel name alone**, so we query `log_path` via
+  ## `tunnel.inspect`.
   ##
-  ## **デーモンが死んでいてもログが読めること**はこのコマンドの重要な価値
-  ## （デバッグの最後の砦）なので、問い合わせに失敗した場合は
-  ## `logs/` 配下のファイル一覧を提示して直接読むよう誘導する。
-  ## ログファイル自体はデーモンの生死に関係なく残っている。
+  ## **Being able to read logs even when the daemon is dead** is an important
+  ## value of this command (the last resort for debugging), so if the query
+  ## fails, we point the user at the list of files under `logs/` to read
+  ## directly. The log files themselves persist regardless of whether the
+  ## daemon is alive.
   if args.positional.len == 0:
     stderr.writeLine("powarder logs: a tunnel name is required")
     return ecUsage.int
@@ -621,23 +643,24 @@ proc cmdLogs(args: ParsedArgs): int =
     path = res{"log_path"}.getStr("")
   except DaemonNotRunningError:
     let dir = logsDir()
-    # 連結を1つずつ `add` で組む。複数行にまたがる `&` は nimpretty の整形で
-    # `name &"..."` のように詰められ、`&"..."` が strformat の補間として
-    # 解釈されてコンパイルエラーになることがあるため（実際に踏んだ）。
-    var msg = "powarder: デーモンが停止しているため \""
+    # Build the concatenation one `add` at a time. A multi-line `&` chain can
+    # get squeezed by nimpretty's formatting into something like
+    # `name &"..."`, where `&"..."` then gets parsed as strformat
+    # interpolation and fails to compile (hit this in practice).
+    var msg = "powarder: cannot determine the log file for \""
     msg.add name
-    msg.add "\" のログファイルを特定できません"
-    msg.add "（ログは ControlMaster 単位で、ファイル名にホストの fingerprint が入るため）。"
+    msg.add "\" because the daemon is not running"
+    msg.add " (logs are keyed by ControlMaster, and the filename includes the host's fingerprint)."
     stderr.writeLine(msg)
     var found = false
     if dirExists(dir):
       for f in walkFiles(dir / "*.log"):
         if not found:
-          stderr.writeLine("powarder: 以下のファイルを直接読んでください:")
+          stderr.writeLine("powarder: read one of the following files directly:")
           found = true
         stderr.writeLine("  " & f)
     if not found:
-      stderr.writeLine("powarder: ログはまだありません: " & dir)
+      stderr.writeLine("powarder: no logs yet: " & dir)
     return ecDaemonUnreachable.int
   except RpcRemoteError as e:
     stderr.writeLine("powarder: " & e.msg)
@@ -700,10 +723,11 @@ proc cmdDaemonRestart(w: Writer): int =
   try:
     discard call(mDaemonShutdown)
   except DaemonNotRunningError:
-    discard # 元々止まっていたなら、そのまま起動を試みればよい
+    discard # If it was already stopped, just go ahead and try to start it
 
-  # shutdown の応答が返っても実プロセスの終了は非同期かもしれないので、
-  # 実際に ping が通らなくなるまで少し待ってから起動を試みる。
+  # Even after the shutdown response comes back, the actual process exit might
+  # be asynchronous, so wait briefly until ping actually stops succeeding
+  # before trying to start it.
   var waited = 0
   while ping() and waited < 5000:
     os.sleep(100)
@@ -740,8 +764,9 @@ proc cmdDaemonReload(w: Writer; lang: Lang): int =
     ecDaemonUnreachable.int
 
 proc cmdDaemonLogs(args: ParsedArgs): int =
-  ## デーモン自身のログ（`paths.daemonLogPath()`）を tail する。トンネルの
-  ## `logs` と同じ考え方（IPC を経由しない直接ファイル読み込み）を流用する。
+  ## Tails the daemon's own log (`paths.daemonLogPath()`). Reuses the same
+  ## approach as the tunnel `logs` command (reading the file directly, without
+  ## going through IPC).
   let path = daemonLogPath()
   if not fileExists(path):
     echo "no logs yet"
@@ -764,12 +789,13 @@ proc serviceInfoJson(info: ServiceInfo): JsonNode =
   }
 
 proc cmdDaemonInstall(args: ParsedArgs; w: Writer): int =
-  ## OS サービス（macOS の launchd LaunchAgent / Linux の systemd `--user` unit）
-  ## として常駐登録する。
+  ## Registers the daemon as a persistent OS service (a macOS launchd
+  ## LaunchAgent / a Linux systemd `--user` unit).
   ##
-  ## `getAppFilename()` は `nimble build` 直後の `./powarder` のような相対パスを
-  ## 返しうるが、サービス登録には絶対パスが必要（launchd/systemd はカレント
-  ## ディレクトリを引き継がない）ので `expandFilename()` で絶対化する。
+  ## `getAppFilename()` can return a relative path like `./powarder` right
+  ## after `nimble build`, but service registration needs an absolute path
+  ## (launchd/systemd don't inherit the current directory), so we make it
+  ## absolute with `expandFilename()`.
   let exe = expandFilename(getAppFilename())
   try:
     let info = installService(exe, args.configPath)
@@ -803,12 +829,13 @@ proc cmdDaemon(args: ParsedArgs; w: Writer; lang: Lang;
     runDaemon: DaemonRunner): int =
   case args.subsubcommand
   of "", "--foreground":
-    # `argv.nim` は `--foreground` というフラグ自体を持たないため、実際に
-    # ここへ到達するのは `subsubcommand == ""`（`powarder daemon` を
-    # サブサブコマンド無しで叩いた）場合のみ。`"--foreground"` の分岐は
-    # 将来 argv.nim にそのフラグが追加された場合や、テストが `ParsedArgs` を
-    # 手で組み立てて呼ぶ場合のために残してある（`autostart.ensureDaemon` は
-    # `["daemon"]` だけを渡してこの経路に乗せる。`cli/autostart.nim` 参照）。
+    # `argv.nim` doesn't have a `--foreground` flag at all, so in practice the
+    # only way to reach here is `subsubcommand == ""` (running `powarder
+    # daemon` with no subsubcommand). The `"--foreground"` branch is kept
+    # around in case that flag gets added to argv.nim in the future, or for
+    # tests that build a `ParsedArgs` by hand and call this directly
+    # (`autostart.ensureDaemon` takes this path by passing just `["daemon"]`;
+    # see `cli/autostart.nim`).
     if runDaemon == nil:
       echo w.failure("the daemon is not built into this binary")
       return ecGeneral.int
@@ -845,8 +872,8 @@ proc cmdCompletion(args: ParsedArgs): int =
 # ---------------------------------------------------------------------------
 
 proc dispatch*(args: ParsedArgs; runDaemon: DaemonRunner = nil): int =
-  ## サブコマンドを実行して終了コードを返す。標準出力への書き込みはここ
-  ## （と、ここから呼ばれる `cmdXxx` 群）で行う。
+  ## Runs the subcommand and returns the exit code. Writing to stdout happens
+  ## here (and in the `cmdXxx` functions called from here).
   if args.versionRequested:
     echo "powarder ", cliVersion
     return ecOk.int

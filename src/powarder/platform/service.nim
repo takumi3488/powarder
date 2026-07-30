@@ -1,45 +1,51 @@
-## OS サービスとしての常駐登録（共通インタフェース）。
+## Registering as an OS service for persistent running (common interface).
 ##
-## `powarder daemon install` / `uninstall` から呼ばれる。macOS (launchd) /
-## Linux (systemd --user) それぞれの実際の登録処理は `platform/service_darwin` /
-## `platform/service_linux` に分離してあり、このモジュール自身は
-## - 共通の型（`ServiceStatus` / `ServiceInfo`）や `serviceLabel` を
-##   `platform/service_types` から import して再 export する
-## - OS 判定（`when defined(macosx)` / `when defined(linux)`）による振り分け
-## だけを持つ。
+## Called from `powarder daemon install` / `uninstall`. The actual
+## registration processing for macOS (launchd) / Linux (systemd --user) is
+## separated into `platform/service_darwin` / `platform/service_linux`
+## respectively, and this module itself only has:
+## - the common types (`ServiceStatus` / `ServiceInfo`) and `serviceLabel`,
+##   imported and re-exported from `platform/service_types`
+## - dispatching based on OS detection (`when defined(macosx)` /
+##   `when defined(linux)`)
 ##
-## ### ★最重要の設計判断
+## ### IMPORTANT: the most critical design decision
 ##
-## 「exit 0 では再起動せず、クラッシュ時のみ再起動する」のが正しい挙動。
-## - macOS: launchd の `KeepAlive` を `SuccessfulExit = false` にする
-## - Linux: systemd の `Restart=on-failure`（**`always` ではない**）
+## The correct behavior is "do not restart on exit 0; restart only on a
+## crash."
+## - macOS: set launchd's `KeepAlive` to `SuccessfulExit = false`
+## - Linux: use systemd's `Restart=on-failure` (**not** `always`)
 ##
-## これを取り違えると、`powarder daemon stop`（= プロセスが exit 0 で終了する）
-## が即座に再起動されて止まらなくなる、あるいは逆にクラッシュしても
-## 復旧しなくなる。`tests/tservice.nim` で明示的に検証している。
+## Getting this backwards means `powarder daemon stop` (= the process
+## exiting with exit 0) gets immediately restarted and can never be
+## stopped, or conversely that it never recovers even after a crash. This
+## is explicitly verified in `tests/tservice.nim`.
 ##
-## `renderUnitFile` は **純粋関数** にしてある（ファイル I/O・`launchctl` /
-## `systemctl` の実行を一切行わない）。テストは実環境（実際の launchd /
-## systemd 登録）を汚さないよう、生成される文字列だけを検証する方針にする。
+## `renderUnitFile` is made a **pure function** (it performs no file I/O and
+## never invokes `launchctl` / `systemctl` at all). The policy for tests is
+## to verify only the generated string, so as not to pollute the real
+## environment (actual launchd / systemd registration).
 ##
-## ### 依存の向き（循環 import の解消）
+## ### Direction of dependencies (resolving the circular import)
 ##
-## 以前は `service_darwin` / `service_linux` がこのモジュールを import して
-## 型を得る一方、このモジュールも OS 判定でその2つを import しており、
-## 3モジュールが相互 import する構成だった。Nim はこの手の循環を許容するが、
-## `service_darwin` / `service_linux` を先に import したり単独でルート
-## モジュールとしてコンパイルすると「部分的にコンパイルされた空の
-## モジュール」に解決されてしまい undeclared identifier で失敗する罠がある。
+## Previously, `service_darwin` / `service_linux` imported this module to
+## get the types, while this module also imported those two based on OS
+## detection, forming a structure where the three modules imported each
+## other in a cycle. Nim tolerates this kind of cycle, but there is a trap
+## where, if `service_darwin` / `service_linux` are imported first, or
+## compiled standalone as the root module, Nim resolves the cycle as a
+## "partially compiled empty module" and fails with "undeclared
+## identifier."
 ##
-## そこで型・定数・`serviceLabel` を `platform/service_types` に切り出した。
-## 依存は `service_types` ← `service_darwin` / `service_linux` ← `service`
-## という一方向になり、循環は発生しない。`export service_types` により、
-## 既存の利用側（`cli/dispatch.nim` など）は
-## `import powarder/platform/service` だけで `ServiceInfo` 等を
-## そのまま使い続けられる。
+## So the types, constants, and `serviceLabel` were extracted into
+## `platform/service_types`. The dependency becomes the one-way chain
+## `service_types` <- `service_darwin` / `service_linux` <- `service`, and
+## no cycle occurs. Thanks to `export service_types`, existing callers
+## (such as `cli/dispatch.nim`) can keep using `ServiceInfo` etc. as-is with
+## just `import powarder/platform/service`.
 ##
-## 非対応 OS（macOS でも Linux でもない）では、黙って何もしないのではなく
-## `OSError` を送出して明示的に失敗する。
+## On an unsupported OS (neither macOS nor Linux), rather than silently
+## doing nothing, it explicitly fails by raising `OSError`.
 
 import powarder/platform/service_types
 export service_types
@@ -51,28 +57,30 @@ elif defined(linux):
 
 when defined(macosx) or defined(linux):
   proc unitFilePath*(): string =
-    ## plist / unit ファイルのパス。
+    ## Path to the plist / unit file.
     impl.unitFilePath()
 
   proc renderUnitFile*(exePath: string; configPath = ""): string =
-    ## plist / unit ファイルの中身を生成する。**純粋関数**（テストのため）。
+    ## Generates the contents of the plist / unit file. **Pure function**
+    ## (for testing).
     impl.renderUnitFile(exePath, configPath)
 
   proc installService*(exePath: string; configPath = ""): ServiceInfo =
-    ## unit ファイルを書き出し、`launchctl` / `systemctl` で実際に登録する。
+    ## Writes out the unit file and actually registers it via `launchctl` /
+    ## `systemctl`.
     impl.installService(exePath, configPath)
 
   proc uninstallService*(): ServiceInfo =
-    ## 登録を解除し、unit ファイルを削除する。
+    ## Deregisters it and deletes the unit file.
     impl.uninstallService()
 
   proc serviceStatus*(): ServiceInfo =
-    ## 現在の登録状態を問い合わせる。
+    ## Queries the current registration status.
     impl.serviceStatus()
 else:
   proc unsupportedOsMsg(): string =
-    "powarder daemon install/uninstall はこの OS では未対応です " &
-      "(サポートしているのは macOS の launchd と Linux の systemd --user のみです)"
+    "powarder daemon install/uninstall is not supported on this OS " &
+      "(only macOS launchd and Linux systemd --user are supported)"
 
   proc unitFilePath*(): string =
     raise newException(OSError, unsupportedOsMsg())

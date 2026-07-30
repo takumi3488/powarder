@@ -1,14 +1,14 @@
-## `powarder/daemon/logstore` のテスト。
+## Tests for `powarder/daemon/logstore`.
 ##
-## ★項目11（copytruncate 検証）がこのモジュールの設計上の核心。
-## ssh マスターは `>>logPath`（`O_APPEND`）で開いた fd を握り続けたまま
-## 動くため、ローテートは「リネーム」ではなく「コピー + truncate」で
-## 行わなければならない。これを間違えると「ローテート後にログが一切
-## 増えない」という気付きにくいバグになる（`daemon/logstore.nim` の
-## モジュール doc comment を参照）。このテストでは実際に `fmAppend` で
-## fd を開いたまま `rotateIfNeeded` を呼び、その fd への書き込みが
-## リネームされた `.1` ではなく元のパス（＝新しいログ）に現れることを
-## 確認する。
+## IMPORTANT: item 11 (copytruncate verification) is the design core of
+## this module. The ssh master keeps holding the fd it opened with
+## `>>logPath` (`O_APPEND`), so rotation has to be done as "copy + truncate"
+## rather than "rename". Getting this wrong turns into the hard-to-notice
+## bug of "the log never grows again after rotation" (see the module doc
+## comment in `daemon/logstore.nim`). This test actually opens an fd with
+## `fmAppend`, keeps it open across a call to `rotateIfNeeded`, and
+## confirms that a write through that fd shows up at the original path
+## (the new log), not at the renamed `.1`.
 
 import std/[unittest, os, strutils]
 import powarder/daemon/logstore
@@ -22,11 +22,11 @@ proc setupSuite() =
 setupSuite()
 
 # ---------------------------------------------------------------------------
-# 9. サイズ未満ならローテートしない
+# 9. No rotation when under the size limit
 # ---------------------------------------------------------------------------
 
-suite "rotateIfNeeded: サイズ未満":
-  test "サイズが上限以下ならローテートせず false を返す":
+suite "rotateIfNeeded: under the size limit":
+  test "returns false and does not rotate when size is at or below the limit":
     let path = testDir / "under.log"
     writeFile(path, "x".repeat(50))
 
@@ -34,17 +34,18 @@ suite "rotateIfNeeded: サイズ未満":
     check not fileExists(path & ".1")
     check getFileSize(path) == 50
 
-  test "ファイルが存在しなければ false を返す":
+  test "returns false if the file doesn't exist":
     let path = testDir / "does-not-exist.log"
     removeFile(path)
     check not rotateIfNeeded(path, maxBytes = 100)
 
 # ---------------------------------------------------------------------------
-# 10. サイズ超過でローテートし、.1 ができて元ファイルが0バイトになる
+# 10. Rotates when over the size limit: `.1` is created and the original
+#     file becomes 0 bytes
 # ---------------------------------------------------------------------------
 
-suite "rotateIfNeeded: サイズ超過":
-  test "サイズが上限を超えていればローテートし、.1 ができて元ファイルが0バイトになる":
+suite "rotateIfNeeded: over the size limit":
+  test "rotates when size exceeds the limit; `.1` is created and the original file becomes 0 bytes":
     let path = testDir / "over.log"
     writeFile(path, "y".repeat(200))
 
@@ -54,16 +55,16 @@ suite "rotateIfNeeded: サイズ超過":
     check getFileSize(path) == 0
 
 # ---------------------------------------------------------------------------
-# 11. ★copytruncate であることの検証
+# 11. IMPORTANT: verifying it's copytruncate
 # ---------------------------------------------------------------------------
 
-suite "copytruncate 検証":
-  test "ローテート前から O_APPEND で開いていた fd への書き込みが、リネームされた.1ではなく元のパス（新しいログ）に現れる":
+suite "copytruncate verification":
+  test "a write via an fd opened O_APPEND before rotation shows up at the original path (the new log), not the renamed .1":
     let path = testDir / "append.log"
     writeFile(path, "z".repeat(200))
 
-    # ssh マスターが持ち続ける `>>logPath` の fd を模擬する。
-    # Nim の `fmAppend` は `O_APPEND` で開く。
+    # Simulates the `>>logPath` fd the ssh master keeps holding on to.
+    # Nim's `fmAppend` opens with `O_APPEND`.
     var appendFd: File
     check open(appendFd, path, fmAppend)
 
@@ -71,8 +72,9 @@ suite "copytruncate 検証":
     check getFileSize(path) == 0
     check readFile(path & ".1") == "z".repeat(200)
 
-    # ローテート前から開いていた fd で書き込む。inode が同じであれば
-    # （＝リネームではなくコピー+truncate であれば）元のパスに現れる。
+    # Write through the fd that was open before rotation. If the inode is
+    # the same (i.e. it was copy+truncate rather than rename), the write
+    # shows up at the original path.
     appendFd.write("AFTER-ROTATE\n")
     appendFd.flushFile()
     appendFd.close()
@@ -81,11 +83,11 @@ suite "copytruncate 検証":
     check "AFTER-ROTATE" notin readFile(path & ".1")
 
 # ---------------------------------------------------------------------------
-# 12. 世代が3つを超えると最古が消える
+# 12. The oldest generation is removed once more than 3 generations exist
 # ---------------------------------------------------------------------------
 
-suite "世代管理":
-  test "3世代を超えると最古の世代が消える":
+suite "generation management":
+  test "the oldest generation is removed once more than 3 generations exist":
     let path = testDir / "gens.log"
 
     writeFile(path, "A".repeat(200))
@@ -109,25 +111,25 @@ suite "世代管理":
     check readFile(path & ".2") == "C".repeat(200)
     check readFile(path & ".3") == "B".repeat(200)
     check not fileExists(path & ".4")
-    # 最古（"A" 世代）はどこにも残っていない
+    # the oldest ("A") generation is nowhere to be found
     check "A" notin readFile(path & ".1")
     check "A" notin readFile(path & ".2")
     check "A" notin readFile(path & ".3")
 
 # ---------------------------------------------------------------------------
-# 13. rotateAll がディレクトリ内の複数ファイルを処理し件数を返す
+# 13. rotateAll processes multiple files in a directory and returns the count
 # ---------------------------------------------------------------------------
 
 suite "rotateAll":
-  test "*.log だけをローテートし、ローテートした件数を返す":
+  test "rotates only *.log files and returns how many were rotated":
     let dir = testDir / "rotateall"
     removeDir(dir)
     createDir(dir)
 
-    writeFile(dir / "a.log", "1".repeat(200)) ## 超過 -> ローテートされる
-    writeFile(dir / "b.log", "2".repeat(200)) ## 超過 -> ローテートされる
-    writeFile(dir / "c.log", "3".repeat(10)) ## 未満 -> ローテートされない
-    writeFile(dir / "not-a-log.txt", "4".repeat(200)) ## *.log にマッチしない
+    writeFile(dir / "a.log", "1".repeat(200)) ## over the limit -> gets rotated
+    writeFile(dir / "b.log", "2".repeat(200)) ## over the limit -> gets rotated
+    writeFile(dir / "c.log", "3".repeat(10)) ## under the limit -> not rotated
+    writeFile(dir / "not-a-log.txt", "4".repeat(200)) ## doesn't match *.log
 
     let rotated = rotateAll(dir, maxBytes = 100)
 
@@ -140,11 +142,11 @@ suite "rotateAll":
     check getFileSize(dir / "b.log") == 0
     check getFileSize(dir / "c.log") == 10
 
-  test "存在しないディレクトリは 0 を返す（クラッシュしない）":
+  test "returns 0 for a directory that doesn't exist (doesn't crash)":
     check rotateAll(testDir / "no-such-dir") == 0
 
 # ---------------------------------------------------------------------------
-# 後片付け
+# Cleanup
 # ---------------------------------------------------------------------------
 
 removeDir(testDir)

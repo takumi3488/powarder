@@ -1,17 +1,20 @@
-## `powarder/daemon/registry` と `powarder/daemon/reconcile` のテスト。
+## Tests for `powarder/daemon/registry` and `powarder/daemon/reconcile`.
 ##
-## 実 SSH サーバなしにテストするため、`tests/fixtures/ssh` という fake ssh を
-## `PATH` の先頭に置いて powarder に `ssh` として掴ませる（`thostsession.nim` /
-## `tforward.nim` と同じ手法。環境構築はそのまま踏襲する）。
-## 実装済みのモードは `ok` / `bind-failed` / `not-forwarded` / `no-master` /
-## `auth-failed` / `slow-start`。ここでは主に `ok` モードだけを使う
-## （registry/reconcile が見るのはホストやフォワード個々の障害復旧ではなく
-## 「望ましい状態」との突き合わせなので、異常系のバリエーションは
-## `thostsession.nim` / `tforward.nim` 側で既にカバーされている）。
+## To test without a real SSH server, we place the fake ssh at
+## `tests/fixtures/ssh` at the front of `PATH` and let powarder pick it up
+## as `ssh` (the same technique as `thostsession.nim` / `tforward.nim`; the
+## environment setup is carried over as-is).
+## The implemented modes are `ok` / `bind-failed` / `not-forwarded` /
+## `no-master` / `auth-failed` / `slow-start`. Here we mainly use only the
+## `ok` mode (what registry/reconcile look at is not the failure recovery
+## of individual hosts or forwards, but reconciling against the "desired
+## state", so the failure-case variations are already covered on the
+## `thostsession.nim` / `tforward.nim` side).
 
 import std/[unittest, os, posix, tables, monotimes, times, strutils]
-import std/nativesockets ## `ForwardSpec` の自動生成 `==` が `Port` の `==` を
-                          ## 使うために必要（`reconcile.nim` と同じ理由）。
+import std/nativesockets ## Needed because the auto-generated `==` for
+                          ## `ForwardSpec` uses `Port`'s `==` internally
+                          ## (same reason as in `reconcile.nim`).
 import std/asyncdispatch
 
 import powarder/core/types
@@ -26,11 +29,11 @@ const testRuntimeDir = "/tmp/pw-rec-rt"
 const testStateDir = "/tmp/pw-rec-state"
 
 # ---------------------------------------------------------------------------
-# セットアップ / ヘルパー
+# Setup / helpers
 # ---------------------------------------------------------------------------
 
 proc withMode(mode: string; body: proc()) =
-  ## `POWARDER_FAKE_SSH_MODE` を一時的に切り替えてテスト本体を実行する。
+  ## Temporarily switches `POWARDER_FAKE_SSH_MODE` and runs the test body.
   let had = existsEnv("POWARDER_FAKE_SSH_MODE")
   let old = getEnv("POWARDER_FAKE_SSH_MODE")
   putEnv("POWARDER_FAKE_SSH_MODE", mode)
@@ -41,7 +44,8 @@ proc withMode(mode: string; body: proc()) =
     else: delEnv("POWARDER_FAKE_SSH_MODE")
 
 proc setupSuite() =
-  ## PATH の先頭に fake ssh を置き、ランタイム/状態ディレクトリを隔離する。
+  ## Puts fake ssh at the front of PATH and isolates the runtime/state
+  ## directories.
   removeDir(testRuntimeDir)
   createDir(testRuntimeDir)
   removeDir(testStateDir)
@@ -57,32 +61,34 @@ proc setupSuite() =
 setupSuite()
 
 var allRegistries: seq[Registry]
-  ## 後片付け漏れを防ぐため、生成した Registry を全部覚えておいて
-  ## ファイルの末尾で teardownAll する（`thostsession.nim` の `allSessions` と
-  ## 同じ手法）。
+  ## To avoid missing cleanup, remember every generated Registry and
+  ## teardownAll them all at the end of the file (the same technique as
+  ## `allSessions` in `thostsession.nim`).
 
 proc track(reg: Registry): Registry =
   allRegistries.add(reg)
   reg
 
 proc processAlive(pid: int): bool =
-  ## `platform/procinfo.pidAlive` と同じ判定だが、`platform/` を import
-  ## しないという制約（別エージェントの担当領域）を守るため、テスト内で
-  ## 最小限だけ複製する（`thostsession.nim` と同じ手法）。
+  ## Same judgment as `platform/procinfo.pidAlive`, but to respect the
+  ## constraint of not importing `platform/` (that's another agent's
+  ## territory), we duplicate just the minimum inside the test (same
+  ## technique as `thostsession.nim`).
   if kill(Pid(pid), 0.cint) == 0:
     return true
   cint(osLastError()) == EPERM
 
 proc newTunnelConfig(name, host: string; spec: ForwardSpec; autostart = true;
     profile = ""; sshExtraArgs: seq[string] = @[]): TunnelConfig =
-  ## テスト用に `TunnelConfig` を組み立てる小さなヘルパー。
+  ## A small helper that assembles a `TunnelConfig` for tests.
   TunnelConfig(name: name, host: host, spec: spec, autostart: autostart,
       profile: profile, sshExtraArgs: sshExtraArgs, retry: initRetryPolicy())
 
 proc waitUntil(reg: Registry; cond: proc(): bool {.closure.};
     timeoutMs = 5000): bool =
-  ## 同期的なポーリング。ホストの接続待ちのように async な内部処理を伴わない
-  ## 遷移を待つのに使う（`thostsession.waitForState` と同じ手法）。
+  ## Synchronous polling. Used to wait for a transition that doesn't
+  ## involve async internal processing, like waiting for a host to
+  ## connect (same technique as `thostsession.waitForState`).
   let deadline = getMonoTime() + initDuration(milliseconds = timeoutMs)
   while not cond():
     tickAll(reg)
@@ -95,9 +101,10 @@ proc waitUntil(reg: Registry; cond: proc(): bool {.closure.};
 
 proc pollAsync(reg: Registry; cond: proc(): bool {.closure.}; tries = 300;
     delayMs = 20): Future[bool] {.async.} =
-  ## detach の副作用確認（`probeUpstream`）は Future で段階的に進むため、
-  ## 同期的に `tick` を呼ぶだけでは進まない。`sleepAsync` でイベントループに
-  ## 制御を返しながらポーリングする（`tforward.pollForward` と同じ手法）。
+  ## Confirming detach's side effect (`probeUpstream`) progresses in
+  ## stages through a Future, so just calling `tick` synchronously won't
+  ## advance it. We poll while yielding control back to the event loop
+  ## via `sleepAsync` (same technique as `tforward.pollForward`).
   for i in 0 ..< tries:
     tickAll(reg)
     if cond():
@@ -106,19 +113,19 @@ proc pollAsync(reg: Registry; cond: proc(): bool {.closure.}; tries = 300;
   result = cond()
 
 # ---------------------------------------------------------------------------
-# 1. getOrCreateHost: マスター共有の核心
+# 1. getOrCreateHost: the heart of master sharing
 # ---------------------------------------------------------------------------
 
 suite "getOrCreateHost":
-  test "同じ host なら同じ HostSession インスタンスを返す":
+  test "returns the same HostSession instance for the same host":
     withMode("ok", proc() =
       let reg = track(newRegistry())
       let a = getOrCreateHost(reg, "host-getorcreate-a")
       let b = getOrCreateHost(reg, "host-getorcreate-a")
-      check a == b ## 参照として同一（HostSession は ref object）
+      check a == b ## Identical as a reference (HostSession is a ref object)
       check reg.hosts.len == 1)
 
-  test "host が違えば違う HostSession になる":
+  test "a different host yields a different HostSession":
     withMode("ok", proc() =
       let reg = track(newRegistry())
       let a = getOrCreateHost(reg, "host-getorcreate-b1")
@@ -128,11 +135,11 @@ suite "getOrCreateHost":
       check reg.hosts.len == 2)
 
 # ---------------------------------------------------------------------------
-# 2. reconcile: 冪等性
+# 2. reconcile: idempotency
 # ---------------------------------------------------------------------------
 
-suite "reconcile: 冪等性":
-  test "同じ desired で2回呼んでも2回目の actions は空":
+suite "reconcile: idempotency":
+  test "calling twice with the same desired leaves the second call's actions empty":
     withMode("ok", proc() =
       let reg = track(newRegistry())
       let spec1 = ForwardSpec(kind: fkLocal, bindAddr: defaultBindAddr,
@@ -144,18 +151,19 @@ suite "reconcile: 冪等性":
       let desired = DesiredState(tunnels: @[tc1, tc2], activeProfiles: @[])
 
       let report1 = reconcile(desired, reg)
-      check report1.actions.len > 0 ## 初回は host/forward の作成が起きる
+      check report1.actions.len > 0 ## The first call creates the host/forward
 
       let report2 = reconcile(desired, reg)
       check report2.actions.len == 0
       check report2.warnings.len == 0)
 
 # ---------------------------------------------------------------------------
-# 3. reconcile: 同じ host を指す複数トンネルがマスターを共有する（M5 完了条件）
+# 3. reconcile: multiple tunnels pointing at the same host share a master
+#    (M5 completion criterion)
 # ---------------------------------------------------------------------------
 
-suite "reconcile: マスター共有":
-  test "同じ host を指す2つのトンネルが1つのマスターを共有する":
+suite "reconcile: master sharing":
+  test "two tunnels pointing at the same host share a single master":
     withMode("ok", proc() =
       let reg = track(newRegistry())
       let spec1 = ForwardSpec(kind: fkLocal, bindAddr: defaultBindAddr,
@@ -173,11 +181,11 @@ suite "reconcile: マスター共有":
       check refCount(host) == 2)
 
 # ---------------------------------------------------------------------------
-# 4. reconcile: 設定から消えたトンネルの detach
+# 4. reconcile: detaching a tunnel removed from the config
 # ---------------------------------------------------------------------------
 
-suite "reconcile: 設定から消えたトンネル":
-  test "設定から消えたトンネルの forward が detach される":
+suite "reconcile: a tunnel removed from the config":
+  test "the forward of a tunnel removed from the config gets detached":
     withMode("ok", proc() =
       let reg = track(newRegistry())
       let spec1 = ForwardSpec(kind: fkLocal, bindAddr: defaultBindAddr,
@@ -199,29 +207,32 @@ suite "reconcile: 設定から消えたトンネル":
       check reg.forwards[id2].state == fwDetaching)
 
 # ---------------------------------------------------------------------------
-# 5. reconcile: spec が変わった場合の detach -> 再作成
+# 5. reconcile: detach -> recreate when the spec changes
 # ---------------------------------------------------------------------------
 
-suite "reconcile: spec 変更":
-  test "同じ id・違う targetPort の場合に detach してから作り直す":
+suite "reconcile: spec change":
+  test "detaches and rebuilds when the id is the same but targetPort differs":
     withMode("ok", proc() =
       let reg = track(newRegistry())
       let spec1 = ForwardSpec(kind: fkLocal, bindAddr: defaultBindAddr,
           bindPort: Port(18206), targetHost: "db1.internal", targetPort: Port(1))
       let spec1b = ForwardSpec(kind: fkLocal, bindAddr: defaultBindAddr,
           bindPort: Port(18206), targetHost: "db1.internal", targetPort: Port(2))
-      check spec1 != spec1b ## targetPort だけが違う
+      check spec1 != spec1b ## Only targetPort differs
       let tc1 = newTunnelConfig("spec-change", "host-spec-change", spec1)
       let id = forwardId(spec1, tc1.host)
-      check id == forwardId(spec1b, tc1.host) ## id は bindAddr:bindPort だけで
-                                               ## 決まるので変わらない
+      check id == forwardId(spec1b, tc1.host) ## The id is determined only
+                                               ## by bindAddr:bindPort, so
+                                               ## it doesn't change
 
       let desired1 = DesiredState(tunnels: @[tc1], activeProfiles: @[])
       discard reconcile(desired1, reg)
 
       let host = getOrCreateHost(reg, tc1.host)
       check waitUntil(reg, proc(): bool = isConnected(host))
-      check reg.forwards[id].state == fwActive ## host 接続後 tickAll で attach 済み
+      check reg.forwards[id].state == fwActive ## Already attached via
+                                                ## tickAll after the host
+                                                ## connects
 
       let tc1b = newTunnelConfig("spec-change", "host-spec-change", spec1b)
       let desired2 = DesiredState(tunnels: @[tc1b], activeProfiles: @[])
@@ -239,11 +250,11 @@ suite "reconcile: spec 変更":
       check reg.forwards[id].spec == spec1b)
 
 # ---------------------------------------------------------------------------
-# 6. reconcile: enabledOverride が効く（M5 完了条件）
+# 6. reconcile: enabledOverride takes effect (M5 completion criterion)
 # ---------------------------------------------------------------------------
 
 suite "reconcile: enabledOverride":
-  test "setEnabled(false) で detach され、無関係な reload では再開しない":
+  test "setEnabled(false) detaches it, and an unrelated reload does not resume it":
     withMode("ok", proc() =
       let reg = track(newRegistry())
       let spec1 = ForwardSpec(kind: fkLocal, bindAddr: defaultBindAddr,
@@ -262,7 +273,8 @@ suite "reconcile: enabledOverride":
       check report2.actions == @[(raDisableForward, "stop-me")]
       check reg.forwards[id1].state == fwDetaching
 
-      # 無関係な reload: stop-me / keep-me はそのまま、新しいトンネルが増えただけ
+      # An unrelated reload: stop-me / keep-me stay as they are; only a
+      # new tunnel was added
       let spec3 = ForwardSpec(kind: fkLocal, bindAddr: defaultBindAddr,
           bindPort: Port(18209), targetHost: "db3.internal", targetPort: Port(3))
       let tc3 = newTunnelConfig("unrelated-new", "host-unrelated", spec3)
@@ -274,16 +286,16 @@ suite "reconcile: enabledOverride":
       for a in report3.actions:
         if a.target == "stop-me":
           resumed = true
-      check not resumed ## stop したトンネルが勝手に再開していない
+      check not resumed ## The stopped tunnel did not resume on its own
       check reg.forwards[id1].state == fwDetaching
       check isEnabled(reg, "stop-me", tc1.autostart) == false)
 
 # ---------------------------------------------------------------------------
-# 7. reconcile: profile フィルタ
+# 7. reconcile: profile filter
 # ---------------------------------------------------------------------------
 
-suite "reconcile: profile フィルタ":
-  test "activeProfiles が空なら profile 無しのトンネルだけが対象になる":
+suite "reconcile: profile filter":
+  test "when activeProfiles is empty, only tunnels with no profile are targeted":
     withMode("ok", proc() =
       let reg = track(newRegistry())
       let specNo = ForwardSpec(kind: fkLocal, bindAddr: defaultBindAddr,
@@ -312,11 +324,11 @@ suite "reconcile: profile フィルタ":
       check forwardsOfTunnel(reg, "prof-dev").len == 1)
 
 # ---------------------------------------------------------------------------
-# 8. tickAll: 順序とイテレータの安全性
+# 8. tickAll: ordering and iterator safety
 # ---------------------------------------------------------------------------
 
 suite "tickAll":
-  test "host -> forward -> 破棄可能な forward の除去、複数同時でも安全":
+  test "host -> forward -> removal of discardable forwards is safe even with multiple at once":
     withMode("ok", proc() =
       let reg = track(newRegistry())
       let host = getOrCreateHost(reg, "host-tickall")
@@ -342,18 +354,20 @@ suite "tickAll":
       waitFor scenario()
 
       check reg.forwards.len == 0
-      check reg.hosts.len == 1 ## ホストは reconcile/registry からは能動的に
-                                ## 削除しない設計（grace period 経由の自己停止に任せる）
+      check reg.hosts.len == 1 ## Hosts are, by design, never actively
+                                ## removed from reconcile/registry (left to
+                                ## self-stop via the grace period)
       check refCount(host) == 0)
 
 # ---------------------------------------------------------------------------
-# 9. teardownAll: プロセスの残骸が無いこと
+# 9. teardownAll: no leftover processes
 # ---------------------------------------------------------------------------
 
 suite "teardownAll":
-  test "teardownAll 後に forwards/hosts が空になり、プロセスの残骸が無い":
+  test "after teardownAll, forwards/hosts are empty and no process debris remains":
     withMode("ok", proc() =
-      let reg = newRegistry() ## この test 自身で teardown まで確認するので track しない
+      let reg = newRegistry() ## Not tracked, since this test itself
+                              ## verifies teardown
       let host = getOrCreateHost(reg, "host-teardownall")
       let spec = ForwardSpec(kind: fkLocal, bindAddr: defaultBindAddr,
           bindPort: Port(18230), targetHost: "db.internal", targetPort: Port(1))
@@ -375,8 +389,8 @@ suite "teardownAll":
 # ---------------------------------------------------------------------------
 
 suite "pruneOverrides":
-  test "設定から消えたトンネル名の override を消す":
-    let reg = newRegistry() ## ssh を一切呼ばないので withMode 不要
+  test "removes the override for a tunnel name that disappeared from the config":
+    let reg = newRegistry() ## No withMode needed since ssh is never invoked
     setEnabled(reg, "ghost", false)
     setEnabled(reg, "real", true)
 
@@ -386,11 +400,13 @@ suite "pruneOverrides":
     check "real" in reg.enabledOverride
 
 # ---------------------------------------------------------------------------
-# 後片付け: すべての Registry を teardownAll し、ランタイム/状態ディレクトリを消す
+# Cleanup: teardownAll every Registry and remove the runtime/state
+# directories
 # ---------------------------------------------------------------------------
 
 for reg in allRegistries:
-  teardownAll(reg) ## 各テストで既に片付けていれば一瞬で終わる安全網
+  teardownAll(reg) ## A safety net that finishes instantly if each test
+                    ## already cleaned up
 
 removeDir(testRuntimeDir)
 removeDir(testStateDir)
@@ -399,12 +415,16 @@ delEnv("POWARDER_FAKE_SSH_LOG")
 delEnv("POWARDER_RUNTIME_DIR")
 delEnv("POWARDER_STATE_DIR")
 
-# fake ssh のリスナー（nc / python3 / perl）は、`hostsession.teardown` が最終手段の
-# SIGKILL を送ると fake ssh 側の trap が発火しないため孤児化して残る。残ったままだと
-# 親から継承した pipe が閉じず、`nimble test` が EOF を待って**ハングする**
-# （実測: Linux コンテナで3時間ハングした）。fake ssh 側で fd を閉じる方法は
-# dash の挙動と asyncdispatch の fd 継承の2点で壊れたため、ここで確実に掃除する。
+# The fake ssh listener (nc / python3 / perl) is orphaned and left behind
+# when `hostsession.teardown`'s last resort, SIGKILL, is sent, because the
+# fake ssh's trap never fires. If it's left behind, the pipe inherited from
+# the parent never closes, and `nimble test` **hangs** waiting for EOF
+# (observed in practice: hung for 3 hours in a Linux container). The
+# approach of closing the fd on the fake ssh side broke on two points --
+# dash's behavior and asyncdispatch's fd inheritance -- so we clean it up
+# reliably here instead.
 #
-# `[p]` のブラケットは `pkill` が自分自身のコマンドラインにマッチして自滅するのを
-# 防ぐための定石（実測で踏んだ。exit 144 になる）。
+# The `[p]` bracket trick is the standard idiom for preventing `pkill` from
+# matching its own command line and killing itself (hit this in practice;
+# it results in exit 144).
 discard execShellCmd("pkill -f '" & testRuntimeDir & "' >/dev/null 2>&1 || true")

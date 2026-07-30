@@ -1,74 +1,83 @@
-## powarder の CLI (クライアント) とデーモン (サーバー) が Unix domain socket 上で
-## やり取りする JSON-RPC 2.0 メッセージのエンコード / デコードを行う。
+## Encodes / decodes the JSON-RPC 2.0 messages exchanged over a Unix
+## domain socket between powarder's CLI (client) and daemon (server).
 ##
-## このモジュールは **文字列 <-> 型の相互変換のみ** を行う純粋モジュールであり、
-## `std/asyncnet` / `std/net` / `std/osproc` を import しない。ソケットへの
-## 読み書きは `ipc/client.nim` / `ipc/server.nim` の責務。
+## This module is a pure module that does **only string <-> type
+## conversion**; it does not import `std/asyncnet` / `std/net` /
+## `std/osproc`. Reading and writing to the socket is the responsibility of
+## `ipc/client.nim` / `ipc/server.nim`.
 ##
-## 前提（1メッセージ = 1行の framing）:
-## - 1つの JSON-RPC メッセージは改行を含まない1行の JSON 文字列として表現される。
-##   `encode*` はこの前提の下で常に改行を含まない文字列を返す
-##   （`$JsonNode` は既定で改行を含まない出力になる。`pretty()` は使わない）。
-## - JSON 文字列リテラル中の生の改行は JSON エンコーダが `\n` にエスケープするため、
-##   この 1 行 = 1 メッセージという framing は安全に成立する。
-## - 1つの UDS 接続 = 1つの論理コマンド。`logs -f` のようなストリーミングは
-##   デーモンを経由せず CLI がログファイルを直接 tail する設計なので、現時点では
-##   notification を積極的に使う予定はない。ただし将来のために notification の
-##   エンコード/デコード（`id` を持たないメッセージ）は用意しておく。
+## Premise (1 message = 1 line of framing):
+## - A single JSON-RPC message is represented as one line of JSON text
+##   containing no newline. Under this premise, `encode*` always returns a
+##   string with no newline (`$JsonNode` produces output with no newline by
+##   default; `pretty()` is not used).
+## - Because the JSON encoder escapes raw newlines inside JSON string
+##   literals as `\n`, this 1 line = 1 message framing holds safely.
+## - 1 UDS connection = 1 logical command. Streaming such as `logs -f` is
+##   designed so the CLI tails the log file directly rather than going
+##   through the daemon, so there is no active plan to make heavy use of
+##   notifications at this point. That said, notification encoding/decoding
+##   (messages with no `id`) is provided for future use.
 
 import std/json
 import std/options
 import std/strformat
-import std/nativesockets ## `Port` の `==` を使うために必要（types.nim は `Port` 自体は
-                          ## export しているが、`==` などの演算子までは re-export しないため）
+import std/nativesockets ## Needed to use `Port`'s `==` (types.nim exports
+                          ## `Port` itself, but does not re-export operators such as `==`)
 
-# `import powarder/core/types` の形を試したが、この構成では
-# リポジトリ直下に nim.cfg 等の `--path` 設定が無く plain `nim c` では解決できない
-# （nimble 経由でビルドする場合のみ srcDir が自動で path に載る）。
-# そのため `mise exec -- nim c -r tests/tprotocol.nim` を素のコマンドで通すために
-# 相対 import に切り替えた（実測して確認済み）。
+# The form `import powarder/core/types` was tried, but with this repo's
+# layout there is no `--path` setting such as a nim.cfg at the repo root, so
+# plain `nim c` cannot resolve it (srcDir is only added to the path
+# automatically when building via nimble). So this was switched to a
+# relative import to make bare commands like
+# `mise exec -- nim c -r tests/tprotocol.nim` work (empirically verified).
 import powarder/core/types
 
 # ---------------------------------------------------------------------------
-# メッセージ型
+# Message types
 # ---------------------------------------------------------------------------
 
 type
   RpcRequest* = object
-    id*: Option[int]  ## none なら notification（応答を期待しない通知）
+    id*: Option[int]  ## none means a notification (a message expecting no response)
     methodName*: string
-      ## JSON 上のキー名は "method"。
-      ## `method` は Nim の予約語（`method` ステートメント = OOP の多重ディスパッチ用
-      ## メソッド定義に使われる）であり、フィールド名として使うにはバッククォートでの
-      ## エスケープ（`` `method` ``）が常に必要になって呼び出し側の可読性を損なう。
-      ## このモジュールは JSON キー名とフィールド名の対応をエンコード/デコード関数側で
-      ## 手動で吸収するので、Nim 側の識別子は素直に読み書きできる `methodName` にした。
-    params*: JsonNode ## 引数無し呼び出しでは nil
+      ## The JSON key name is "method".
+      ## `method` is a Nim reserved word (the `method` statement is used to
+      ## define OOP multiple-dispatch methods), so using it as a field name
+      ## would always require backtick escaping (`` `method` ``), which
+      ## hurts readability at call sites. This module manually absorbs the
+      ## mapping between the JSON key name and the field name inside the
+      ## encode/decode functions, so the Nim-side identifier was made the
+      ## plain, easy-to-read `methodName`.
+    params*: JsonNode ## nil for calls with no arguments
 
   RpcErrorInfo* = object
     code*: int
     message*: string
-    data*: JsonNode ## 追加情報が無ければ nil
+    data*: JsonNode ## nil if there's no additional information
 
   RpcResponse* = object
     id*: Option[int]
-      ## 応答は常に対応するリクエストの `id` を持つ想定なので、実用上ここが
-      ## `none` になることは無い（`encodeSuccess` / `encodeError` はどちらも
-      ## `id: int` を必須で受け取るため、id 無しの応答は作れない）。
-      ## それでも `RpcRequest.id` と型を対称にしておくことで、将来
-      ## 「id が特定できないまま返すエラー応答」のような JSON-RPC 2.0 の
-      ## エッジケースを表現したくなったときに型を変えずに済む。
-    result*: JsonNode ## 成功時の戻り値。省略可能な呼び出しの応答では nil
-    error*: Option[RpcErrorInfo] ## 成功時は none
+      ## A response is always expected to carry the `id` of its
+      ## corresponding request, so in practice this is never `none` (both
+      ## `encodeSuccess` / `encodeError` require `id: int`, so it's
+      ## impossible to construct a response with no id). Even so, keeping
+      ## the type symmetric with `RpcRequest.id` means the type won't need
+      ## to change if we ever want to represent a JSON-RPC 2.0 edge case in
+      ## the future, such as "an error response returned when the id
+      ## couldn't be determined".
+    result*: JsonNode ## The return value on success. nil for responses to calls with an optional result
+    error*: Option[RpcErrorInfo] ## none on success
 
   RpcParseErrorKind* = enum
-    ## `decodeRequest` / `decodeResponse` が投げる `RpcParseError` の原因分類。
-    ## メッセージ文字列だけに頼ると呼び出し側での分岐が壊れやすいため、
-    ## `case` で判定できるように種別を持たせる。
-    rpeInvalidJson ## JSON として構文解析できない（空文字列を含む）
-    rpeInvalidVersion ## "jsonrpc" フィールドが無い、または "2.0" でない
-    rpeMissingField ## 必須フィールドが欠落している
-    rpeInvalidField ## フィールドは存在するが型/値が不正
+    ## Classifies the cause of an `RpcParseError` raised by `decodeRequest` /
+    ## `decodeResponse`. Relying solely on the message string would make
+    ## the caller's branching fragile, so a kind is provided that can be
+    ## switched on with `case`.
+    rpeInvalidJson ## Cannot be parsed as JSON (including an empty string)
+    rpeInvalidVersion ## the "jsonrpc" field is missing, or is not "2.0"
+    rpeMissingField ## a required field is missing
+    rpeInvalidField ## the field is present but its type/value is invalid
 
   RpcParseError* = object of CatchableError
     kind*: RpcParseErrorKind
@@ -78,28 +87,28 @@ proc newRpcParseError(kind: RpcParseErrorKind; msg: string): ref RpcParseError =
   result.kind = kind
 
 # ---------------------------------------------------------------------------
-# エラーコード
+# Error codes
 # ---------------------------------------------------------------------------
 
 const
-  # JSON-RPC 2.0 標準のエラーコード。
+  # Standard JSON-RPC 2.0 error codes.
   rpcParseError* = -32700
   rpcInvalidRequest* = -32600
   rpcMethodNotFound* = -32601
   rpcInvalidParams* = -32602
   rpcInternalError* = -32603
 
-  # powarder 固有のエラーコード（JSON-RPC 2.0 のサーバー定義領域 -32000〜-32099）。
-  # 各コメントは対応する CLI の終了コード。
-  errTunnelNotFound* = -32001 ## 終了コード 4
-  errTunnelNameConflict* = -32002 ## 終了コード 5
-  errSshFailed* = -32003 ## 終了コード 6
-  errConfigInvalid* = -32004 ## 終了コード 3
+  # powarder-specific error codes (JSON-RPC 2.0's server-defined range,
+  # -32000 to -32099). Each comment notes the corresponding CLI exit code.
+  errTunnelNotFound* = -32001 ## exit code 4
+  errTunnelNameConflict* = -32002 ## exit code 5
+  errSshFailed* = -32003 ## exit code 6
+  errConfigInvalid* = -32004 ## exit code 3
   errHostNotFound* = -32005
   errForwardBindFailed* = -32006
 
 # ---------------------------------------------------------------------------
-# メソッド名
+# Method names
 # ---------------------------------------------------------------------------
 
 const
@@ -109,7 +118,7 @@ const
   mDaemonShutdown* = "daemon.shutdown"
   mTunnelList* = "tunnel.list"
   mTunnelInspect* = "tunnel.inspect"
-  mTunnelCreate* = "tunnel.create" ## ad-hoc な `powarder run` 用
+  mTunnelCreate* = "tunnel.create" ## for the ad-hoc `powarder run`
   mTunnelUp* = "tunnel.up"
   mTunnelDown* = "tunnel.down"
   mTunnelStart* = "tunnel.start"
@@ -120,18 +129,20 @@ const
   mHostList* = "host.list"
 
 # ---------------------------------------------------------------------------
-# エンコード
+# Encoding
 # ---------------------------------------------------------------------------
 #
-# JSON-RPC 2.0 の建前では成功応答の "result" は値が無くても `null` として
-# 常に含める必要があるが、powarder の内部プロトコルでは
-# `params` / `result` / `data` が Nim 側で `nil`（JsonNode を渡さない）の場合、
-# 出力 JSON からそのフィールド自体を省略する。呼び出し側の設計判断としてこの方が
-# 「値が無い」を表現するのに素直で、bandwidth 上のメリットも小さいながらある。
+# The JSON-RPC 2.0 spec officially requires that a success response's
+# "result" always be included, as `null` if there's no value, but in
+# powarder's internal protocol, when `params` / `result` / `data` are `nil`
+# on the Nim side (no JsonNode passed), that field is omitted entirely from
+# the output JSON. This is a design decision on the caller's part: it's a
+# more natural way to express "there's no value", and there's also a small,
+# if minor, bandwidth benefit.
 
 proc encodeRequest*(id: int; methodName: string;
     params: JsonNode = nil): string =
-  ## id 付きリクエストを1行の JSON にエンコードする。
+  ## Encodes a request with an id into a single line of JSON.
   var j = newJObject()
   j["jsonrpc"] = %"2.0"
   j["id"] = %id
@@ -141,9 +152,9 @@ proc encodeRequest*(id: int; methodName: string;
   result = $j
 
 proc encodeNotification*(methodName: string; params: JsonNode = nil): string =
-  ## `id` を持たない notification を1行の JSON にエンコードする。
-  ## JSON-RPC 2.0 の定義通り、notification は "id" フィールド自体を持たない
-  ## （"id": null ではなく、キーが存在しない）。
+  ## Encodes a notification with no `id` into a single line of JSON. Per
+  ## the JSON-RPC 2.0 spec, a notification has no "id" field at all (not
+  ## "id": null -- the key itself is absent).
   var j = newJObject()
   j["jsonrpc"] = %"2.0"
   j["method"] = %methodName
@@ -152,9 +163,9 @@ proc encodeNotification*(methodName: string; params: JsonNode = nil): string =
   result = $j
 
 proc encodeSuccess*(id: int; res: JsonNode): string =
-  ## 成功応答を1行の JSON にエンコードする。`res` が nil のときは
-  ## "result" フィールド自体を省略する（daemon.shutdown のような戻り値の
-  ## 意味を持たない呼び出しを想定）。
+  ## Encodes a success response into a single line of JSON. When `res` is
+  ## nil, the "result" field itself is omitted (intended for calls with no
+  ## meaningful return value, such as daemon.shutdown).
   var j = newJObject()
   j["jsonrpc"] = %"2.0"
   j["id"] = %id
@@ -164,7 +175,7 @@ proc encodeSuccess*(id: int; res: JsonNode): string =
 
 proc encodeError*(id: int; code: int; message: string;
     data: JsonNode = nil): string =
-  ## エラー応答を1行の JSON にエンコードする。
+  ## Encodes an error response into a single line of JSON.
   var errObj = newJObject()
   errObj["code"] = %code
   errObj["message"] = %message
@@ -177,53 +188,55 @@ proc encodeError*(id: int; code: int; message: string;
   result = $j
 
 # ---------------------------------------------------------------------------
-# デコード
+# Decoding
 # ---------------------------------------------------------------------------
 
 proc parseAndCheckEnvelope(line: string): JsonNode =
-  ## request/response 共通の下ごしらえ:
-  ## 空文字列・JSON構文エラー・トップレベルがオブジェクトでない・
-  ## jsonrpc フィールドの検査までをまとめて行う。
+  ## The groundwork shared by request/response decoding: checks for an
+  ## empty string, JSON syntax errors, a non-object top level, and the
+  ## jsonrpc field, all in one place.
   if line.len == 0:
-    # UDS の recvLine は切断時に空文字列を返す。切断と「空行を受け取った」の
-    # 区別は上位レイヤ（recvLine の戻り値そのもの）の責務であり、このモジュールに
-    # 渡ってきた空文字列は常に不正な入力として扱う。
-    raise newRpcParseError(rpeInvalidJson, "空文字列は不正な入力です")
+    # UDS's recvLine returns an empty string on disconnect. Distinguishing
+    # disconnection from "an empty line was received" is the
+    # responsibility of the layer above (the return value of recvLine
+    # itself), so an empty string that reaches this module is always
+    # treated as invalid input.
+    raise newRpcParseError(rpeInvalidJson, "empty string is invalid input")
 
   var j: JsonNode
   try:
     j = parseJson(line)
   except JsonParsingError as e:
     raise newRpcParseError(rpeInvalidJson,
-        &"JSON の構文解析に失敗しました: {e.msg}")
+        &"failed to parse JSON: {e.msg}")
 
   if j.kind != JObject:
-    raise newRpcParseError(rpeInvalidJson, "JSON のトップレベルはオブジェクトである必要があります")
+    raise newRpcParseError(rpeInvalidJson, "the top level of the JSON must be an object")
 
   if not j.hasKey("jsonrpc"):
-    raise newRpcParseError(rpeInvalidVersion, "jsonrpc フィールドがありません")
+    raise newRpcParseError(rpeInvalidVersion, "the jsonrpc field is missing")
   if j["jsonrpc"].kind != JString or j["jsonrpc"].getStr != "2.0":
-    raise newRpcParseError(rpeInvalidVersion, "jsonrpc フィールドは \"2.0\" である必要があります")
+    raise newRpcParseError(rpeInvalidVersion, "the jsonrpc field must be \"2.0\"")
 
   result = j
 
 proc decodeRequest*(line: string): RpcRequest =
-  ## 1行の JSON 文字列を `RpcRequest` にデコードする。
-  ## 不正な入力は `RpcParseError` を送出する。
+  ## Decodes a single line of JSON text into an `RpcRequest`. Invalid
+  ## input raises `RpcParseError`.
   let j = parseAndCheckEnvelope(line)
 
   if not j.hasKey("method"):
-    raise newRpcParseError(rpeMissingField, "method フィールドがありません")
+    raise newRpcParseError(rpeMissingField, "the method field is missing")
   if j["method"].kind != JString:
-    raise newRpcParseError(rpeInvalidField, "method フィールドは文字列である必要があります")
+    raise newRpcParseError(rpeInvalidField, "the method field must be a string")
   let methodName = j["method"].getStr
 
   var id = none(int)
   if j.hasKey("id"):
-    # notification は "id" キー自体を持たない。キーが存在する場合は
-    # 整数であることを要求する（文字列/null な id は powarder では未サポート）。
+    # A notification has no "id" key at all. When the key is present, it's
+    # required to be an integer (string/null ids are unsupported in powarder).
     if j["id"].kind != JInt:
-      raise newRpcParseError(rpeInvalidField, "id フィールドは整数である必要があります")
+      raise newRpcParseError(rpeInvalidField, "the id field must be an integer")
     id = some(j["id"].getInt)
 
   var params: JsonNode = nil
@@ -233,14 +246,14 @@ proc decodeRequest*(line: string): RpcRequest =
   result = RpcRequest(id: id, methodName: methodName, params: params)
 
 proc decodeResponse*(line: string): RpcResponse =
-  ## 1行の JSON 文字列を `RpcResponse` にデコードする。
-  ## 不正な入力は `RpcParseError` を送出する。
+  ## Decodes a single line of JSON text into an `RpcResponse`. Invalid
+  ## input raises `RpcParseError`.
   let j = parseAndCheckEnvelope(line)
 
   if not j.hasKey("id"):
-    raise newRpcParseError(rpeMissingField, "id フィールドがありません")
+    raise newRpcParseError(rpeMissingField, "the id field is missing")
   if j["id"].kind != JInt:
-    raise newRpcParseError(rpeInvalidField, "id フィールドは整数である必要があります")
+    raise newRpcParseError(rpeInvalidField, "the id field must be an integer")
   let id = some(j["id"].getInt)
 
   let hasError = j.hasKey("error") and j["error"].kind != JNull
@@ -249,15 +262,15 @@ proc decodeResponse*(line: string): RpcResponse =
   if hasError:
     let ej = j["error"]
     if ej.kind != JObject:
-      raise newRpcParseError(rpeInvalidField, "error フィールドはオブジェクトである必要があります")
+      raise newRpcParseError(rpeInvalidField, "the error field must be an object")
     if not ej.hasKey("code"):
-      raise newRpcParseError(rpeMissingField, "error.code フィールドがありません")
+      raise newRpcParseError(rpeMissingField, "the error.code field is missing")
     if ej["code"].kind != JInt:
-      raise newRpcParseError(rpeInvalidField, "error.code フィールドは整数である必要があります")
+      raise newRpcParseError(rpeInvalidField, "the error.code field must be an integer")
     if not ej.hasKey("message"):
-      raise newRpcParseError(rpeMissingField, "error.message フィールドがありません")
+      raise newRpcParseError(rpeMissingField, "the error.message field is missing")
     if ej["message"].kind != JString:
-      raise newRpcParseError(rpeInvalidField, "error.message フィールドは文字列である必要があります")
+      raise newRpcParseError(rpeInvalidField, "the error.message field must be a string")
 
     var data: JsonNode = nil
     if ej.hasKey("data") and ej["data"].kind != JNull:
@@ -269,37 +282,44 @@ proc decodeResponse*(line: string): RpcResponse =
   elif hasResult:
     result = RpcResponse(id: id, result: j["result"], error: none(RpcErrorInfo))
   else:
-    # "result" も "error" も無い（JSON null による省略済みの成功応答を含む）は
-    # 正当な「戻り値なしの成功応答」として扱う。
+    # Having neither "result" nor "error" (including a success response
+    # whose value was omitted via JSON null) is treated as a legitimate
+    # "success response with no return value".
     result = RpcResponse(id: id, result: nil, error: none(RpcErrorInfo))
 
 # ---------------------------------------------------------------------------
-# ペイロードのシリアライズ補助
+# Payload serialization helpers
 # ---------------------------------------------------------------------------
 #
-# `std/json` の `%*` マクロ / `to()` マクロを types.nim の各型に対して実測した結果:
+# Results of empirically testing `std/json`'s `%*` / `to()` macros against
+# each type in types.nim:
 #
-# - `Port`（`distinct uint16`）: エンコード方向 (`%`) は標準ライブラリに
-#   `distinct` 型向けの汎用オーバーロードが無いため、`ForwardSpec` などを
-#   そのまま `%*` に渡すとコンパイルエラーになる。下の `` `%`*(p: Port) ``
-#   が無いと `src/powarder/ipc/protocol.nim` はコンパイルできない。
-#   一方デコード方向の `to()` は `initFromJson[T: distinct]` が
-#   `distinctBase` 経由で自動的に面倒を見てくれるため、手書きの変換は不要だった。
-# - `ForwardKind`（`fkLocal = "L"` のように文字列値を持つ enum）: `%(o: enum)` は
-#   `$o` を使って文字列化するため、"L" / "R" が期待通りそのまま JSON 文字列になる。
-#   デコード方向も `parseEnum` が同じ `$o` 表現から逆引きするため、追加の変換は不要。
-# - `UpstreamTarget`（case を含む variant object）: `%*` / `to()` はどちらも
-#   variant object をそのまま扱えた（`Port` への `%` を用意した後は
-#   コンパイル/往復変換とも問題なし）。ただし Nim が自動生成する `==` は
-#   フィールドを並行に辿る `fields` イテレータを使っており、
-#   "parallel 'fields' iterator does not work for 'case' objects" という
-#   コンパイルエラーになって variant object には使えない。往復変換のテストで
-#   `==` による比較が必要なため、下に手書きの `` `==` `` を用意した
-#   （本来は types.nim 側に置くのが自然だが、当エージェントはそのファイルを
-#   変更できないためここに定義する。types.nim への追加を提案する）。
+# - `Port` (`distinct uint16`): on the encoding side (`%`), the standard
+#   library has no generic overload for `distinct` types, so passing
+#   `ForwardSpec` and similar types straight to `%*` fails to compile.
+#   Without the `` `%`*(p: Port) `` below, `src/powarder/ipc/protocol.nim`
+#   would not compile. On the decoding side, however, `to()`'s
+#   `initFromJson[T: distinct]` takes care of it automatically via
+#   `distinctBase`, so no hand-written conversion was needed there.
+# - `ForwardKind` (an enum with string values like `fkLocal = "L"`):
+#   `%(o: enum)` stringifies using `$o`, so "L" / "R" become the expected
+#   JSON strings as-is. Decoding also works with no extra conversion,
+#   because `parseEnum` looks values up from that same `$o` representation.
+# - `UpstreamTarget` (a variant object containing a `case`): both `%*` and
+#   `to()` handled the variant object as-is (once the `%` for `Port` was in
+#   place, both compilation and round-tripping worked fine). However, the
+#   `==` that Nim auto-generates uses the `fields` iterator, which walks
+#   fields in parallel, and that fails to compile with "parallel 'fields'
+#   iterator does not work for 'case' objects" -- so it can't be used for a
+#   variant object. Since the round-trip tests need `==` comparison, a
+#   hand-written `` `==` `` is provided below (this would more naturally
+#   live in types.nim, but since this agent cannot modify that file, it is
+#   defined here instead; adding it to types.nim is suggested as a
+#   follow-up).
 #
-# 以上により、`ForwardSpec` / `TunnelConfig` / `HostSessionKey` / `RetryPolicy` は
-# 汎用の `%` / `to()` にそのまま委譲するだけの薄いラッパーで済んでいる。
+# Given the above, `ForwardSpec` / `TunnelConfig` / `HostSessionKey` /
+# `RetryPolicy` only need thin wrappers that simply delegate to the
+# generic `%` / `to()`.
 
 
 proc toJson*(spec: ForwardSpec): JsonNode = % spec

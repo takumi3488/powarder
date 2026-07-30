@@ -1,31 +1,36 @@
-## バックグラウンド化（デーモン化）。
+## Backgrounding (daemonization).
 ##
-## CLI がデーモン未起動を検知したときに、自分でデーモンプロセスを起動して端末から
-## 切り離すために使う。`daemonize()` は「呼び出したプロセス自身」を二重 fork で
-## デーモン化する。`spawnDetached()` は「別の実行ファイル」を完全に切り離して
-## 起動する（呼び出し元の CLI プロセス自身はそのまま生き続ける）。
+## Used when the CLI detects that the daemon is not running, to launch a daemon
+## process itself and detach it from the terminal. `daemonize()` daemonizes
+## "the calling process itself" via a double fork. `spawnDetached()` launches
+## "a separate executable" fully detached (the calling CLI process itself
+## keeps running as-is).
 
 import std/[os, posix]
 
 proc daemonize*(keepCwd = false) =
-  ## 二重 fork + `setsid()` で端末から切り離す。**親プロセス（およびセッション
-  ## リーダーになった中間プロセス）は `quit(0)` して戻ってこない。** 呼び出す側は
-  ## 「この呼び出しから戻ってきたら、それは二重 fork の末に残った孫プロセスである」
-  ## という前提でコードを書くこと。
+  ## Detach from the terminal via a double fork + `setsid()`. **The parent
+  ## process (and the intermediate process that becomes the session leader)
+  ## calls `quit(0)` and never returns.** The caller must write its code on
+  ## the assumption that "if this call returns, it is the grandchild process
+  ## left after the double fork."
   ##
-  ## 手順:
-  ## 1. 1 回目の `fork()`。親は `quit(0)` で抜ける。子は `setsid()` を呼び、制御
-  ##    端末を持たない新しいセッションのリーダーになる。
-  ## 2. 2 回目の `fork()`。セッションリーダー自身も `quit(0)` で抜ける。残った孫は
-  ##    「セッションリーダーではない」プロセスになるため、以後どんな経路でも新たに
-  ##    制御端末を獲得できなくなる（SVr4 系 OS ではセッションリーダーが端末デバイス
-  ##    を open すると自動的にそれが制御端末になってしまう。この経路を構造的に
-  ##    塞ぐのが二重 fork の目的）。
-  ## 3. `umask(0)`: 継承したファイル作成マスクの影響を受けないようにする。
-  ## 4. `chdir("/")`（`keepCwd` が true のときは省略）: カレントディレクトリを
-  ##    手放し、デーモンプロセスの存在によってファイルシステムのアンマウントが
-  ##    妨げられないようにする。
-  ## 5. fd 0/1/2 を `/dev/null` に向け直し、端末に対する読み書きを一切残さない。
+  ## Steps:
+  ## 1. First `fork()`. The parent exits via `quit(0)`. The child calls
+  ##    `setsid()` and becomes the leader of a new session with no
+  ##    controlling terminal.
+  ## 2. Second `fork()`. The session leader itself exits via `quit(0)`. The
+  ##    remaining grandchild becomes a process that is "not a session
+  ##    leader," so it can never acquire a controlling terminal again through
+  ##    any path (on SVr4-family OSes, when a session leader opens a terminal
+  ##    device it automatically becomes its controlling terminal; the purpose
+  ##    of the double fork is to structurally block this path).
+  ## 3. `umask(0)`: avoid being affected by an inherited file creation mask.
+  ## 4. `chdir("/")` (skipped when `keepCwd` is true): give up the current
+  ##    directory so the daemon process's existence does not block
+  ##    unmounting the filesystem.
+  ## 5. Redirect fd 0/1/2 to `/dev/null`, leaving no reads/writes to the
+  ##    terminal at all.
   let pid1 = fork()
   if pid1 < 0:
     raiseOSError(osLastError(), "fork (1st)")
@@ -55,62 +60,73 @@ proc daemonize*(keepCwd = false) =
 
 proc spawnDetached*(exePath: string; args: openArray[string];
                     logPath = ""): int =
-  ## `exePath` を `args` 付きで、呼び出し元から完全に切り離して起動する。
+  ## Launch `exePath` with `args`, fully detached from the caller.
   ##
-  ## 内部で二重 fork を行い、最終的に `exePath` を exec した「孫プロセス」は init
-  ## （PID 1、あるいは macOS では launchd）に養子縁組されるため、呼び出し元
-  ## プロセスが終了しても道連れにならずに動き続ける。
+  ## Internally performs a double fork, and the "grandchild process" that
+  ## finally execs `exePath` is adopted by init (PID 1, or launchd on
+  ## macOS), so it keeps running even after the calling process exits,
+  ## without being dragged down with it.
   ##
-  ## **`logPath` を必ず渡すこと（空なら `/dev/null`）。**
-  ## exec 前に fd 0/1/2 を付け替えないと、起動されたデーモンは**呼び出し元 CLI の
-  ## stdout/stderr を継承したまま動き続ける**。すると `powarder up | tee log` や
-  ## `$(powarder ps)` のようにパイプ／コマンド置換で受けたときに、
-  ## **パイプの書き込み側が閉じないため読み手が EOF を検出できず、CLI 自体は
-  ## 終了しているのにシェルが永久に待つ**という現象が起きる（実測で踏んだ）。
+  ## **Always pass `logPath` (falls back to `/dev/null` if empty).**
+  ## If fd 0/1/2 are not redirected before the exec, the launched daemon
+  ## **keeps running while inheriting the calling CLI's stdout/stderr**. Then
+  ## when received via a pipe or command substitution such as
+  ## `powarder up | tee log` or `$(powarder ps)`,
+  ## **the write end of the pipe never closes, so the reader can never
+  ## detect EOF, and the shell waits forever even though the CLI itself has
+  ## already exited** (empirically verified — this was actually hit).
   ##
-  ## この付け替えを `exePath` 側の `daemonize()` に任せる設計にはできない。
-  ## powarder のデーモンは asyncdispatch を使うため、
-  ## 「asyncdispatch を触った後に `fork()` すると子の kqueue fd が壊れる」問題を
-  ## 避けて `daemonize()` を呼ばない方針になっており、**リダイレクトする主体が
-  ## どこにも居なくなる**。だからここで（exec の直前・fork の後に）行う。
+  ## This redirection cannot be designed to be delegated to `daemonize()` on
+  ## the `exePath` side. Because powarder's daemon uses asyncdispatch, it
+  ## follows a policy of not calling `daemonize()` in order to avoid the
+  ## issue where "calling `fork()` after touching asyncdispatch corrupts the
+  ## child's kqueue fd," which means **there is no longer anyone left to do
+  ## the redirection**. That is why it is done here (right before the exec,
+  ## after the fork).
   ##
-  ## **戻り値は「中間プロセス」の PID であり、最終的に起動されたデーモン自身の PID
-  ## とは一致しない。** これは `ssh -f` や `ControlPersist` が二重 fork によって
-  ## `startProcess` の追跡から外れてしまう問題（powarder が他の場所では意図的に
-  ## 避けている挙動）と同じ機構を、ここでは逆に意図的に使っているために生じる制約
-  ## である。中間プロセスは孫を起動した直後に終了し、このプロシージャが返る前に
-  ## `waitpid` で刈り取り済みなので、戻り値の PID は**既に存在しないプロセスを
-  ## 指している**。デーモン自身の実際の PID を知りたい場合は、デーモン側が
-  ## `lock.writePid()` でロックファイルに書いた値を `lock.readPid()` で読むこと
-  ## （この戻り値を PID として信用してはいけない）。
+  ## **The return value is the PID of the "intermediate process," and does
+  ## not match the PID of the daemon that is ultimately launched.** This
+  ## constraint arises because we are here deliberately using, in reverse,
+  ## the same mechanism as the problem where `ssh -f` or `ControlPersist`
+  ## slip out of `startProcess` tracking due to a double fork (a behavior
+  ## that powarder deliberately avoids elsewhere). The intermediate process
+  ## exits immediately after launching the grandchild and has already been
+  ## reaped via `waitpid` before this procedure returns, so the returned PID
+  ## **points to a process that no longer exists**. If you need to know the
+  ## daemon's actual PID, read the value the daemon side wrote to the lock
+  ## file with `lock.writePid()` via `lock.readPid()` instead (do not trust
+  ## this return value as a PID).
   let pid1 = fork()
   if pid1 < 0:
     raiseOSError(osLastError(), "fork (1st)")
 
   if pid1 == 0:
-    # 中間プロセス。ここで quit() を使うと、呼び出し元プロセスが持っていた Nim
-    # ランタイムの終了処理（GC・atexit 相当の処理）をこの fork されたコピーでも
-    # 走らせてしまうため、必ず posix.exitnow（_exit(2)）で抜ける。
+    # Intermediate process. Using quit() here would also run the Nim
+    # runtime's exit-time processing (GC / atexit-equivalent handling) that
+    # the calling process had, in this forked copy too, so always exit via
+    # posix.exitnow (_exit(2)) instead.
     if setsid() < 0:
       exitnow(1)
     let pid2 = fork()
     if pid2 < 0:
       exitnow(1)
     if pid2 == 0:
-      # 孫プロセス: fd を付け替えてから exePath に exec する。
-      # プロセスイメージがまるごと置き換わるので、以後は exePath 自身の
-      # プロセスとして動く（開いた fd は exec をまたいで引き継がれる）。
+      # Grandchild process: redirect fds, then exec into exePath.
+      # The process image is replaced entirely, so from here on it runs as
+      # exePath's own process (open fds are carried across the exec).
       #
-      # stdin は常に /dev/null。stdout/stderr は logPath（空なら /dev/null）へ。
-      # **ここを省くと呼び出し元のパイプを掴んだままになり、シェルがハングする**
-      # （この proc の doc comment を参照）。
+      # stdin is always /dev/null. stdout/stderr go to logPath (or
+      # /dev/null if empty).
+      # **Omitting this keeps holding onto the caller's pipe and hangs the
+      # shell** (see this proc's doc comment).
       let inFd = posix.open("/dev/null".cstring, O_RDONLY)
       if inFd >= 0:
         discard dup2(inFd, 0)
         if inFd > 2: discard close(inFd)
 
       let outTarget = if logPath.len > 0: logPath else: "/dev/null"
-      # 追記で開く（デーモンのログを前回分に足していく）。作成時は 0600。
+      # Open in append mode (accumulate onto the daemon's previous log).
+      # Created with mode 0600.
       let outFd = posix.open(outTarget.cstring,
                              O_WRONLY or O_CREAT or O_APPEND, 0o600)
       if outFd >= 0:
@@ -118,7 +134,8 @@ proc spawnDetached*(exePath: string; args: openArray[string];
         discard dup2(outFd, 2)
         if outFd > 2: discard close(outFd)
       else:
-        # ログを開けなくても標準出力を掴み続けるのは避ける（ハングの原因になる）。
+        # Even if the log can't be opened, avoid continuing to hold onto
+        # stdout (it would cause a hang).
         let nullFd = posix.open("/dev/null".cstring, O_WRONLY)
         if nullFd >= 0:
           discard dup2(nullFd, 1)
@@ -129,9 +146,9 @@ proc spawnDetached*(exePath: string; args: openArray[string];
       for a in args:
         argv.add a
       discard execvp(exePath.cstring, allocCStringArray(argv))
-      exitnow(127) # ここに来るのは exec 自体が失敗したときだけ
+      exitnow(127) # Only reached if the exec itself fails
     else:
-      exitnow(0) # 中間プロセスは孫を起動したら即座に終了する
+      exitnow(0) # The intermediate process exits immediately after launching the grandchild
 
   var status: cint
   discard waitpid(pid1, status, 0)

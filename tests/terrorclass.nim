@@ -27,7 +27,7 @@ suite "classify: ekGatewayPortsDisabled":
     check classify("Warning: remote port forwarding failed for listen port 8080\n") ==
       ekGatewayPortsDisabled
 
-  test "Error 系 / listen path 系でも同じ分類になる":
+  test "Error-style / listen-path-style also classify the same":
     check classify("Error: remote port forwarding failed for listen path /tmp/x.sock\n") ==
       ekGatewayPortsDisabled
 
@@ -37,7 +37,7 @@ suite "classify: ekUnknownHost":
     check classify("ssh: Could not resolve hostname typo.example: Name or service not known\n") ==
       ekUnknownHost
 
-  test "Name or service not known 単体":
+  test "Name or service not known alone":
     check classify("getaddrinfo failed: Name or service not known\n") == ekUnknownHost
 
   test "nodename nor servname provided (macOS/BSD)":
@@ -63,7 +63,7 @@ suite "classify: ekTimeout":
 
 suite "classify: ekHostKeyChanged":
 
-  test "REMOTE HOST IDENTIFICATION HAS CHANGED バナー":
+  test "REMOTE HOST IDENTIFICATION HAS CHANGED banner":
     check classify(
         "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n" &
         "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n" &
@@ -71,14 +71,14 @@ suite "classify: ekHostKeyChanged":
         "Host key for example.com has changed and you have requested strict checking.\n" &
         "Host key verification failed.\n") == ekHostKeyChanged
 
-  test "REVOKED HOST KEY DETECTED バナー":
+  test "REVOKED HOST KEY DETECTED banner":
     check classify(
         "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n" &
         "@       WARNING: REVOKED HOST KEY DETECTED!               @\n" &
         "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n" &
         "Host key verification failed.\n") == ekHostKeyChanged
 
-  test "StrictHostKeyChecking=yes による明示的拒否（バナー無し）":
+  test "StrictHostKeyChecking=yes explicit rejection (no banner)":
     check classify(
         "No ed25519 host key is known for example.com and you have requested " &
         "strict checking.\nHost key verification failed.\n") == ekHostKeyChanged
@@ -93,7 +93,7 @@ suite "classify: ekBatchModeNoAuth":
     check classify("user@host: Permission denied (publickey,password).\n") ==
       ekBatchModeNoAuth
 
-  test "Host key verification failed が単独（BatchMode が新規ホスト鍵の確認を潰した）":
+  test "Host key verification failed alone (BatchMode swallowed the new host key confirmation)":
     check classify("Host key verification failed.\n") == ekBatchModeNoAuth
 
 suite "classify: ekForwardingDenied":
@@ -104,53 +104,57 @@ suite "classify: ekForwardingDenied":
 
 suite "classify: ekUnknown":
 
-  test "分類不能な文言":
+  test "Unclassifiable text":
     check classify("something totally unexpected\n") == ekUnknown
 
-suite "classify: 優先順位":
+suite "classify: priority order":
 
-  test "ホスト鍵変更バナーは Permission denied より優先される":
+  test "Host key change banner takes priority over Permission denied":
     check classify(
         "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n" &
         "Host key verification failed.\n" &
         "user@host: Permission denied (publickey).\n") == ekHostKeyChanged
 
-  test "publickey,keyboard-interactive は素の publickey 判定より優先される":
-    # msgPermDeniedPubkey ("Permission denied (publickey") も部分一致するが、
-    # より具体的な msgPermDeniedPubkeyKbdInteractive を先にチェックするため
-    # ekBatchModeNoAuth になる。
+  test "publickey,keyboard-interactive takes priority over the plain publickey match":
+    # msgPermDeniedPubkey ("Permission denied (publickey") also partially
+    # matches, but the more specific msgPermDeniedPubkeyKbdInteractive is
+    # checked first, so the result is ekBatchModeNoAuth.
     check classify("user@host: Permission denied (publickey,keyboard-interactive).\n") ==
       ekBatchModeNoAuth
 
-  test "最後の行ではなく最も具体的な原因を拾う":
-    # 1行目は一般的な Permission denied だが、2行目により具体的な
-    # BatchMode 由来のパターンがある場合、後者を優先する。
+  test "Picks the most specific cause, not just the last line":
+    # The first line is a plain Permission denied, but when the second line
+    # has a more specific BatchMode-derived pattern, that one takes priority.
     check classify(
         "user@host: Permission denied (publickey,password).\n" &
         "some trailing unrelated log line\n") == ekBatchModeNoAuth
 
-suite "explain: プレースホルダの埋め込み":
+suite "explain: placeholder embedding":
 
-  test "ekPortInUse: bindPort が summary と hints の両方に入る":
+  test "ekPortInUse: bindPort appears in both summary and hints":
     let ctx = initErrorContext(bindPort = 8080)
     let ex = explain(ekPortInUse, langJa, ctx)
     check "8080" in ex.summary
     check ex.hints.len > 0
     check ex.hints.anyIt("8080" in it)
 
-  test "ekAuthFailed: host が埋め込まれる":
+  test "ekAuthFailed: host is embedded":
     let ctx = initErrorContext(host = "prod-db")
     let ex = explain(ekAuthFailed, langEn, ctx)
     check "prod-db" in ex.summary
     check ex.hints.anyIt("prod-db" in it)
 
-  test "ekUnknown: 生の stderr がそのまま出る":
+  test "ekUnknown: the raw stderr passes through unchanged":
     let ctx = initErrorContext(rawStderr = "some very specific ssh error text")
     let ex = explain(ekUnknown, langEn, ctx)
     check ex.hints.anyIt("some very specific ssh error text" in it)
 
-  test "langEn と langJa で異なる文言が返る":
+  test "langEn and langJa now return identical text (Japanese wording was removed from the source)":
+    # errorclass.nim's `templates` table now holds the same English text in
+    # both its langEn and langJa columns, since the Japanese wording was
+    # removed. This documents that behavioral change rather than asserting
+    # the old (no longer true) "they differ" expectation.
     let ctx = initErrorContext(host = "prod-db")
     let exEn = explain(ekConnectionRefused, langEn, ctx)
     let exJa = explain(ekConnectionRefused, langJa, ctx)
-    check exEn.summary != exJa.summary
+    check exEn.summary == exJa.summary
