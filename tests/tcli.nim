@@ -296,7 +296,7 @@ suite "output: renderError":
     let w = newWriter(noColor = true)
     let ctx = initErrorContext(host = "prod-bastion", bindPort = 5432)
     let rawStderr = "bind [127.0.0.1]:5432: Address already in use\n"
-    let rendered = renderError(w, ekPortInUse, ctx, langJa, rawStderr)
+    let rendered = renderError(w, ekPortInUse, ctx, rawStderr)
     let lines = rendered.splitLines()
 
     # Part 1: headline (what failed)
@@ -307,34 +307,10 @@ suite "output: renderError":
     # Part 2: explanation of the cause and remediation hints
     check "5432" in rendered
     check "port" in rendered
+    check "already in use" in rendered
 
     # Part 3: the raw stderr is always included
     check "(ssh: bind [127.0.0.1]:5432: Address already in use)" in rendered
-
-  test "the raw stderr keeps the same content under the English locale too":
-    let w = newWriter(noColor = true)
-    let ctx = initErrorContext(host = "prod-bastion", bindPort = 5432)
-    let rawStderr = "bind [127.0.0.1]:5432: Address already in use\n"
-    let rendered = renderError(w, ekPortInUse, ctx, langEn, rawStderr)
-    check "(ssh: bind [127.0.0.1]:5432: Address already in use)" in rendered
-    check "already in use" in rendered
-
-# ===========================================================================
-# output: detectLang
-# ===========================================================================
-
-suite "output: detectLang":
-  test "LANG=ja_JP.UTF-8 gives langJa":
-    withEnv({"LC_ALL": "", "LANG": "ja_JP.UTF-8"}, proc() =
-      check detectLang() == langJa)
-
-  test "LANG=en_US.UTF-8 gives langEn":
-    withEnv({"LC_ALL": "", "LANG": "en_US.UTF-8"}, proc() =
-      check detectLang() == langEn)
-
-  test "LC_ALL takes priority over LANG":
-    withEnv({"LC_ALL": "ja_JP.UTF-8", "LANG": "en_US.UTF-8"}, proc() =
-      check detectLang() == langJa)
 
 # ===========================================================================
 # output: -R rows have "-" stat columns

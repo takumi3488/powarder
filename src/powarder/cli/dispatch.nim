@@ -259,7 +259,7 @@ proc extractRawStderr(e: ref RpcRemoteError): string =
       e.msg
   else: e.msg
 
-proc renderRpcErrorBody(w: Writer; e: ref RpcRemoteError; lang: Lang;
+proc renderRpcErrorBody(w: Writer; e: ref RpcRemoteError;
     host = ""): string =
   ## `output.renderError` includes a generic headline ("Failed to set up
   ## forwarding to X.") as the first of its three sections, but callers
@@ -270,7 +270,7 @@ proc renderRpcErrorBody(w: Writer; e: ref RpcRemoteError; lang: Lang;
   let rawStderr = extractRawStderr(e)
   let kind = classify(rawStderr)
   let ctx = initErrorContext(host = host, rawStderr = rawStderr)
-  let full = renderError(w, kind, ctx, lang, rawStderr)
+  let full = renderError(w, kind, ctx, rawStderr)
   let lines = full.splitLines()
   if lines.len > 2: lines[2 .. ^1].join("\n") else: full
 
@@ -304,7 +304,7 @@ proc formatForwardSummary(spec: ForwardSpec): string =
   "-" & $spec.kind & " " & spec.bindAddr & ":" & $spec.bindPort & " -> " &
     spec.targetHost & ":" & $spec.targetPort
 
-proc cmdRun(args: ParsedArgs; w: Writer; lang: Lang): int =
+proc cmdRun(args: ParsedArgs; w: Writer): int =
   if args.positional.len == 0:
     stderr.writeLine("powarder run: a host is required")
     return ecUsage.int
@@ -350,7 +350,7 @@ proc cmdRun(args: ParsedArgs; w: Writer; lang: Lang): int =
         formatForwardSummary(spec) & " via " & host & ")")
     except RpcRemoteError as e:
       echo w.failure("tunnel \"" & name & "\" failed to start")
-      echo renderRpcErrorBody(w, e, lang, host = host)
+      echo renderRpcErrorBody(w, e, host = host)
       exitCode = exitCodeForRpcError(e.code).int
     except DaemonNotRunningError:
       echo w.failure("tunnel \"" & name & "\" failed to start: daemon is not reachable")
@@ -361,7 +361,7 @@ proc cmdRun(args: ParsedArgs; w: Writer; lang: Lang): int =
 # up / down
 # ---------------------------------------------------------------------------
 
-proc cmdUp(args: ParsedArgs; w: Writer; lang: Lang): int =
+proc cmdUp(args: ParsedArgs; w: Writer): int =
   if not ensureDaemon(args.noAutostart):
     echo w.failure(daemonUnreachableMsg)
     return ecDaemonUnreachable.int
@@ -386,13 +386,13 @@ proc cmdUp(args: ParsedArgs; w: Writer; lang: Lang): int =
     exitCode
   except RpcRemoteError as e:
     echo w.failure("up failed")
-    echo renderRpcErrorBody(w, e, lang)
+    echo renderRpcErrorBody(w, e)
     exitCodeForRpcError(e.code).int
   except DaemonNotRunningError:
     echo w.failure("daemon is not reachable")
     ecDaemonUnreachable.int
 
-proc cmdDown(args: ParsedArgs; w: Writer; lang: Lang): int =
+proc cmdDown(args: ParsedArgs; w: Writer): int =
   if not ensureDaemon(args.noAutostart):
     echo w.failure(daemonUnreachableMsg)
     return ecDaemonUnreachable.int
@@ -411,7 +411,7 @@ proc cmdDown(args: ParsedArgs; w: Writer; lang: Lang): int =
     ecOk.int
   except RpcRemoteError as e:
     echo w.failure("down failed")
-    echo renderRpcErrorBody(w, e, lang)
+    echo renderRpcErrorBody(w, e)
     exitCodeForRpcError(e.code).int
   except DaemonNotRunningError:
     echo w.failure("daemon is not reachable")
@@ -421,7 +421,7 @@ proc cmdDown(args: ParsedArgs; w: Writer; lang: Lang): int =
 # start / stop / restart / rm (common RPC-calling pattern)
 # ---------------------------------------------------------------------------
 
-proc cmdSimpleNamesAction(args: ParsedArgs; w: Writer; lang: Lang;
+proc cmdSimpleNamesAction(args: ParsedArgs; w: Writer;
     methodName, verb, pastVerb, resultKey: string): int =
   ## The processing common to `start` / `stop` / `restart` / `rm`: call an RPC
   ## once with `{"names": [...]}`, then print each item in the result array on
@@ -442,7 +442,7 @@ proc cmdSimpleNamesAction(args: ParsedArgs; w: Writer; lang: Lang;
     ecOk.int
   except RpcRemoteError as e:
     echo w.failure(verb & " failed")
-    echo renderRpcErrorBody(w, e, lang, host = args.positional.join(", "))
+    echo renderRpcErrorBody(w, e, host = args.positional.join(", "))
     exitCodeForRpcError(e.code).int
   except DaemonNotRunningError:
     echo w.failure("daemon is not reachable")
@@ -452,7 +452,7 @@ proc cmdSimpleNamesAction(args: ParsedArgs; w: Writer; lang: Lang;
 # ps
 # ---------------------------------------------------------------------------
 
-proc cmdPs(args: ParsedArgs; w: Writer; lang: Lang): int =
+proc cmdPs(args: ParsedArgs; w: Writer): int =
   if not ensureDaemon(args.noAutostart):
     echo w.failure(daemonUnreachableMsg)
     return ecDaemonUnreachable.int
@@ -475,7 +475,7 @@ proc cmdPs(args: ParsedArgs; w: Writer; lang: Lang): int =
     ecOk.int
   except RpcRemoteError as e:
     echo w.failure("ps failed")
-    echo renderRpcErrorBody(w, e, lang)
+    echo renderRpcErrorBody(w, e)
     exitCodeForRpcError(e.code).int
   except DaemonNotRunningError:
     echo w.failure("daemon is not reachable")
@@ -485,7 +485,7 @@ proc cmdPs(args: ParsedArgs; w: Writer; lang: Lang): int =
 # inspect
 # ---------------------------------------------------------------------------
 
-proc cmdInspect(args: ParsedArgs; w: Writer; lang: Lang): int =
+proc cmdInspect(args: ParsedArgs; w: Writer): int =
   if args.positional.len == 0:
     stderr.writeLine("powarder inspect: at least one tunnel name is required")
     return ecUsage.int
@@ -502,7 +502,7 @@ proc cmdInspect(args: ParsedArgs; w: Writer; lang: Lang): int =
         echo renderInspect(res)
     except RpcRemoteError as e:
       echo w.failure("tunnel \"" & name & "\" inspect failed")
-      echo renderRpcErrorBody(w, e, lang, host = name)
+      echo renderRpcErrorBody(w, e, host = name)
       exitCode = exitCodeForRpcError(e.code).int
     except DaemonNotRunningError:
       echo w.failure("daemon is not reachable")
@@ -513,7 +513,7 @@ proc cmdInspect(args: ParsedArgs; w: Writer; lang: Lang): int =
 # check
 # ---------------------------------------------------------------------------
 
-proc cmdCheck(args: ParsedArgs; w: Writer; lang: Lang): int =
+proc cmdCheck(args: ParsedArgs; w: Writer): int =
   if not ensureDaemon(args.noAutostart):
     echo w.failure(daemonUnreachableMsg)
     return ecDaemonUnreachable.int
@@ -541,7 +541,7 @@ proc cmdCheck(args: ParsedArgs; w: Writer; lang: Lang): int =
     exitCode
   except RpcRemoteError as e:
     echo w.failure("check failed")
-    echo renderRpcErrorBody(w, e, lang)
+    echo renderRpcErrorBody(w, e)
     exitCodeForRpcError(e.code).int
   except DaemonNotRunningError:
     echo w.failure("daemon is not reachable")
@@ -551,7 +551,7 @@ proc cmdCheck(args: ParsedArgs; w: Writer; lang: Lang): int =
 # hosts
 # ---------------------------------------------------------------------------
 
-proc cmdHosts(args: ParsedArgs; w: Writer; lang: Lang): int =
+proc cmdHosts(args: ParsedArgs; w: Writer): int =
   if not ensureDaemon(args.noAutostart):
     echo w.failure(daemonUnreachableMsg)
     return ecDaemonUnreachable.int
@@ -568,7 +568,7 @@ proc cmdHosts(args: ParsedArgs; w: Writer; lang: Lang): int =
     ecOk.int
   except RpcRemoteError as e:
     echo w.failure("hosts failed")
-    echo renderRpcErrorBody(w, e, lang)
+    echo renderRpcErrorBody(w, e)
     exitCodeForRpcError(e.code).int
   except DaemonNotRunningError:
     echo w.failure("daemon is not reachable")
@@ -578,7 +578,7 @@ proc cmdHosts(args: ParsedArgs; w: Writer; lang: Lang): int =
 # prune
 # ---------------------------------------------------------------------------
 
-proc cmdPrune(args: ParsedArgs; w: Writer; lang: Lang): int =
+proc cmdPrune(args: ParsedArgs; w: Writer): int =
   ## Removes all stopped tunnels in one go.
   ##
   ## **Regardless of whether `-a`/`--all` is given, this always queries
@@ -595,8 +595,7 @@ proc cmdPrune(args: ParsedArgs; w: Writer; lang: Lang): int =
       if w.mode == omJson:
         echo (%*{"removed": newJArray()}).pretty()
       else:
-        echo w.info(if lang == langJa: "nothing to prune"
-                     else: "nothing to prune")
+        echo w.info("nothing to prune")
       return ecOk.int
 
     discard call(mTunnelRemove, %*{"names": names})
@@ -608,7 +607,7 @@ proc cmdPrune(args: ParsedArgs; w: Writer; lang: Lang): int =
     ecOk.int
   except RpcRemoteError as e:
     echo w.failure("prune failed")
-    echo renderRpcErrorBody(w, e, lang)
+    echo renderRpcErrorBody(w, e)
     exitCodeForRpcError(e.code).int
   except DaemonNotRunningError:
     echo w.failure("daemon is not reachable")
@@ -742,7 +741,7 @@ proc cmdDaemonRestart(w: Writer): int =
     echo w.failure("failed to restart the daemon")
     ecDaemonUnreachable.int
 
-proc cmdDaemonReload(w: Writer; lang: Lang): int =
+proc cmdDaemonReload(w: Writer): int =
   try:
     let res = call(mDaemonReload)
     if w.mode == omJson:
@@ -757,7 +756,7 @@ proc cmdDaemonReload(w: Writer; lang: Lang): int =
     ecOk.int
   except RpcRemoteError as e:
     echo w.failure("reload failed")
-    echo renderRpcErrorBody(w, e, lang)
+    echo renderRpcErrorBody(w, e)
     exitCodeForRpcError(e.code).int
   except DaemonNotRunningError:
     echo w.failure("daemon is not reachable")
@@ -825,7 +824,7 @@ proc cmdDaemonUninstall(w: Writer): int =
     echo w.failure(e.msg)
     ecGeneral.int
 
-proc cmdDaemon(args: ParsedArgs; w: Writer; lang: Lang;
+proc cmdDaemon(args: ParsedArgs; w: Writer;
     runDaemon: DaemonRunner): int =
   case args.subsubcommand
   of "", "--foreground":
@@ -844,7 +843,7 @@ proc cmdDaemon(args: ParsedArgs; w: Writer; lang: Lang;
   of "start": cmdDaemonStart(w)
   of "stop": cmdDaemonStop(w)
   of "restart": cmdDaemonRestart(w)
-  of "reload": cmdDaemonReload(w, lang)
+  of "reload": cmdDaemonReload(w)
   of "logs": cmdDaemonLogs(args)
   of "install": cmdDaemonInstall(args, w)
   of "uninstall": cmdDaemonUninstall(w)
@@ -883,28 +882,27 @@ proc dispatch*(args: ParsedArgs; runDaemon: DaemonRunner = nil): int =
 
   let w = newWriter(json = args.json, noColor = args.noColor,
       quiet = args.quiet)
-  let lang = detectLang()
 
   case args.subcommand
-  of "run": cmdRun(args, w, lang)
-  of "up": cmdUp(args, w, lang)
-  of "down": cmdDown(args, w, lang)
+  of "run": cmdRun(args, w)
+  of "up": cmdUp(args, w)
+  of "down": cmdDown(args, w)
   of "start":
-    cmdSimpleNamesAction(args, w, lang, mTunnelStart, "start", "started", "started")
+    cmdSimpleNamesAction(args, w, mTunnelStart, "start", "started", "started")
   of "stop":
-    cmdSimpleNamesAction(args, w, lang, mTunnelStop, "stop", "stopped", "stopped")
+    cmdSimpleNamesAction(args, w, mTunnelStop, "stop", "stopped", "stopped")
   of "restart":
-    cmdSimpleNamesAction(args, w, lang, mTunnelRestart, "restart", "restarted", "restarted")
+    cmdSimpleNamesAction(args, w, mTunnelRestart, "restart", "restarted", "restarted")
   of "rm":
-    cmdSimpleNamesAction(args, w, lang, mTunnelRemove, "remove", "removed", "removed")
-  of "ps": cmdPs(args, w, lang)
-  of "inspect": cmdInspect(args, w, lang)
-  of "check": cmdCheck(args, w, lang)
-  of "hosts": cmdHosts(args, w, lang)
+    cmdSimpleNamesAction(args, w, mTunnelRemove, "remove", "removed", "removed")
+  of "ps": cmdPs(args, w)
+  of "inspect": cmdInspect(args, w)
+  of "check": cmdCheck(args, w)
+  of "hosts": cmdHosts(args, w)
   of "logs": cmdLogs(args)
-  of "daemon": cmdDaemon(args, w, lang, runDaemon)
+  of "daemon": cmdDaemon(args, w, runDaemon)
   of "completion": cmdCompletion(args)
-  of "prune": cmdPrune(args, w, lang)
+  of "prune": cmdPrune(args, w)
   of "":
     echo usage()
     ecUsage.int

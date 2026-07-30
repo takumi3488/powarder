@@ -117,10 +117,7 @@ proc info*(w: Writer; msg: string): string =
 # ---------------------------------------------------------------------------
 
 const
-  headlineTemplate: array[Lang, string] = [
-    langEn: "Failed to set up forwarding to $1.",
-    langJa: "Failed to set up forwarding to $1.",
-  ]
+  headlineTemplate = "Failed to set up forwarding to $1."
 
 proc lastNonEmptyLine(s: string): string =
   ## ssh's stderr often spans multiple lines, but the one line that actually
@@ -134,7 +131,7 @@ proc lastNonEmptyLine(s: string): string =
       return trimmed
   s.strip()
 
-proc renderError*(w: Writer; kind: ErrorKind; ctx: ErrorContext; lang: Lang;
+proc renderError*(w: Writer; kind: ErrorKind; ctx: ErrorContext;
                   rawStderr: string): string =
   ## The three-part structure of error display:
   ##   Line 1: ✘ <what failed> (a headline with `ctx.host` embedded)
@@ -143,8 +140,8 @@ proc renderError*(w: Writer; kind: ErrorKind; ctx: ErrorContext; lang: Lang;
   ##   Candidate remedies (`explain().hints`, each line indented)
   ##   blank line
   ##   (ssh: <the relevant line of raw stderr>)   <- the raw output is always kept
-  let expl = explain(kind, lang, ctx)
-  let headline = headlineTemplate[lang] % [ctx.host]
+  let expl = explain(kind, ctx)
+  let headline = headlineTemplate % [ctx.host]
 
   var lines: seq[string] = @[w.failure(headline), ""]
   lines.add("  " & expl.summary)
@@ -153,20 +150,3 @@ proc renderError*(w: Writer; kind: ErrorKind; ctx: ErrorContext; lang: Lang;
   lines.add("")
   lines.add("  (ssh: " & lastNonEmptyLine(rawStderr) & ")")
   lines.join("\n")
-
-# ---------------------------------------------------------------------------
-# Locale detection
-# ---------------------------------------------------------------------------
-
-proc detectLang*(): Lang =
-  ## Determines the language by checking the `LC_ALL` / `LANG` environment
-  ## variables. Following POSIX locale precedence (`LC_ALL` takes priority
-  ## over `LANG`), returns `langJa` if the value starts with "ja"
-  ## (case-insensitive), otherwise `langEn`.
-  let locale =
-    if getEnv("LC_ALL").len > 0: getEnv("LC_ALL")
-    else: getEnv("LANG")
-  if locale.toLowerAscii().startsWith("ja"):
-    langJa
-  else:
-    langEn

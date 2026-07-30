@@ -321,7 +321,7 @@ proc recordFailureAndTransition(hs: HostSession; event: HostEvent) =
   let tail = readLogTail(hs.logPath)
   let kind = classify(tail)
   hs.lastErrorKind = kind
-  hs.lastError = explain(kind, langEn,
+  hs.lastError = explain(kind,
       initErrorContext(host = hs.host, rawStderr = tail)).summary
 
   inc hs.consecutiveFailures

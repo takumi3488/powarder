@@ -201,7 +201,7 @@ proc attach(fw: Forward) =
       # already attached with cancelForward (leaving it attached would be
       # treated as a leftover on the next attach).
       discard muxclient.cancelForward(fw.host.ctlPath, fw.host.host, fw.spec, udsPath)
-      let expl = explain(ekPortInUse, langEn,
+      let expl = explain(ekPortInUse,
           initErrorContext(bindPort = int(fw.spec.bindPort)))
       fw.lastErrorKind = ekPortInUse
       fw.lastError = expl.summary
