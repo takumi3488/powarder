@@ -56,6 +56,8 @@ type
     probe*: bool                      ## ps --probe (opt into Tier2 health check)
     noAutostart*: bool
     immediate*: bool                  ## down skips the grace period
+    checkOnly*: bool ## update --check (only report whether an update is available; does not install)
+    toVersion*: string ## update --to (install this version instead of latest; empty means latest)
     helpRequested*: bool
     versionRequested*: bool
 
@@ -160,6 +162,10 @@ proc parseArgv*(args: openArray[string]): ParsedArgs =
       result.probe = true
     of "--immediate":
       result.immediate = true
+    of "--check":
+      result.checkOnly = true
+    of "--to":
+      result.toVersion = nextValue(a)
     of "-f":
       # The meaning of -f depends on the subcommand (see module doc comment).
       if result.subcommand == "logs":
@@ -189,6 +195,13 @@ proc parseArgv*(args: openArray[string]): ParsedArgs =
           return
         of "help":
           result.helpRequested = true
+          # `dispatch` prints `usage(subcommand)`, so a token after `help`
+          # names the command to describe: `help run` shows the `run` details
+          # rather than the general help. `usage()` already falls back to the
+          # general help for anything it doesn't recognize, so no validation
+          # is needed here.
+          if i < args.len:
+            result.subcommand = args[i]
           return
         of "ls":
           result.subcommand = "ps" ## docker compose-style alias
@@ -242,6 +255,7 @@ Daemon commands:
   daemon status|start|stop|restart|reload|install|uninstall|logs
 
 Other commands:
+  update                     Self-update the powarder binary (see 'help update')
   completion zsh|bash|fish   Print a shell completion script
   version                    Print the powarder version
   help                       Show this help
@@ -312,6 +326,19 @@ Usage: powarder completion <zsh|bash|fish>
 
 Print a shell completion script to stdout."""
 
+const updateUsage = """
+Usage: powarder update [options]
+
+Self-update the powarder binary in place. Delegates the actual
+download/verify/install work to install.sh (fetched from GitHub), passed
+the directory of the currently running binary so it replaces this
+installation.
+
+Options:
+  --check        Only report whether an update is available; do not install
+  --to VERSION   Install VERSION instead of the latest release (e.g. v1.2.3)
+  --json         (with --check) print machine-readable JSON"""
+
 proc usage*(subcommand = ""): string =
   ## The help string. If `subcommand` is empty, returns the overall help;
   ## otherwise returns details for that subcommand (falling back to the
@@ -331,5 +358,7 @@ proc usage*(subcommand = ""): string =
     daemonUsage
   of "completion":
     completionUsage
+  of "update":
+    updateUsage
   else:
     generalUsage

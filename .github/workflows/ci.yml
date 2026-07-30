@@ -26,9 +26,26 @@ jobs:
         run: nimble test -y
 
 
+  # `install.sh` is fetched and piped into `sh` by end users, so a syntax error
+  # in it breaks installation for everyone even though no Nim test can catch
+  # it. `--shell=sh` keeps shellcheck honest about the POSIX-only requirement
+  # (the script also has to run under dash).
+  shell-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Check install.sh parses under dash
+        run: dash -n install.sh
+
+      - name: Shellcheck install.sh
+        run: shellcheck --shell=sh install.sh
+
+
   automerge:
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, shell-lint]
     if: github.event.pull_request.user.login == 'renovate[bot]'
     permissions:
       contents: write

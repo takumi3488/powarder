@@ -43,6 +43,7 @@ _powarder() {
     'prune:Remove all stopped tunnels'
     'hosts:List available SSH hosts'
     'daemon:Manage the background daemon'
+    'update:Self-update the powarder binary'
     'completion:Print a shell completion script'
     'version:Print the powarder version'
     'help:Show help'
@@ -101,7 +102,7 @@ _powarder "$@"
 _powarder_completions() {
   local cur
   cur="${COMP_WORDS[COMP_CWORD]}"
-  local commands="run up down start stop restart ps ls inspect check logs rm prune hosts daemon completion version help"
+  local commands="run up down start stop restart ps ls inspect check logs rm prune hosts daemon update completion version help"
   if [ "$COMP_CWORD" -eq 1 ]; then
     COMPREPLY=($(compgen -W "$commands" -- "$cur"))
     return 0
@@ -119,7 +120,7 @@ complete -F _powarder_completions powarder
 """
 
   fishScript = """# powarder fish completion (simple: subcommand names only)
-set -l powarder_commands run up down start stop restart ps ls inspect check logs rm prune hosts daemon completion version help
+set -l powarder_commands run up down start stop restart ps ls inspect check logs rm prune hosts daemon update completion version help
 
 complete -c powarder -f -n '__fish_use_subcommand' -a "$powarder_commands"
 complete -c powarder -f -n '__fish_seen_subcommand_from daemon' -a 'status start stop restart reload install uninstall logs'

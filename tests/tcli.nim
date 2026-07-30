@@ -106,6 +106,32 @@ suite "parseArgv - daemon / completion":
     check p.subcommand == "completion"
     check p.subsubcommand == "zsh"
 
+suite "parseArgv - update":
+  test "update alone has checkOnly false and toVersion empty":
+    let p = parseArgv(["update"])
+    check p.subcommand == "update"
+    check not p.checkOnly
+    check p.toVersion == ""
+
+  test "update --check sets checkOnly":
+    let p = parseArgv(["update", "--check"])
+    check p.subcommand == "update"
+    check p.checkOnly
+
+  test "update --to v1.2.3 sets toVersion":
+    let p = parseArgv(["update", "--to", "v1.2.3"])
+    check p.subcommand == "update"
+    check p.toVersion == "v1.2.3"
+
+  test "update --check --to v1.2.3 can be combined":
+    let p = parseArgv(["update", "--check", "--to", "v1.2.3"])
+    check p.checkOnly
+    check p.toVersion == "v1.2.3"
+
+  test "--to with no following value is an error":
+    expect ArgvError:
+      discard parseArgv(["update", "--to"])
+
 suite "parseArgv - aliases / meta commands":
   test "ls is an alias for ps":
     let p = parseArgv(["ls"])
@@ -122,6 +148,19 @@ suite "parseArgv - aliases / meta commands":
 
   test "help sets helpRequested":
     check parseArgv(["help"]).helpRequested
+
+  test "help alone leaves subcommand empty (general help)":
+    check parseArgv(["help"]).subcommand == ""
+
+  test "help <command> records the command so dispatch shows its details":
+    let p = parseArgv(["help", "update"])
+    check p.helpRequested
+    check p.subcommand == "update"
+
+  test "help <unknown> is not an error (usage falls back to general help)":
+    let p = parseArgv(["help", "nonesuch"])
+    check p.helpRequested
+    check p.subcommand == "nonesuch"
 
   test "no arguments sets helpRequested":
     check parseArgv([]).helpRequested

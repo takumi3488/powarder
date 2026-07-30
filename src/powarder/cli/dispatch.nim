@@ -19,6 +19,7 @@ import powarder/cli/output
 import powarder/cli/names
 import powarder/cli/autostart
 import powarder/cli/cmd_completion
+import powarder/cli/cmd_update
 import powarder/ipc/client
 import powarder/ipc/protocol
 import powarder/core/paths
@@ -903,6 +904,7 @@ proc dispatch*(args: ParsedArgs; runDaemon: DaemonRunner = nil): int =
   of "daemon": cmdDaemon(args, w, runDaemon)
   of "completion": cmdCompletion(args)
   of "prune": cmdPrune(args, w)
+  of "update": cmdUpdate(args, w)
   of "":
     echo usage()
     ecUsage.int

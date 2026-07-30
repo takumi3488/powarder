@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: darwin-arm64
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.2.10'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build release binary
+        shell: bash
+        run: nimble build -d:release -y
+
+      - name: Sanity check binary
+        shell: bash
+        run: ./powarder --version
+
+      - name: Create archive
+        shell: bash
+        run: tar czf powarder-${{ matrix.target }}.tar.gz powarder
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: powarder-${{ matrix.target }}
+          path: powarder-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    # `workflow_dispatch` runs from a branch, where `GITHUB_REF_NAME` is a
+    # branch name rather than a version tag. Publishing a release makes no
+    # sense there (and the version check below would always fail), so a manual
+    # run only exercises the build matrix.
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Verify tag matches powarder.nimble version
+        shell: bash
+        run: |
+          set -eu
+          tag_version="${GITHUB_REF_NAME#v}"
+          nimble_version=$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' powarder.nimble)
+          echo "Tag version:    ${tag_version}"
+          echo "nimble version: ${nimble_version}"
+          if [ "${tag_version}" != "${nimble_version}" ]; then
+            echo "::error::Tag version (${tag_version}) does not match powarder.nimble version (${nimble_version})"
+            exit 1
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        working-directory: dist
+        run: sha256sum powarder-*.tar.gz > SHA256SUMS
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/powarder-*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true
