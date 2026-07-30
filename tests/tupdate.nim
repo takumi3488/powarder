@@ -74,29 +74,52 @@ suite "cmd_update: envAssignments":
 # ===========================================================================
 
 suite "cmd_update: updateShellCommand":
-  test "assembles env assignments + downloader pipeline (curl, latest)":
+  test "assembles downloader pipeline + env assignments (curl, latest)":
     let cmd = updateShellCommand("/usr/local/bin", "", dlCurl,
         "https://example.com/install.sh")
-    check cmd == "POWARDER_INSTALL_DIR=/usr/local/bin curl -fsSL " &
-        "https://example.com/install.sh | sh"
+    check cmd == "curl -fsSL https://example.com/install.sh | " &
+        "POWARDER_INSTALL_DIR=/usr/local/bin sh"
 
   test "includes POWARDER_VERSION when --to is given":
     let cmd = updateShellCommand("/usr/local/bin", "v1.2.3", dlCurl,
         "https://example.com/install.sh")
-    check cmd == "POWARDER_INSTALL_DIR=/usr/local/bin " &
-        "POWARDER_VERSION=v1.2.3 curl -fsSL " &
-        "https://example.com/install.sh | sh"
+    check cmd == "curl -fsSL https://example.com/install.sh | " &
+        "POWARDER_INSTALL_DIR=/usr/local/bin POWARDER_VERSION=v1.2.3 sh"
 
   test "wget variant pipes through wget instead of curl":
     let cmd = updateShellCommand("/usr/local/bin", "", dlWget,
         "https://example.com/install.sh")
-    check cmd == "POWARDER_INSTALL_DIR=/usr/local/bin wget -qO- " &
-        "https://example.com/install.sh | sh"
+    check cmd == "wget -qO- https://example.com/install.sh | " &
+        "POWARDER_INSTALL_DIR=/usr/local/bin sh"
 
   test "defaults to the real install.sh URL when none is given":
     let cmd = updateShellCommand("/usr/local/bin", "", dlCurl)
     check installScriptUrl in cmd
-    check cmd.endsWith(" | sh")
+    check cmd.endsWith(" sh")
+
+  # This is the specific mistake that shipped in v0.1.0: the assignments were
+  # emitted ahead of the downloader, where the shell scopes them to *that*
+  # command. install.sh then ran with no POWARDER_INSTALL_DIR at all and
+  # installed into its own default directory instead of the one holding the
+  # running binary — a silent success in the wrong place, not a failure. The
+  # two checks below pin the assignments to the right-hand side of the pipe.
+  test "env assignments attach to the sh that runs install.sh, not the downloader":
+    let cmd = updateShellCommand("/usr/local/bin", "v1.2.3", dlCurl,
+        "https://example.com/install.sh")
+    let pipeIdx = cmd.find(" | ")
+    check pipeIdx >= 0
+    let beforePipe = cmd[0 ..< pipeIdx]
+    let afterPipe = cmd[pipeIdx + 3 .. ^1]
+    check envInstallDir notin beforePipe
+    check envVersion notin beforePipe
+    check envInstallDir in afterPipe
+    check envVersion in afterPipe
+
+  test "the right-hand side of the pipe ends with the sh that consumes it":
+    let cmd = updateShellCommand("/usr/local/bin", "", dlCurl,
+        "https://example.com/install.sh")
+    check cmd.endsWith(" sh")
+    check not cmd.contains("| sh ")
 
 # ===========================================================================
 # normalizeVersion / isUpdateAvailable
