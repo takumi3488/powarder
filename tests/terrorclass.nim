@@ -133,28 +133,23 @@ suite "explain: placeholder embedding":
 
   test "ekPortInUse: bindPort appears in both summary and hints":
     let ctx = initErrorContext(bindPort = 8080)
-    let ex = explain(ekPortInUse, langJa, ctx)
+    let ex = explain(ekPortInUse, ctx)
     check "8080" in ex.summary
     check ex.hints.len > 0
     check ex.hints.anyIt("8080" in it)
 
   test "ekAuthFailed: host is embedded":
     let ctx = initErrorContext(host = "prod-db")
-    let ex = explain(ekAuthFailed, langEn, ctx)
+    let ex = explain(ekAuthFailed, ctx)
     check "prod-db" in ex.summary
     check ex.hints.anyIt("prod-db" in it)
 
   test "ekUnknown: the raw stderr passes through unchanged":
     let ctx = initErrorContext(rawStderr = "some very specific ssh error text")
-    let ex = explain(ekUnknown, langEn, ctx)
+    let ex = explain(ekUnknown, ctx)
     check ex.hints.anyIt("some very specific ssh error text" in it)
 
-  test "langEn and langJa now return identical text (Japanese wording was removed from the source)":
-    # errorclass.nim's `templates` table now holds the same English text in
-    # both its langEn and langJa columns, since the Japanese wording was
-    # removed. This documents that behavioral change rather than asserting
-    # the old (no longer true) "they differ" expectation.
+  test "ekConnectionRefused: host is embedded in the summary":
     let ctx = initErrorContext(host = "prod-db")
-    let exEn = explain(ekConnectionRefused, langEn, ctx)
-    let exJa = explain(ekConnectionRefused, langJa, ctx)
-    check exEn.summary == exJa.summary
+    let ex = explain(ekConnectionRefused, ctx)
+    check "prod-db" in ex.summary

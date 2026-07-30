@@ -7,9 +7,9 @@
 ## "what to do next".
 ##
 ## This module performs no I/O whatsoever. It does not import `std/asyncnet`,
-## `std/osproc`, or `std/os`. Determining `Lang` (e.g. reading the `LANG`
-## environment variable) is I/O, so that is the caller's responsibility; this
-## module only does "given a fixed `Lang`, return fixed wording".
+## `std/osproc`, or `std/os`. It only does "given a classification code and a
+## context, return fixed wording", which keeps it unit-testable without side
+## effects.
 
 import std/strutils
 import std/sequtils
@@ -131,11 +131,9 @@ type
     ekConnectionRefused, ekTimeout, ekHostKeyChanged, ekForwardingDenied,
     ekBatchModeNoAuth, ekUnknown
 
-  Lang* = enum langEn, langJa
-
   ErrorContext* = object
     ## Information used to fill host names, port numbers, etc. into the
-    ## translated text. powarder always runs with BatchMode=yes fixed, so
+    ## message text. powarder always runs with BatchMode=yes fixed, so
     ## `interactiveAuthUnavailable` is expected to always be true, but it is
     ## kept as a field for tests and future extension.
     host*: string ## The Host alias from ~/.ssh/config
@@ -229,8 +227,8 @@ proc classify*(stderr: string): ErrorKind =
 # ---------------------------------------------------------------------------
 # Table mapping classification code -> template strings
 #
-# To add a language, just add an enum value to `Lang` and one more column to
-# this array (no changes needed to the `classify` / `explain` logic).
+# One entry per `ErrorKind`, so adding a code is a matter of adding a row here
+# (no changes needed to the `classify` / `explain` logic).
 # `{host}` `{bindPort}` `{targetHost}` `{targetPort}` in the templates are
 # replaced with `ErrorContext` values by `fill()`.
 # ---------------------------------------------------------------------------
@@ -239,161 +237,74 @@ type
   Template = tuple[summary: string; hints: seq[string]]
 
 const
-  templates: array[ErrorKind, array[Lang, Template]] = [
-    ekPortInUse: [
-      langEn: (
-        summary: "Local port {bindPort} is already in use by another process.",
-        hints: @[
-          "Find out what's using it: lsof -nP -iTCP:{bindPort} -sTCP:LISTEN",
-          "Stop that process, or choose a different bindPort for this tunnel.",
+  templates: array[ErrorKind, Template] = [
+    ekPortInUse: (
+      summary: "Local port {bindPort} is already in use by another process.",
+      hints: @[
+        "Find out what's using it: lsof -nP -iTCP:{bindPort} -sTCP:LISTEN",
+        "Stop that process, or choose a different bindPort for this tunnel.",
     ]),
-      langJa: (
-        summary: "Local port {bindPort} is already in use by another process.",
-        hints: @[
-          "Find out what's using it: lsof -nP -iTCP:{bindPort} -sTCP:LISTEN",
-          "Stop that process, or choose a different bindPort for this tunnel.",
+    ekAuthFailed: (
+      summary: "SSH authentication to {host} failed (publickey/password rejected).",
+      hints: @[
+        "Try connecting by hand to see the real prompt: ssh {host}",
+        "Check that your key is loaded: ssh-add -l",
     ]),
-  ],
-    ekAuthFailed: [
-      langEn: (
-        summary: "SSH authentication to {host} failed (publickey/password rejected).",
-        hints: @[
-          "Try connecting by hand to see the real prompt: ssh {host}",
-          "Check that your key is loaded: ssh-add -l",
+    ekGatewayPortsDisabled: (
+      summary: "The remote side refused to bind the requested forwarding port.",
+      hints: @[
+        "Ask the remote admin to enable `GatewayPorts` in sshd_config if you " &
+            "need it reachable from outside the remote host.",
+        "Or bind to 127.0.0.1 on the remote side if only local access on " &
+            "that host is needed.",
     ]),
-      langJa: (
-        summary: "SSH authentication to {host} failed (publickey/password rejected).",
-        hints: @[
-          "Try connecting by hand to see the real prompt: ssh {host}",
-          "Check that your key is loaded: ssh-add -l",
+    ekUnknownHost: (
+      summary: "Could not resolve host \"{host}\".",
+      hints: @[
+        "Check for typos in the host name.",
+        "Make sure the host is defined in ~/.ssh/config (or is a resolvable DNS name).",
     ]),
-  ],
-    ekGatewayPortsDisabled: [
-      langEn: (
-        summary: "The remote side refused to bind the requested forwarding port.",
-        hints: @[
-          "Ask the remote admin to enable `GatewayPorts` in sshd_config if you " &
-              "need it reachable from outside the remote host.",
-          "Or bind to 127.0.0.1 on the remote side if only local access on " &
-              "that host is needed.",
+    ekConnectionRefused: (
+      summary: "Connection to {host} was refused.",
+      hints: @[
+        "The sshd on the remote host may not be running.",
+        "Double-check you're connecting to the right port.",
     ]),
-      langJa: (
-        summary: "The remote side refused to bind the requested forwarding port.",
-        hints: @[
-          "Ask the remote admin to enable `GatewayPorts` in sshd_config if you " &
-              "need it reachable from outside the remote host.",
-          "Or bind to 127.0.0.1 on the remote side if only local access on " &
-              "that host is needed.",
+    ekTimeout: (
+      summary: "Connection to {host} timed out.",
+      hints: @[
+        "Check network reachability and any firewalls between here and {host}.",
     ]),
-  ],
-    ekUnknownHost: [
-      langEn: (
-        summary: "Could not resolve host \"{host}\".",
-        hints: @[
-          "Check for typos in the host name.",
-          "Make sure the host is defined in ~/.ssh/config (or is a resolvable DNS name).",
+    ekHostKeyChanged: (
+      summary: "The host key presented by {host} does not match the one " &
+          "saved in known_hosts.",
+      hints: @[
+        "Do NOT simply delete the known_hosts entry. Verify the new host " &
+            "key out-of-band with the server owner first (this could be a " &
+            "man-in-the-middle attack).",
+        "Only after verifying, remove the stale entry: ssh-keygen -R {host}",
     ]),
-      langJa: (
-        summary: "Could not resolve host \"{host}\".",
-        hints: @[
-          "Check for typos in the host name.",
-          "Make sure the host is defined in ~/.ssh/config (or is a resolvable DNS name).",
+    ekForwardingDenied: (
+      summary: "The remote sshd refused to open this forwarding channel.",
+      hints: @[
+        "Ask the remote admin to check `AllowTcpForwarding` (and `PermitOpen` " &
+            "if set) in sshd_config for {host}.",
     ]),
-  ],
-    ekConnectionRefused: [
-      langEn: (
-        summary: "Connection to {host} was refused.",
-        hints: @[
-          "The sshd on the remote host may not be running.",
-          "Double-check you're connecting to the right port.",
+    ekBatchModeNoAuth: (
+      summary: "{host} requires interactive authentication, which powarder " &
+          "cannot provide (it always connects with BatchMode=yes).",
+      hints: @[
+        "Set up non-interactive publickey authentication for {host} " &
+            "(ssh-copy-id, or add the key to the agent: ssh-add).",
+        "If this is the first connection to {host}, connect once by hand " &
+            "(plain `ssh {host}`) so the host key gets added to known_hosts, " &
+            "then retry.",
     ]),
-      langJa: (
-        summary: "Connection to {host} was refused.",
-        hints: @[
-          "The sshd on the remote host may not be running.",
-          "Double-check you're connecting to the right port.",
+    ekUnknown: (
+      summary: "ssh reported an error that powarder doesn't recognize yet.",
+      hints: @[
+        "Raw ssh stderr: {rawStderr}",
     ]),
-  ],
-    ekTimeout: [
-      langEn: (
-        summary: "Connection to {host} timed out.",
-        hints: @[
-          "Check network reachability and any firewalls between here and {host}.",
-    ]),
-      langJa: (
-        summary: "Connection to {host} timed out.",
-        hints: @[
-          "Check network reachability and any firewalls between here and {host}.",
-    ]),
-  ],
-    ekHostKeyChanged: [
-      langEn: (
-        summary: "The host key presented by {host} does not match the one " &
-            "saved in known_hosts.",
-        hints: @[
-          "Do NOT simply delete the known_hosts entry. Verify the new host " &
-              "key out-of-band with the server owner first (this could be a " &
-              "man-in-the-middle attack).",
-          "Only after verifying, remove the stale entry: ssh-keygen -R {host}",
-    ]),
-      langJa: (
-        summary: "The host key presented by {host} does not match the one " &
-            "saved in known_hosts.",
-        hints: @[
-          "Do NOT simply delete the known_hosts entry. Verify the new host " &
-              "key out-of-band with the server owner first (this could be a " &
-              "man-in-the-middle attack).",
-          "Only after verifying, remove the stale entry: ssh-keygen -R {host}",
-    ]),
-  ],
-    ekForwardingDenied: [
-      langEn: (
-        summary: "The remote sshd refused to open this forwarding channel.",
-        hints: @[
-          "Ask the remote admin to check `AllowTcpForwarding` (and `PermitOpen` " &
-              "if set) in sshd_config for {host}.",
-    ]),
-      langJa: (
-        summary: "The remote sshd refused to open this forwarding channel.",
-        hints: @[
-          "Ask the remote admin to check `AllowTcpForwarding` (and `PermitOpen` " &
-              "if set) in sshd_config for {host}.",
-    ]),
-  ],
-    ekBatchModeNoAuth: [
-      langEn: (
-        summary: "{host} requires interactive authentication, which powarder " &
-            "cannot provide (it always connects with BatchMode=yes).",
-        hints: @[
-          "Set up non-interactive publickey authentication for {host} " &
-              "(ssh-copy-id, or add the key to the agent: ssh-add).",
-          "If this is the first connection to {host}, connect once by hand " &
-              "(plain `ssh {host}`) so the host key gets added to known_hosts, " &
-              "then retry.",
-    ]),
-      langJa: (
-        summary: "{host} requires interactive authentication, which powarder " &
-            "cannot provide (it always connects with BatchMode=yes).",
-        hints: @[
-          "Set up non-interactive publickey authentication for {host} " &
-              "(ssh-copy-id, or add the key to the agent: ssh-add).",
-          "If this is the first connection to {host}, connect once by hand " &
-              "(plain `ssh {host}`) so the host key gets added to known_hosts, " &
-              "then retry.",
-    ]),
-  ],
-    ekUnknown: [
-      langEn: (
-        summary: "ssh reported an error that powarder doesn't recognize yet.",
-        hints: @[
-          "Raw ssh stderr: {rawStderr}",
-    ]),
-      langJa: (
-        summary: "ssh reported an error that powarder doesn't recognize yet.",
-        hints: @[
-          "Raw ssh stderr: {rawStderr}",
-    ]),
-  ],
   ]
 
 proc fill(t: string; ctx: ErrorContext): string =
@@ -406,8 +317,8 @@ proc fill(t: string; ctx: ErrorContext): string =
     ("{rawStderr}", ctx.rawStderr),
   )
 
-proc explain*(kind: ErrorKind; lang: Lang; ctx: ErrorContext): Explanation =
-  ## Looks up the template for `kind` and `lang`, fills in the values from
-  ## `ctx`, and returns the result.
-  let t = templates[kind][lang]
+proc explain*(kind: ErrorKind; ctx: ErrorContext): Explanation =
+  ## Looks up the template for `kind`, fills in the values from `ctx`, and
+  ## returns the result.
+  let t = templates[kind]
   Explanation(summary: t.summary.fill(ctx), hints: t.hints.mapIt(it.fill(ctx)))
