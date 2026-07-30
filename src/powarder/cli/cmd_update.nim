@@ -16,8 +16,10 @@
 ##    the way a user's shell would resolve either command.
 ## 3. Runs `<downloader> <install.sh URL> | sh` through `std/osproc`, with
 ##    `POWARDER_INSTALL_DIR` (and, if `--to` was given, `POWARDER_VERSION`)
-##    set as environment-variable assignments prefixed onto that same shell
-##    command line — see `updateShellCommand`.
+##    assigned to the `sh` on the *right* of the pipe, which is the process
+##    that actually runs install.sh — see `updateShellCommand`, which
+##    explains why putting them anywhere else silently installs into the
+##    wrong directory.
 ## 4. Passes install.sh's own exit code straight through as `powarder
 ##    update`'s exit code. It is *not* translated into `cli/dispatch`'s
 ##    `ExitCode` enum, since that enum only covers powarder's own semantics
@@ -121,8 +123,10 @@ proc downloaderArgv*(downloader: Downloader; url: string): seq[string] =
   of dlWget: @["wget", "-qO-", url]
 
 proc envAssignments*(installDir, toVersion: string): seq[string] =
-  ## The `VAR='value'` shell-assignment tokens to prefix onto the install.sh
-  ## pipeline. `POWARDER_INSTALL_DIR` is always set. `POWARDER_VERSION` is
+  ## The `VAR='value'` shell-assignment tokens to prefix onto the `sh` that
+  ## *runs* install.sh (see `updateShellCommand` for why it has to be that
+  ## `sh` and not the downloader). `POWARDER_INSTALL_DIR` is always set.
+  ## `POWARDER_VERSION` is
   ## set only when `toVersion` is non-empty (empty means "latest", which is
   ## install.sh's own default; explicitly setting it to an empty string
   ## could instead be read by install.sh as "the version named empty
@@ -138,16 +142,29 @@ proc envAssignments*(installDir, toVersion: string): seq[string] =
 proc updateShellCommand*(installDir, toVersion: string; downloader: Downloader;
     url = installScriptUrl): string =
   ## The full command line executed via `/bin/sh -c` to perform the actual
-  ## update: the env-var assignments from `envAssignments`, followed by
-  ## "download install.sh, pipe it into `sh`" (`os.quoteShellCommand`,
-  ## again mirroring `muxclient.nim`, escapes the downloader's own argv).
+  ## update: "download install.sh, pipe it into `sh`", with the env-var
+  ## assignments from `envAssignments` attached **to that trailing `sh`**:
+  ##
+  ##     curl -fsSL <url> | POWARDER_INSTALL_DIR='<dir>' sh
+  ##
+  ## The placement is the whole point and is easy to get backwards. A
+  ## variable assignment prefixed to a command applies to *that one command*
+  ## only, and the two sides of a pipeline are separate commands — so
+  ## `POWARDER_INSTALL_DIR=<dir> curl ... | sh` exports the variable into
+  ## **curl**, which has no use for it, while install.sh runs without it and
+  ## silently falls back to its own default directory. That is not a
+  ## crash; it is a successful install into the wrong place, which is why
+  ## the assignments belong on the right-hand side of the `|`.
+  ##
+  ## (`os.quoteShellCommand`, mirroring `muxclient.nim`, escapes the
+  ## downloader's own argv.)
   ##
   ## Building this as one plain string (rather than passing the env
   ## overrides through `osproc.startProcess`'s `env:` parameter) keeps the
   ## whole command reproducible and directly comparable with `==` in tests,
   ## without having to snapshot-and-diff an entire environment table.
-  let pipeline = quoteShellCommand(downloaderArgv(downloader, url)) & " | sh"
-  (envAssignments(installDir, toVersion) & @[pipeline]).join(" ")
+  let runner = (envAssignments(installDir, toVersion) & @["sh"]).join(" ")
+  quoteShellCommand(downloaderArgv(downloader, url)) & " | " & runner
 
 proc normalizeVersion*(v: string): string =
   ## Strips surrounding whitespace and one leading `v`/`V`, so `"v1.2.3"`,
