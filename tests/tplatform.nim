@@ -116,9 +116,15 @@ suite "procinfo: 長い引数列と cmdlineMatches":
     # シェルを介さず `/bin/cat -` を直接起動する。先頭の "-" で標準入力待ちに
     # なってブロックし続けるので、後続の引数を cat が処理しようとすることも
     # なく、渡した argv がそのまま cmdline に残る。
+    # ダミー引数を `--` で始めてはいけない。**GNU coreutils の `cat`（Linux）は
+    # `--dummy-...` を不正な長オプションと解釈して即座にエラー終了する**ため、
+    # `processCmdline` を呼ぶ前にプロセスが消えてしまう（BSD `cat`（macOS）は
+    # 長オプションを持たずファイル名として扱うので、この差で Linux だけ落ちた）。
+    # `-` を先頭に置いてあるので `cat` は stdin を待ってブロックし続け、
+    # 後続の引数をファイルとして開こうとはしない。
     var args = @["-"]
     for i in 0 ..< 20:
-      args.add("--dummy-argument-" & $i & "-" & "x".repeat(20))
+      args.add("dummy-argument-" & $i & "-" & "x".repeat(20))
     args.add("POWARDER_END_MARKER")
 
     let p = startProcess("/bin/cat", args = args)

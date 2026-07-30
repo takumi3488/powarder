@@ -384,3 +384,13 @@ removeDir(testRuntimeDir)
 delEnv("POWARDER_FAKE_SSH_MODE")
 delEnv("POWARDER_FAKE_SSH_LOG")
 delEnv("POWARDER_RUNTIME_DIR")
+
+# fake ssh のリスナー（nc / python3 / perl）は、`hostsession.teardown` が最終手段の
+# SIGKILL を送ると fake ssh 側の trap が発火しないため孤児化して残る。残ったままだと
+# 親から継承した pipe が閉じず、`nimble test` が EOF を待って**ハングする**
+# （実測: Linux コンテナで3時間ハングした）。fake ssh 側で fd を閉じる方法は
+# dash の挙動と asyncdispatch の fd 継承の2点で壊れたため、ここで確実に掃除する。
+#
+# `[p]` のブラケットは `pkill` が自分自身のコマンドラインにマッチして自滅するのを
+# 防ぐための定石（実測で踏んだ。exit 144 になる）。
+discard execShellCmd("pkill -f '" & testRuntimeDir & "' >/dev/null 2>&1 || true")

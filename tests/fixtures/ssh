@@ -103,11 +103,86 @@ if [ "$is_master" -eq 1 ]; then
 
   # 実際に制御ソケット（UDS）を作る。`socketExists()` による readiness 判定が
   # 本物同様に動くようにするため、ただのファイルではなく本物の UDS にする。
-  # `nc -lU` を使う（この環境・CI 双方で確認済み。`-k` で複数回の
-  # `-O check` / `-O forward` 呼び出しに耐えられるようにする）。
+  #
+  # **UDS を作れるツールは環境によって違う。** 実測:
+  #   - macOS: `nc`（BSD netcat。`-U` あり）
+  #   - nimlang/nim:2.2.10（Debian trixie）: nc / socat / python3 が無く **perl だけ**
+  #   - GitHub Actions の ubuntu: `nc`（netcat-openbsd）
+  # 1つのツールに賭けると環境を移した瞬間にテストが大量に落ちる（実際に Debian で
+  # `tdaemon.nim` の4件が落ちた）ので、使えるものを順に試すフォールバックにする。
+  #
+  # `nc -h` の出力を grep してオプションの有無を判定する方法は netcat の実装差
+  # （traditional / openbsd / BSD）で当てにならないため、**実際に起動して
+  # ソケットが現れたかどうか**で採否を決める。
+  # ★継承した余分な fd を必ず閉じてからリスナーを exec すること。
+  #
+  # powarder のテストバイナリは `startProcess` で fake ssh を起動するが、
+  # `std/osproc` は `poParentStreams` を指定しない限り **stdin/stdout/stderr 用の
+  # pipe を必ず作る**（実測）。その pipe の fd は fake ssh に、さらにその子である
+  # リスナーへと継承される。リスナーは長命なので、リスナーが残ったままだと
+  # **親（テストバイナリ → nimble）がその pipe の EOF を永久に待ってハングする**
+  # （実測: Linux コンテナで `nimble test` が3時間ハングした。孤児リスナーの fd に
+  # `3,5,8,9,10,12 -> pipe:[...]` が残り、`nimble` が読んでいた pipe が閉じなかった）。
+  #
+  # ★**ここで fd 3 以降を閉じてはいけない。** 2通り試して両方壊れた:
+  #   (1) `exec N>&-` を 3..63 に無条件で当てる
+  #       → `dash`（Debian / Ubuntu の /bin/sh）は開いていない fd へのリダイレクトを
+  #         エラーとし、**非対話シェルを即座に終了させる**（macOS の bash は黙って許容）。
+  #         `2>/dev/null || true` では抑えられない（シェル自体が死ぬ）。
+  #   (2) `[ -e /dev/fd/N ]` で存在確認してから閉じる
+  #       → 親が asyncdispatch を初期化済み（epoll / socket の fd を持つ）だと
+  #         リスナーの起動自体が壊れる。最小再現で確認: asyncdispatch 無しなら
+  #         tick 1 で hsConnected、有りなら「UDS を作れるツールがありません」。
+  #
+  # そのため fd は 0/1/2 のリダイレクトだけに留め、**ハングは「テストの最後に
+  # runtime dir に紐づくリスナーを確実に掃除する」ことで防ぐ**方針にした
+  # （各テストファイル末尾の pkill を参照）。リスナーが残らなければ pipe も閉じる。
+  _spawn_listener() {
+    exec "$@" </dev/null >/dev/null 2>&1
+  }
+
   rm -f "$ctl_path"
-  nc -lkU "$ctl_path" >/dev/null 2>&1 &
-  nc_pid=$!
+  nc_pid=""
+  for _uds_tool in nc python3 perl; do
+    command -v "$_uds_tool" >/dev/null 2>&1 || continue
+    case "$_uds_tool" in
+      nc)
+        ( _spawn_listener nc -lkU "$ctl_path" ) &
+        ;;
+      python3)
+        ( _spawn_listener python3 -c 'import socket, sys, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(sys.argv[1])
+s.listen(5)
+while True:
+    time.sleep(3600)' "$ctl_path" ) &
+        ;;
+      perl)
+        ( _spawn_listener perl -e 'use IO::Socket::UNIX;
+my $p = shift;
+IO::Socket::UNIX->new(Local => $p, Listen => 5) or die "bind failed: $!";
+while (1) { sleep 3600; }' "$ctl_path" ) &
+        ;;
+    esac
+    _uds_pid=$!
+    _i=0
+    while [ ! -S "$ctl_path" ] && [ "$_i" -lt 40 ] && kill -0 "$_uds_pid" 2>/dev/null; do
+      sleep 0.05
+      _i=$((_i + 1))
+    done
+    if [ -S "$ctl_path" ]; then
+      nc_pid=$_uds_pid
+      break
+    fi
+    kill "$_uds_pid" 2>/dev/null
+    rm -f "$ctl_path"
+  done
+
+  if [ -z "$nc_pid" ]; then
+    echo "fake ssh: UDS を作れるツールがありません" >&2
+    echo "fake ssh: nc -U / python3 / perl のいずれかが必要です" >&2
+    exit 1
+  fi
 
   # M6 の孤児 adopt テスト向け: 実マスター（このスクリプト自身）の pid を
   # ctl_path の隣に記録しておく。`-O check` はこれを読んで返す（無ければ
@@ -118,13 +193,19 @@ if [ "$is_master" -eq 1 ]; then
 
   cleanup() {
     kill "$nc_pid" 2>/dev/null
+    # **リスナーが実際に終わるまで待つ。** kill を送っただけで exit すると、
+    # 親のシェルが先に消えてリスナーが孤児化（PPID=1）し、テスト終了後も
+    # 残り続ける（実測: torphan のテスト後に nc が5個、9分以上残っていた）。
+    wait "$nc_pid" 2>/dev/null
     rm -f "$ctl_path" "${ctl_path}.pid"
   }
   trap 'cleanup; exit 0' TERM INT
 
-  while kill -0 "$nc_pid" 2>/dev/null; do
-    sleep 0.2
-  done
+  # `wait` を使う（`while kill -0 + sleep` のポーリングではなく）。
+  # POSIX sh の `wait` はシグナルで中断されるので trap が確実に・即座に発火し、
+  # かつ待機中に CPU を使わない。ポーリングだと `sleep` の粒度分だけ trap の
+  # 発火が遅れ、その間に親が終了するとリスナーが取り残される。
+  wait "$nc_pid" 2>/dev/null
   cleanup
   exit 0
 fi
