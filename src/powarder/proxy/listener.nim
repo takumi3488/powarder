@@ -1,4 +1,5 @@
-## 公開リスナー（ユーザーが指定した bind アドレス:ポート）の accept ループ。
+## The accept loop for the public listener (the bind address:port specified
+## by the user).
 
 import std/asyncdispatch
 import std/asyncnet
@@ -18,10 +19,10 @@ type
 
 proc newForwardProxy*(bindAddr: string; bindPort: Port; target: UpstreamTarget;
                       maxConns = defaultMaxConns): ForwardProxy =
-  ## 公開リスナーを bind & listen する。**bind に失敗したら例外をそのまま
-  ## 投げる**（「ローカルポートが既に使われている」をここで検出するのが
-  ## 正しい層。ssh 側ではなく powarder 側がユーザー指定ポートを bind する
-  ## ため）。
+  ## Binds & listens on the public listener. **If the bind fails, the
+  ## exception is simply propagated as-is** (this is the correct layer to
+  ## detect "the local port is already in use," since it is powarder — not
+  ## ssh — that binds the user-specified port).
   let domain = if bindAddr.contains(':'): AF_INET6 else: AF_INET
   let listener = newAsyncSocket(domain, buffered = false)
   listener.setSockOpt(OptReuseAddr, true)
@@ -31,10 +32,11 @@ proc newForwardProxy*(bindAddr: string; bindPort: Port; target: UpstreamTarget;
                maxConns: maxConns, closing: false)
 
 proc handleConnection(p: ForwardProxy; client: AsyncSocket) {.async.} =
-  ## 1接続分のハンドラ。同時接続数の上限を超えていれば即 close、
-  ## 上流への接続に失敗してもクライアントを即 close する
-  ## （生 TCP 中継なのでクライアントにエラーを意味的に伝える手段は無く、
-  ## 即 close が唯一の選択）。
+  ## Handler for a single connection. Closes immediately if the concurrent
+  ## connection limit is exceeded, and also closes the client immediately
+  ## if connecting to the upstream fails (since this is a raw TCP relay,
+  ## there is no way to convey the error's meaning to the client, so an
+  ## immediate close is the only option).
   if p.stats.activeConns >= p.maxConns:
     p.stats.recordRejected()
     client.close()
@@ -60,11 +62,12 @@ proc handleConnection(p: ForwardProxy; client: AsyncSocket) {.async.} =
   p.stats.recordDisconnect()
 
 proc serve*(p: ForwardProxy) {.async.} =
-  ## accept ループ。1接続ごとに `asyncCheck` でハンドラを起動する。
+  ## The accept loop. Launches the handler with `asyncCheck` for each
+  ## connection.
   ##
-  ## `close()` がリスナーを閉じると保留中の `acceptAddr` は例外を投げるので、
-  ## `closing` フラグを見て正常終了（ループを抜ける）と本物の accept 失敗を
-  ## 区別する。
+  ## When `close()` closes the listener, the pending `acceptAddr` raises an
+  ## exception, so the `closing` flag is checked to distinguish a normal
+  ## termination (break out of the loop) from a genuine accept failure.
   while not p.closing:
     try:
       let conn = await p.listener.acceptAddr()
@@ -76,14 +79,15 @@ proc serve*(p: ForwardProxy) {.async.} =
         raise
 
 proc close*(p: ForwardProxy) =
-  ## `closing = true` にしてリスナーを閉じる。accept ループは `closing` を
-  ## 見て抜ける。
+  ## Sets `closing = true` and closes the listener. The accept loop checks
+  ## `closing` and exits.
   p.closing = true
   p.listener.close()
 
 proc retarget*(p: ForwardProxy; target: UpstreamTarget) =
-  ## フォワードの宛先が変わったとき、新しい上流に切り替える。
-  ## 既存の接続は旧 target のまま流し続け（すでに `dialUpstream` 済みの
-  ## ソケットを握っているため）、新規接続だけが新 target に向く。
-  ## ほぼ無停止で切り替えられる。
+  ## Switches to a new upstream when the forward's destination changes.
+  ## Existing connections keep flowing to the old target (since they
+  ## already hold a socket that has already been through `dialUpstream`),
+  ## and only new connections go to the new target. This allows switching
+  ## with essentially no downtime.
   p.target = target

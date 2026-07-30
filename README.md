@@ -1,45 +1,48 @@
 # powarder
 
-`powarder` は、SSH のローカル/リモートポートフォワード（`ssh -L` / `ssh -R`）を
-Docker コンテナのように「名前の付いた管理対象」として扱う CLI と、それを
-裏で維持し続ける常駐デーモンです。
+`powarder` is a CLI that treats SSH local/remote port forwards (`ssh -L` /
+`ssh -R`) as "named, managed objects" -- the same way Docker treats
+containers -- backed by a daemon that keeps them alive in the background.
 
-## これは何か
+## What is this?
 
-素の `ssh -N -L 8080:localhost:80 bastion` を使ったことがある人なら、次のような
-不満に心当たりがあるはずです。
+If you've ever used plain `ssh -N -L 8080:localhost:80 bastion`, you've
+probably run into frustrations like these:
 
-- 端末を閉じると（あるいは SSH セッションが切れると）フォワードも死ぬ
-- ネットワークが一瞬切れただけで再接続してくれない
-- いま自分が何本トンネルを張っているか、`ps` で一覧できない
-- 同じ長いコマンドを毎回タイプし直す（あるいはシェルの履歴を漁る）
+- Close the terminal (or let the SSH session drop) and the forward dies with it
+- A brief network blip happens and it never reconnects on its own
+- No way to see how many tunnels you currently have up, e.g. via `ps`
+- Retyping the same long command every time (or digging through shell history)
 
-`powarder` はこれらを、Docker が「コンテナ」という単位でプロセスを管理するのと
-同じ発想で解決します。トンネルには名前を付けて `powarder.json` に宣言し、
-バックグラウンドのデーモンが `powarder up` / 自動起動時にまとめて張り、
-死んだら統計情報（接続数・転送バイト数）付きの `ps` で状態を確認しながら、
-自動的に張り直します。
+`powarder` solves these problems the same way Docker solves process
+management with the "container" abstraction: you name each tunnel and
+declare it in `powarder.json`, a background daemon brings them all up
+together via `powarder up` or at autostart, and if one dies it automatically
+reconnects -- while you watch its state via `ps`, which reports statistics
+(connection count, bytes transferred).
 
-**`autossh` との違い**: `autossh` は「1本の ssh 接続の生存監視」だけを行う
-ツールで、複数のトンネルを横断した一覧性や、名前による管理、接続ごとの
-統計は持ちません（`autossh` を並べて複数起動しても、それぞれが独立していて
-全体像を把握する手段が無い）。`powarder` は複数のトンネル・複数のホストを
-1つのデーモンが一元管理し、`ps` / `hosts` / `inspect` で全体を見渡せる点が
-本質的な違いです。
+**How this differs from `autossh`**: `autossh` only does "keep-alive
+monitoring for a single ssh connection." It has no way to list across
+multiple tunnels, no name-based management, and no per-connection
+statistics (run several `autossh` instances side by side and you just get
+independent processes with no way to see the big picture). The essential
+difference with `powarder` is that a single daemon centrally manages
+multiple tunnels across multiple hosts, and `ps` / `hosts` / `inspect` let
+you see the whole picture at a glance.
 
-## インストール
+## Installation
 
-`powarder` は Nim 2.2.10 で書かれており、**外部の nimble パッケージには
-一切依存しません**（`std/*` のみ）。ビルドに必要なのは Nim 本体だけです。
+`powarder` is written in Nim 2.2.10 and has **zero external nimble package
+dependencies** (only `std/*`). All you need to build it is Nim itself.
 
-[mise](https://mise.jdx.dev/) を使う場合:
+If you use [mise](https://mise.jdx.dev/):
 
 ```bash
 mise plugins install nim https://github.com/mise-plugins/mise-nim
 mise install nim@2.2.10
 ```
 
-ビルド:
+Build:
 
 ```bash
 git clone https://example.com/powarder.git
@@ -47,20 +50,21 @@ cd powarder
 mise exec -- nimble build -y
 ```
 
-`./powarder` バイナリができます。適当な `$PATH` の通ったディレクトリに置いて
-ください（例: `mv powarder /usr/local/bin/` や `~/.local/bin/`）。
+This produces the `./powarder` binary. Put it somewhere on your `$PATH`
+(e.g. `mv powarder /usr/local/bin/` or `~/.local/bin/`).
 
-## 使い方
+## Usage
 
-まず設定無しで、ad-hoc に1本張ってみます（`ssh -L` とほぼ同じ書き味です）。
+First, with no config at all, let's bring up a single tunnel ad hoc (the
+syntax is nearly identical to `ssh -L`).
 
 ```console
 $ powarder run -L 8080:localhost:80 prod-bastion
 ✔ tunnel "web1" started (-L 127.0.0.1:8080 -> localhost:80 via prod-bastion)
 ```
 
-`~/.config/powarder/config.json`（または `./powarder.json`）に宣言しておけば、
-まとめて起動・停止できます。
+Declare tunnels in `~/.config/powarder/config.json` (or `./powarder.json`)
+and you can start/stop them all at once.
 
 ```console
 $ powarder up
@@ -77,28 +81,28 @@ HOST          STATE        TUNNELS  PID    UPTIME  RETRIES
 prod-bastion  hsConnected  2        41213  3s      0
 
 $ powarder logs -f web1
-# ssh マスターの -v ログをそのまま tail -f する（Ctrl-C で抜ける）
+# tail -f the ssh master's -v log as-is (Ctrl-C to exit)
 
 $ powarder down
 ✔ tunnel "web1" stopped
 ✔ tunnel "db1" stopped
 ```
 
-停止中のトンネルをまとめて片付けたいときは `prune` を使います
-（`-a` の有無に関わらず、停止中のトンネルを全部見て削除します）。
+Use `prune` when you want to clean up stopped tunnels in one go (regardless
+of `-a`, it looks at every stopped tunnel and removes them all).
 
 ```console
 $ powarder prune
 ✔ tunnel "web1" removed
 ```
 
-主なサブコマンド一覧は `powarder help` を、個別のオプションは
-`powarder help <command>` を参照してください。
+See `powarder help` for the full list of subcommands, and
+`powarder help <command>` for the options of an individual command.
 
-### 常駐サービスとして登録する
+### Registering as a background service
 
-端末やログインセッションと無関係にデーモンを動かし続けたい場合は、
-OS のサービス機構に登録できます。
+If you want the daemon to keep running independently of any terminal or
+login session, you can register it with your OS's service manager.
 
 ```console
 $ powarder daemon install
@@ -108,18 +112,19 @@ $ powarder daemon uninstall
 ✔ uninstalled "dev.powarder.daemon"
 ```
 
-- macOS: `~/Library/LaunchAgents/dev.powarder.daemon.plist` を生成し
-  `launchctl bootstrap` で登録します。
-- Linux: `~/.config/systemd/user/powarder.service` を生成し
-  `systemctl --user enable --now` で登録します。**`loginctl enable-linger
-  $USER` を実行していないと、ログアウト時に systemd の user manager ごと
-  停止し、トンネルも切れます**（`daemon install` / `daemon status` の出力に
-  この案内が出ます）。
+- macOS: generates `~/Library/LaunchAgents/dev.powarder.daemon.plist` and
+  registers it with `launchctl bootstrap`.
+- Linux: generates `~/.config/systemd/user/powarder.service` and registers
+  it with `systemctl --user enable --now`. **If you haven't run
+  `loginctl enable-linger $USER`, the systemd user manager -- and your
+  tunnels along with it -- will stop as soon as you log out** (`daemon
+  install` / `daemon status` print this warning for you).
 
-## 設定ファイル
+## Config file
 
-`~/.config/powarder/config.json`（`POWARDER_CONFIG` で上書き可。カレント
-ディレクトリに `powarder.json` があればそちらを優先）の例:
+Example of `~/.config/powarder/config.json` (overridable via
+`POWARDER_CONFIG`; a `powarder.json` in the current directory takes
+priority if one exists):
 
 ```jsonc
 {
@@ -143,92 +148,104 @@ $ powarder daemon uninstall
 }
 ```
 
-| フィールド | 説明 |
+| Field | Description |
 |---|---|
-| `name` | トンネルの一意な名前。`ps` / `start` / `stop` / `rm` 等で参照する |
-| `host` | `~/.ssh/config` の `Host` エイリアス |
-| `type` | `"L"`（ローカルフォワード）または `"R"`（リモートフォワード） |
-| `forward` | ssh 完全互換の `[bind_address:]port:host:hostport` |
-| `autostart` | `powarder up` で自動的に起動するか（省略時 `false`） |
-| `profile` | `powarder up --profile X` で選択的に起動するためのタグ |
-| `sshExtraArgs` | マスター起動時に追加する ssh オプション（省略可） |
-| `retry` | 再接続のバックオフ設定（省略可） |
+| `name` | Unique tunnel name, referenced by `ps` / `start` / `stop` / `rm`, etc. |
+| `host` | A `Host` alias from `~/.ssh/config` |
+| `type` | `"L"` (local forward) or `"R"` (remote forward) |
+| `forward` | ssh-compatible `[bind_address:]port:host:hostport` |
+| `autostart` | Whether to start automatically with `powarder up` (defaults to `false` if omitted) |
+| `profile` | A tag used to selectively start tunnels via `powarder up --profile X` |
+| `sshExtraArgs` | Extra ssh options to pass when starting the master (optional) |
+| `retry` | Reconnect backoff settings (optional) |
 
-**`~/.ssh/config` との役割分担**: `powarder.json` には意図的に `user` /
-`port` / `identityFile` / `proxyJump` に相当するフィールドを持たせて
-**いません**。接続経路・認証（ユーザー名・ポート番号・鍵ファイル・踏み台
-経由の `ProxyJump`）は `~/.ssh/config` の責務、「どのローカルポートを
-どこへ転送するか」という転送トポロジだけが `powarder.json` の責務、という
-分担をスキーマのレベルで強制しています。これらのキーを書いても致命的
-エラーにはしませんが、`~/.ssh/config` へ書くよう促す警告が出ます。
+**Division of responsibility with `~/.ssh/config`**: `powarder.json`
+deliberately has no fields equivalent to `user` / `port` / `identityFile` /
+`proxyJump`. The schema enforces this split at the type level: connection
+routing and authentication (username, port number, key file, `ProxyJump`
+through a bastion) are the responsibility of `~/.ssh/config`, while
+`powarder.json` is responsible only for the forwarding topology -- which
+local port gets forwarded where. Including these keys won't cause a fatal
+error, but you'll get a warning telling you to move them into
+`~/.ssh/config` instead.
 
-## 仕組み
+## How it works
 
-`powarder` は自前で SSH プロトコルを実装しているわけではありません。
-`ssh` バイナリそのものを **ControlMaster** として起動し、個々のフォワードは
-起動済みのマスターに `ssh -O forward` で後付けする、という構成を取ります。
+`powarder` doesn't implement the SSH protocol itself. It launches the
+`ssh` binary directly as a **ControlMaster**, and each individual forward
+is attached to the already-running master afterward via `ssh -O forward`.
 
-- **1ホスト = 1つの長命マスター。** `~/.ssh/config` の同じ `Host` を指す
-  複数のトンネルは、1つのマスター接続を共有します。「同じ host か」は
-  ホスト名の文字列一致ではなく、`ssh -G <host>` の解決結果（実際に有効になる
-  全設定）から作った fingerprint で判定しています。そのため `ProxyJump` や
-  `IdentityFile` を `Host` ブロックの継承で変えても、実質的に同じ接続先なら
-  正しく1本にまとまります。
-- **認証・鍵・KEX は全部 OpenSSH に任せる。** マスターの起動は普通の
-  `ssh -M -N ...` であり、`ProxyJump`、証明書認証、FIDO2/セキュリティキー、
-  最新の鍵交換アルゴリズムなど、手元の `ssh` が対応しているものはそのまま
-  powarder でも使えます。powarder が「認証をどう頑張るか」を作り込む必要が
-  ありません。
-- **`-L` は powarder が薄い TCP プロキシを挟みます。** ユーザーが指定した
-  ローカルポートは powarder 自身が listen し、実際のフォワードは ssh 側に
-  Unix domain socket を張らせて、そこへ powarder が中継します。理由は単純で、
-  ssh の mux プロトコルには接続数・転送バイト数を取得する手段が無いためです。
-  クライアントと powarder の間に自前のプロキシを挟むことで、`ps` に出る
-  `CONNS` / `RX/TX` 等の統計を実測できるようにしています。
-- **`-R` は統計が取れません。** リモート側が listen する構成上、powarder は
-  データパスに一切介在できないため、原理的に接続数もバイト数も分かりません
-  （`ps` ではこれらの列が `-` になります）。ヘルスチェックも「マスターが
-  生きているか」だけが頼りです。
-- **ヘルスチェックは実トラフィックの副産物が主体（Tier 3）。** 定期的な
-  能動プローブ（`--probe` でオプトインできる Tier 2）は宛先への実接続を
-  必ず発生させてしまい、宛先のログにノイズを撒くため既定では行いません。
-  代わりに、実際のクライアント接続が上流に繋がらなかった回数を見て不健全を
-  判定します。トラフィックが多いフォワードほど異常検知が速くなるのが利点です。
+- **One host = one long-lived master.** Multiple tunnels that point at the
+  same `Host` in `~/.ssh/config` share a single master connection. "Same
+  host" isn't decided by comparing host name strings -- it's decided by a
+  fingerprint built from the resolved output of `ssh -G <host>` (every
+  setting that actually ends up in effect). So even if `ProxyJump` or
+  `IdentityFile` changes through `Host` block inheritance, tunnels that
+  genuinely resolve to the same destination are still correctly
+  consolidated into a single connection.
+- **Authentication, keys, and key exchange are left entirely to OpenSSH.**
+  The master is started with a plain `ssh -M -N ...`, so anything your
+  local `ssh` already supports -- `ProxyJump`, certificate authentication,
+  FIDO2/security keys, the latest key-exchange algorithms -- works with
+  powarder too. powarder never has to build its own logic for "how do we
+  make authentication work."
+- **For `-L`, powarder inserts a thin TCP proxy.** powarder itself listens
+  on the local port you specified, and the actual forward runs over a Unix
+  domain socket that ssh sets up, with powarder relaying between the two.
+  The reason is simple: the ssh mux protocol has no way to report
+  connection counts or bytes transferred. By putting its own proxy between
+  the client and itself, powarder can actually measure the `CONNS` /
+  `RX/TX` statistics shown in `ps`.
+- **`-R` can't get statistics at all.** Because the remote side does the
+  listening in this configuration, powarder has no way to sit in the data
+  path, so it fundamentally has no way to know connection counts or byte
+  counts (these columns show `-` in `ps`). Health checking for `-R` can
+  only rely on "is the master still alive."
+- **Health checks mostly piggyback on real traffic (Tier 3).** Periodic
+  active probing (Tier 2, opt-in via `--probe`) always forces a real
+  connection to the destination and adds noise to the destination's logs,
+  so it's disabled by default. Instead, powarder tracks how many times a
+  real client connection failed to reach upstream and uses that to judge
+  unhealthiness. The upside is that the busier a forward's traffic, the
+  faster it detects problems.
 
-## トラブルシュート
+## Troubleshooting
 
-- **非対話認証が前提です。** デーモンには TTY が無く、常に
-  `BatchMode=yes` で接続します。パスワード認証や対話的な MFA が必須の
-  ホストには使えません。事前に鍵を用意し、`ssh-agent` に解錠済みの状態で
-  登録しておいてください。
-- **launchd/systemd 経由だと `SSH_AUTH_SOCK` が継承されません。**
-  対話シェルから起動したセッションの環境変数（`PATH` も含む）は、
-  OS サービスとして起動したデーモンには引き継がれません。`PATH` は
-  plist/unit ファイル側で最低限を明示していますが、`SSH_AUTH_SOCK`
-  （ssh-agent のソケットパス）は原理的に解決できません。鍵がエージェント
-  管理の場合、`daemon install` 経由では認証できないことがあります。
-  macOS では `~/.ssh/config` に `UseKeychain yes` を設定して macOS の
-  Keychain に鍵を保存する方式にすると、この問題を回避できます。
-- **`powarder logs <name>` で、対応する ssh マスターの `-v` ログがそのまま
-  読めます。** デバッグの最後の砦です。デーモンが停止していても、ログ
-  ファイル自体は `~/.local/state/powarder/logs/` に残っているので直接
-  読めます。
-- **エラーメッセージは（ロケールが日本語なら）日本語に翻訳されますが、
-  生の ssh 出力も必ず併記されます。** 翻訳文だけでは判断できないケースの
-  ための保険です。
-- **`-R` のヘルスチェックは弱いです。** リモート側が listen する構成上、
-  そのリスナーが実際に生きているかを powarder 側から確認する手段が
-  原理的にありません。「マスター接続が生きているか」以上の保証はできない
-  点を理解した上で使ってください。
+- **Non-interactive authentication is assumed.** The daemon has no TTY and
+  always connects with `BatchMode=yes`. It can't be used with hosts that
+  require password authentication or interactive MFA. Set up your keys in
+  advance and make sure they're already unlocked in `ssh-agent`.
+- **`SSH_AUTH_SOCK` is not inherited when launched via launchd/systemd.**
+  Environment variables from your interactive shell session (including
+  `PATH`) are not passed down to a daemon started as an OS service. `PATH`
+  is given a minimal explicit value in the plist/unit file, but
+  `SSH_AUTH_SOCK` (the ssh-agent socket path) fundamentally cannot be
+  resolved that way. If your keys are managed by an agent, authentication
+  may fail when the daemon is started via `daemon install`. On macOS, you
+  can work around this by setting `UseKeychain yes` in `~/.ssh/config` and
+  storing the key in the macOS Keychain instead.
+- **`powarder logs <name>` gives you the corresponding ssh master's raw
+  `-v` log, unfiltered.** This is the last resort for debugging. Even
+  while the daemon is stopped, the log files themselves remain under
+  `~/.local/state/powarder/logs/` and can be read directly.
+- **Error messages are localized based on your locale, but the raw ssh
+  output is always included alongside them.** This is a safety net for
+  cases where the localized text alone isn't enough to diagnose the
+  problem.
+- **`-R` health checks are weak.** Because the remote side does the
+  listening in this configuration, powarder has no way to check from its
+  own side whether that listener is actually still alive. Use it knowing
+  that the only guarantee available is "the master connection is alive" --
+  nothing stronger.
 
-## 既知の制約
+## Known limitations
 
-- 非特権ユーザー前提です（macOS の LaunchAgent、Linux の
-  `systemctl --user`）。1024番未満の特権ポートへの bind や、複数 OS
-  ユーザー間で1つのデーモンを共有する構成はスコープ外です。
-- `~/.ssh/config` を書き換えたら `powarder daemon reload` を実行して
-  ください（デーモンは起動時に読んだ設定をキャッシュしています）。
-- macOS の `sockaddr_un.sun_path` には 104 バイトの制限があるため、
-  ランタイムディレクトリ（IPC ソケットや ControlPath を置く場所）が
-  深すぎると使えません。その場合は `POWARDER_RUNTIME_DIR` で短いパスを
-  明示してください。
+- Assumes a non-privileged user (macOS LaunchAgent, Linux
+  `systemctl --user`). Binding to privileged ports below 1024, or sharing
+  a single daemon across multiple OS users, is out of scope.
+- After editing `~/.ssh/config`, run `powarder daemon reload` (the daemon
+  caches the config it read at startup).
+- macOS's `sockaddr_un.sun_path` has a 104-byte limit, so the runtime
+  directory (where IPC sockets and ControlPath live) can't be nested too
+  deeply. If it is, specify a shorter path explicitly with
+  `POWARDER_RUNTIME_DIR`.

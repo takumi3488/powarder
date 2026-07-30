@@ -1,33 +1,40 @@
-## powarder デーモン本体。M1〜M4 で作られた各モジュール（registry / reconcile /
-## hostsession / forward / ipc）を配線し、RPC ハンドラを提供する。
+## The powarder daemon itself. Wires up the modules built in M1-M4
+## (registry / reconcile / hostsession / forward / ipc) and provides the
+## RPC handlers.
 ##
-## ★最重要の制約: **`platform/daemonize.daemonize()` を呼んではいけない。**
-## `runDaemon()` はフォアグラウンドで動作する設計にする。
+## IMPORTANT constraint (the most critical one): **`platform/daemonize.daemonize()`
+## must never be called.** `runDaemon()` is designed to run in the
+## foreground.
 ##
-## 理由（macOS で実測判明。`tests/tipc.nim` のモジュール doc comment も参照）:
-## asyncdispatch（`newAsyncSocket` を1回でも呼ぶとグローバル kqueue fd が
-## プロセス内に初期化される）に一度でも触れた**後**に `fork()` すると、子が
-## 継承した kqueue fd が壊れて、子プロセス内での `accept()` が
-## "Bad file descriptor" で失敗するようになる。デーモンは起動直後から
-## `newIpcServer`（内部で `newAsyncSocket`）を使うため、もし `runDaemon` 自身が
-## 「まず asyncdispatch を使い始めてから、バックグラウンド化のために
-## `fork()`（daemonize）する」という順序を踏むと、この壊れた kqueue を抱えた
-## まま起動してしまう。
+## Reason (confirmed by measurement in practice on macOS; see also the
+## module doc comment on `tests/tipc.nim`): if `fork()` is called *after*
+## asyncdispatch has been touched even once (calling `newAsyncSocket` even
+## a single time initializes a global kqueue fd within the process), the
+## kqueue fd inherited by the child gets corrupted, and `accept()` inside
+## the child process starts failing with "Bad file descriptor". Since the
+## daemon uses `newIpcServer` (which internally calls `newAsyncSocket`)
+## right from startup, if `runDaemon` itself were to follow the order of
+## "start using asyncdispatch first, then `fork()` (daemonize) to go into
+## the background", it would end up starting with this corrupted kqueue in
+## tow.
 ##
-## そのため、デーモンのバックグラウンド化は **CLI 側**が
-## `platform/daemonize.spawnDetached()`（`execvp` で別の実行ファイルに置き換わる
-## ため、既存プロセスが asyncdispatch に触れていても影響を受けない）で行う設計に
-## なっている。このモジュールは、その `spawnDetached()` から（あるいは手動で）
-## 起動された「今のプロセスそのもの」がフォアグラウンドのまま動き続ける
-## `runDaemon()` だけを提供する。
+## For that reason, backgrounding the daemon is designed to be done by the
+## **CLI side** via `platform/daemonize.spawnDetached()` (this is
+## unaffected even if the existing process has touched asyncdispatch,
+## because `execvp` replaces it with a separate executable). This module
+## only provides `runDaemon()`, which keeps "the current process itself" --
+## whether started from that `spawnDetached()` or manually -- running in
+## the foreground.
 
 import std/[asyncdispatch, os, posix, times, monotimes, json, options, tables, strutils]
-import std/nativesockets ## `Port` の `$` / `==` を使うために必要
-                          ## （`core/types.nim` は `export Port` で型のみ
-                          ## 再輸出しているため。他モジュールと同じ理由）。
-import std/deques ## `ForwardStats.recentSources`（`Deque[SourceEntry]`）を
-                   ## `for` で回すために必要（`proxy/stats.nim` は型のみ export
-                   ## するため、`items` イテレータを使うにはここでの import が要る）。
+import std/nativesockets ## Needed to use `Port`'s `$` / `==`
+                          ## (because `core/types.nim` re-exports `Port` via
+                          ## `export Port` for the type only; same reason as
+                          ## in other modules).
+import std/deques ## Needed to iterate `ForwardStats.recentSources`
+                   ## (a `Deque[SourceEntry]`) with `for` (`proxy/stats.nim`
+                   ## exports the type only, so the `items` iterator needs
+                   ## this import here to be usable).
 
 import powarder/version
 import powarder/core/types
@@ -47,34 +54,37 @@ import powarder/ipc/protocol
 import powarder/proxy/upstream
 
 # ---------------------------------------------------------------------------
-# 定数
+# Constants
 # ---------------------------------------------------------------------------
 
 const
   daemonVersion* = powarderVersion
   exitAlreadyRunning* = 7
-    ## 多重起動時（ロックが既に他プロセスに保持されている）の終了コード。
-    ## CLI 側の「デーモンに到達できない」系の終了コードと合わせてある。
+    ## Exit code for a duplicate launch attempt (the lock is already held by
+    ## another process). Kept consistent with the CLI side's family of
+    ## "cannot reach the daemon" exit codes.
   defaultTickIntervalMs = 500
   defaultStateSaveIntervalMs = 5000
   logRotateIntervalMs = 60_000
-    ## ログローテーションのチェック間隔（M6）。毎 tick（500ms）ごとに全ログ
-    ## ファイルの `getFileSize` を呼ぶのは無駄なので、60秒に間引く
-    ## （`config/statefile` の状態保存の間引きと同じ考え方）。
+    ## Check interval for log rotation (M6). Calling `getFileSize` on every
+    ## log file on every tick (500ms) would be wasteful, so it is throttled
+    ## to 60 seconds (the same idea as the throttling of state saves in
+    ## `config/statefile`).
   isoFormat = "yyyy-MM-dd'T'HH:mm:sszzz"
-    ## `config/statefile.nim` の `savedAtFormat` と同じ書式（ISO8601 相当）。
+    ## The same format as `savedAtFormat` in `config/statefile.nim`
+    ## (equivalent to ISO8601).
 
 # ---------------------------------------------------------------------------
-# 型
+# Types
 # ---------------------------------------------------------------------------
 
 type
   DaemonOpts* = object
-    configPath*: string  ## 空なら configfile.findConfigFile()
-    socketPath*: string  ## 空なら paths.ipcSocketPath()
+    configPath*: string  ## If empty, uses configfile.findConfigFile()
+    socketPath*: string  ## If empty, uses paths.ipcSocketPath()
     activeProfiles*: seq[string]
-    tickIntervalMs*: int ## 既定 500
-    stateSaveIntervalMs*: int ## 既定 5000（毎 tick 保存すると I/O が無駄）
+    tickIntervalMs*: int ## Default 500
+    stateSaveIntervalMs*: int ## Default 5000 (saving on every tick would waste I/O)
 
   Daemon* = ref object
     opts*: DaemonOpts
@@ -83,51 +93,57 @@ type
     lock*: SingletonLock
     config*: ConfigFile
     startedAt*: MonoTime
-    startedAtWall*: times.Time ## `std/posix` も `Time` を export するため修飾する
+    startedAtWall*: times.Time ## Qualified because `std/posix` also exports `Time`
     shuttingDown*: bool
     reloadRequested*: bool
     lastStateSaveAt: MonoTime
-      ## 内部専用（テストからは触らない）。前回 `persistState` した時刻。
+      ## Internal-only (tests should not touch it). Timestamp of the last
+      ## `persistState` call.
     lastPersistedJson: string
-      ## 内部専用。前回保存した `PersistedState` の JSON 表現。
+      ## Internal-only. The JSON representation of the `PersistedState`
+      ## last saved.
       ##
-      ## **「reconcile が行動したら保存」では不十分**なので内容比較で判定する。
-      ## reconcile がホストを作った直後はまだ `spawnMaster` が走っていないため
-      ## `pid = 0` / `argv = @[]` であり、その状態を保存してしまうと
-      ## **adopt に必要な情報が欠けた記録**が残る（実際にこれで adopt が
-      ## `aoMismatch` になった）。pid が埋まるのは次の tick の `tickAll` の中だが、
-      ## そのとき reconcile は差分ゼロなので「行動あり」では検出できない。
-      ## 前回保存内容と実際に比べれば、pid や状態が変わった瞬間を取りこぼさない。
+      ## **"Save whenever reconcile takes an action" is not enough**, so
+      ## this is judged by comparing content instead. Right after reconcile
+      ## creates a host, `spawnMaster` has not run yet, so it is still
+      ## `pid = 0` / `argv = @[]`; saving that state would leave behind
+      ## **a record missing the information adopt needs** (this actually
+      ## caused adopt to end up as `aoMismatch`). The pid gets filled in
+      ## during the next tick's `tickAll`, but at that point reconcile sees
+      ## zero diff, so it cannot be detected via "an action was taken".
+      ## Comparing against what was actually saved last time means the
+      ## moment the pid or state changes is never missed.
     lastLogRotateAt: MonoTime
-      ## 内部専用（M6）。前回 `logstore.rotateAll` を呼んだ時刻。
+      ## Internal-only (M6). Timestamp of the last `logstore.rotateAll` call.
     adhocTunnels: Table[string, TunnelConfig]
-      ## 内部専用。`tunnel.create` で作られた、設定ファイルには存在しない
-      ## ad-hoc なトンネル定義。`desiredState()` は `config.tunnels` と
-      ## これを合わせたものを望ましい状態として `reconcile` に渡す。
+      ## Internal-only. Ad-hoc tunnel definitions created via
+      ## `tunnel.create` that do not exist in the config file.
+      ## `desiredState()` passes `config.tunnels` combined with these to
+      ## `reconcile` as the desired state.
 
 # ---------------------------------------------------------------------------
-# シグナル
+# Signals
 # ---------------------------------------------------------------------------
 #
-# `posix.onSignal` が生成するハンドラは素の signal handler（async-signal-safe
-# である必要がある）なので、ここでは bool フラグを立てるだけに留める。実際の
-# 後始末は 500ms のメインループがフラグを見て行う（self-pipe trick は不要）。
-# シングルトンロックによりプロセス内でデーモンは1つしか動かない前提なので、
-# モジュールレベルのグローバル変数で十分。
+# The handler generated by `posix.onSignal` is a bare signal handler (which
+# must be async-signal-safe), so here we limit ourselves to just setting a
+# bool flag. The actual cleanup is done by the 500ms main loop watching that
+# flag (no self-pipe trick needed). Since the singleton lock guarantees only
+# one daemon runs per process, a module-level global variable is sufficient.
 
 var
   signalShutdownRequested = false
   signalReloadRequested = false
 
 proc installSignalHandlers() =
-  ## `SIGTERM` / `SIGINT` → shutdown、`SIGHUP` → reload。
+  ## `SIGTERM` / `SIGINT` -> shutdown, `SIGHUP` -> reload.
   onSignal(SIGTERM, SIGINT):
     signalShutdownRequested = true
   onSignal(SIGHUP):
     signalReloadRequested = true
 
 # ---------------------------------------------------------------------------
-# 小さなヘルパー
+# Small helpers
 # ---------------------------------------------------------------------------
 
 proc secondsSince(t: MonoTime): int =
@@ -153,12 +169,12 @@ proc getStrParam(params: JsonNode; key: string; default = ""): string =
     default
 
 # ---------------------------------------------------------------------------
-# 望ましい状態 / 既知のトンネル
+# Desired state / known tunnels
 # ---------------------------------------------------------------------------
 
 proc desiredState(d: Daemon): DesiredState =
-  ## `config.tunnels` と ad-hoc トンネル（`tunnel.create`）を合わせたものを
-  ## reconcile に渡す望ましい状態にする。
+  ## Combines `config.tunnels` with ad-hoc tunnels (`tunnel.create`) into
+  ## the desired state passed to reconcile.
   var tunnels = d.config.tunnels
   for tc in d.adhocTunnels.values:
     tunnels.add tc
@@ -185,8 +201,9 @@ proc allKnownNames(d: Daemon): seq[string] =
       result.add name
 
 proc upsertConfigTunnel(d: Daemon; tc: TunnelConfig) =
-  ## `tunnel.up` が `config_path` で明示的に指定された別ファイルのトンネル定義を
-  ## 取り込むときに使う（同名は上書き）。
+  ## Used when `tunnel.up` pulls in a tunnel definition from a separate file
+  ## explicitly specified via `config_path` (an existing entry with the
+  ## same name is overwritten).
   for i in 0 ..< d.config.tunnels.len:
     if d.config.tunnels[i].name == tc.name:
       d.config.tunnels[i] = tc
@@ -194,7 +211,7 @@ proc upsertConfigTunnel(d: Daemon; tc: TunnelConfig) =
   d.config.tunnels.add tc
 
 # ---------------------------------------------------------------------------
-# 状態の永続化
+# State persistence
 # ---------------------------------------------------------------------------
 
 proc buildPersistedState(d: Daemon): PersistedState =
@@ -215,9 +232,10 @@ proc buildPersistedState(d: Daemon): PersistedState =
   PersistedState(version: 1, savedAt: "", hosts: hosts, forwards: forwards)
 
 proc persistState(d: Daemon) =
-  ## 保存はあくまでクラッシュ後の adopt（M6）を効率化するためのヒントに過ぎない
-  ## （`statefile.loadState` 自身が壊れたファイルを無視する設計）ので、保存に
-  ## 失敗してもデーモンは継続する。
+  ## Saving is ultimately nothing more than a hint to make adopt (M6) after
+  ## a crash more efficient (`statefile.loadState` itself is designed to
+  ## ignore a corrupted file), so the daemon keeps running even if the save
+  ## fails.
   try:
     ensureStateDirs()
     saveState(stateFile(), buildPersistedState(d))
@@ -225,16 +243,17 @@ proc persistState(d: Daemon) =
     discard
 
 # ---------------------------------------------------------------------------
-# 孤児マスターの adopt（M6）
+# Adopting orphan masters (M6)
 # ---------------------------------------------------------------------------
 
 proc logAdoptReport(report: AdoptReport) =
-  ## `adoptOrphans` の結果を起動時ログに出す。
+  ## Emits the result of `adoptOrphans` to the startup log.
   ##
-  ## **長い文字列は `&` を複数行にまたがず `msg.add` で組む。** nimpretty が
-  ## 行末の `&` を詰めて次行の `"..."` と地続きにすると、`&"..."` が
-  ## `strformat` の補間と解釈されてコンパイルエラーになることが実際にあった
-  ## （プロジェクトの申し送り事項）。
+  ## **Build long strings with `msg.add` rather than spanning `&` across
+  ## multiple lines.** There was an actual incident (a note carried over in
+  ## this project) where nimpretty collapsed a trailing `&` and the next
+  ## line's `"..."` together, causing `&"..."` to be parsed as a
+  ## `strformat` interpolation and fail to compile.
   var adopted = 0
   var deadReclaimed = 0
   var mismatch = 0
@@ -246,7 +265,7 @@ proc logAdoptReport(report: AdoptReport) =
     of aoMismatch: inc mismatch
     of aoNoSocket: inc noSocket
 
-  var msg = "powarder: 孤児マスターの adopt: "
+  var msg = "powarder: orphan master adopt: "
   msg.add "hosts_adopted=" & $adopted
   msg.add " hosts_dead_reclaimed=" & $deadReclaimed
   msg.add " hosts_mismatch=" & $mismatch
@@ -264,11 +283,13 @@ proc logAdoptReport(report: AdoptReport) =
 # ---------------------------------------------------------------------------
 
 proc doReload(d: Daemon): ReconcileReport =
-  ## 設定を再読込して reconcile する。`daemon.reload` ハンドラと、
-  ## `SIGHUP` 経由の `reloadRequested` フラグの両方から呼ばれる。
+  ## Reloads the config and reconciles. Called both from the
+  ## `daemon.reload` handler and from the `reloadRequested` flag via
+  ## `SIGHUP`.
   ##
-  ## 読み込みに失敗した場合は直前の設定を維持したまま warning だけ追加する
-  ## （`newDaemon` の起動時と同じ「設定ミスでデーモンが死なない」方針）。
+  ## If loading fails, keeps the previous config and just adds a warning
+  ## (the same "a config mistake must not kill the daemon" policy as at
+  ## `newDaemon` startup).
   var warnings: seq[string] = @[]
   try:
     let cfg = loadConfig(d.opts.configPath)
@@ -281,15 +302,17 @@ proc doReload(d: Daemon): ReconcileReport =
         stderr.writeLine("powarder: error: " & w)
       warnings.add w
   except ConfigError as e:
-    let msg = "warning: 設定の再読込に失敗しました。直前の設定を維持します: " & e.msg
+    let msg = "warning: failed to reload the config. Keeping the previous config: " & e.msg
     stderr.writeLine("powarder: " & msg)
     warnings.add msg
 
-  # **`(host, extraArgs)` → fingerprint のキャッシュを破棄する。**
-  # reload は「設定を読み直す」操作なので、`~/.ssh/config` の再評価もここで行う。
-  # これを呼ばないと「ssh_config を直して reload しても反映されない」という
-  # 分かりにくい挙動になる。既存の HostSession / Forward は破棄されず、
-  # fingerprint が変わったホストだけが Add/Remove の一般ロジックで入れ替わる。
+  # **Discard the `(host, extraArgs)` -> fingerprint cache.**
+  # Since reload is a "re-read the config" operation, the re-evaluation of
+  # `~/.ssh/config` is also done here. Without this call, editing
+  # ssh_config and reloading would not take effect -- a confusing
+  # behavior. Existing HostSession / Forward instances are not discarded;
+  # only hosts whose fingerprint changed get swapped out via the general
+  # Add/Remove logic.
   d.reg.clearHostKeyCache()
 
   result = reconcile(d.desiredState(), d.reg)
@@ -297,14 +320,15 @@ proc doReload(d: Daemon): ReconcileReport =
     result.warnings.insert(w, 0)
 
 # ---------------------------------------------------------------------------
-# tunnel.list / tunnel.inspect 用の JSON 組み立て
+# JSON assembly for tunnel.list / tunnel.inspect
 # ---------------------------------------------------------------------------
 
 proc forwardUptimeSeconds(fw: Forward): JsonNode =
-  ## `fkLocal`: リスナー（`proxy.stats`）が最初に起動した時刻から。
-  ## `fkRemote`（や、まだプロキシが無い `fkLocal`）: 所属マスターが最後に
-  ## 接続確立した時刻を代わりに使う（fkRemote は powarder 自身の
-  ## 「いつから active か」の記録を持たないための近似）。
+  ## `fkLocal`: from the time the listener (`proxy.stats`) first started.
+  ## `fkRemote` (or `fkLocal` before it has a proxy yet): uses instead the
+  ## time the owning master last established a connection (an
+  ## approximation, since fkRemote has no record of its own for "how long
+  ## has it been active").
   let st = stats(fw)
   if st.isSome:
     %secondsSince(st.get.startedAtMono)
@@ -325,8 +349,9 @@ proc tunnelEntryFromForward(fw: Forward): JsonNode =
 
   let st = stats(fw)
   if st.isSome:
-    # ★ -R は統計が原理的に取れない（プロキシを挟めないため）ので、この分岐に
-    # 入らず下の else で4項目すべて null になる。CLI 側はそれを見て "-" と表示する。
+    # IMPORTANT: -R fundamentally cannot have statistics (no proxy can be
+    # interposed), so it never enters this branch; below in the else, all
+    # four fields end up null. The CLI side sees that and displays "-".
     let s = st.get
     result["conns"] = %s.activeConns
     result["total_conns"] = %s.totalConns
@@ -344,14 +369,17 @@ proc tunnelEntryFromForward(fw: Forward): JsonNode =
   result["last_error"] = (if fw.lastError.len > 0: %fw.lastError else: newJNull())
 
 proc tunnelEntryFromConfig(tc: TunnelConfig): JsonNode =
-  ## live な `Forward` が registry に無いトンネル（無効化されている、または
-  ## enable されたばかりで reconcile がまだ追いついていない）の表示用エントリ。
+  ## Display entry for a tunnel that has no live `Forward` in the registry
+  ## (either it is disabled, or it was just enabled and reconcile hasn't
+  ## caught up to it yet).
   ##
-  ## **`state` には常に本物の `ForwardState` の文字列だけを入れる**
-  ## （CLI 側が `state` を enum としてパースしても壊れないようにするため）。
-  ##「無効化されている」という情報は自由記述の `status`（"stopped"）側で表現する。
-  ## `ForwardState` に「無効化済み」を表す値が無いのが本質的な理由なので、
-  ## `core/types.ForwardState` へ専用の値を足すことを報告で提案する。
+  ## **`state` must always hold only a genuine `ForwardState` string**
+  ## (so that the CLI side does not break even if it parses `state` as an
+  ## enum). The fact that it is "disabled" is instead expressed via the
+  ## free-form `status` field ("stopped"). The underlying reason is that
+  ## `ForwardState` has no value representing "disabled", so this is
+  ## flagged as a suggestion to add a dedicated value to
+  ## `core/types.ForwardState`.
   result = newJObject()
   result["name"] = %tc.name
   result["type"] = %tc.spec.kind
@@ -369,7 +397,7 @@ proc tunnelEntryFromConfig(tc: TunnelConfig): JsonNode =
   result["last_error"] = newJNull()
 
 # ---------------------------------------------------------------------------
-# RPC ハンドラ
+# RPC handlers
 # ---------------------------------------------------------------------------
 
 proc handleDaemonPing(d: Daemon; params: JsonNode): JsonNode =
@@ -396,8 +424,8 @@ proc handleDaemonReload(d: Daemon; params: JsonNode): JsonNode =
       "tunnels": d.config.tunnels.len}
 
 proc handleDaemonShutdown(d: Daemon; params: JsonNode): JsonNode =
-  ## フラグを立てるだけ。実際の graceful shutdown はメインループが抜けた後、
-  ## `runDaemon` が行う。
+  ## Just sets a flag. The actual graceful shutdown is performed by
+  ## `runDaemon` after the main loop exits.
   d.shuttingDown = true
   %*{"ok": true}
 
@@ -414,7 +442,8 @@ proc handleTunnelList(d: Daemon; params: JsonNode): JsonNode =
     if fws.len > 0:
       result.add tunnelEntryFromForward(fws[0])
     else:
-      # enabled になった直後で reconcile がまだ Forward を作っていない一瞬の状態。
+      # A momentary state right after being enabled, where reconcile has
+      # not created the Forward yet.
       result.add tunnelEntryFromConfig(tc)
 
 proc handleTunnelInspect(d: Daemon; params: JsonNode): JsonNode =
@@ -461,9 +490,10 @@ proc handleTunnelInspect(d: Daemon; params: JsonNode): JsonNode =
 proc handleTunnelUp(d: Daemon; params: JsonNode): JsonNode =
   let names = getStrArray(params, "names")
   if params != nil and params.hasKey("profiles") and params["profiles"].kind == JArray:
-    # `up` は「このセッションで有効にするプロファイル集合」を確定させる操作
-    # （docker compose の `--profile` と同じ発想）なので、以後の reconcile
-    # （メインループやこの後の `reconcile` 呼び出し）にも効くよう永続化する。
+    # `up` is an operation that fixes "the set of profiles active for this
+    # session" (the same idea as docker compose's `--profile`), so it is
+    # persisted to also take effect on subsequent reconciles (the main
+    # loop and any later `reconcile` calls).
     d.opts.activeProfiles = getStrArray(params, "profiles")
 
   let configPathOverride = getStrParam(params, "config_path")
@@ -474,7 +504,7 @@ proc handleTunnelUp(d: Daemon; params: JsonNode): JsonNode =
         d.upsertConfigTunnel(tc)
     except ConfigError as e:
       raise newRpcError(errConfigInvalid,
-          "config_path の読み込みに失敗しました: " & e.msg)
+          "failed to load config_path: " & e.msg)
 
   var targetNames = names
   if targetNames.len == 0:
@@ -517,9 +547,11 @@ proc handleTunnelDown(d: Daemon; params: JsonNode): JsonNode =
   discard reconcile(d.desiredState(), d.reg)
 
   if immediate:
-    # 参照が無くなったホストの idle grace period（既定25秒）を待たず、今すぐ
-    # マスターを畳む。他の `down` 対象外のホストで既に refCount == 0 のものにも
-    # 一律に効くが、そのようなホストはどのみち自然に停止する定めなので実害は無い。
+    # Tear down the master right now instead of waiting for the idle grace
+    # period (default 25 seconds) on hosts whose references have dropped to
+    # zero. This also applies uniformly to hosts outside this `down`
+    # target that already have refCount == 0, but that causes no real harm
+    # since such hosts are destined to stop naturally anyway.
     for hs in d.reg.hosts.values:
       if refCount(hs) == 0:
         requestStop(hs, immediate = true)
@@ -560,7 +592,7 @@ proc handleTunnelRestart(d: Daemon; params: JsonNode): JsonNode =
     setEnabled(d.reg, name, true)
     for fw in forwardsOfTunnel(d.reg, name):
       if fw.state != fwDetaching:
-        requestDetach(fw) ## 次の reconcile で除去 -> 作り直しのサイクルに乗る
+        requestDetach(fw) ## Rides the next reconcile's remove -> recreate cycle
   discard reconcile(d.desiredState(), d.reg)
   %*{"restarted": names}
 
@@ -617,33 +649,37 @@ proc handleTunnelCheck(d: Daemon; params: JsonNode): JsonNode =
   for name in names:
     let fws = forwardsOfTunnel(d.reg, name)
     var ok = false
-    var detail = "登録されていません"
+    var detail = "not registered"
     if fws.len > 0:
       let fw = fws[0]
       ok = fw.state == fwActive
       detail =
-        if ok: fw.spec.bindAddr & ":" & $fw.spec.bindPort & " で接続を受け付けています"
+        if ok: fw.spec.bindAddr & ":" & $fw.spec.bindPort & " is accepting connections"
         elif fw.lastError.len > 0: fw.lastError
         else: describeState(fw)
 
-      # probe=true のときだけ Tier2 の実プローブを行う（既定では行わない。
-      # `proxy/upstream.probeUpstream` の doc comment の通り、OpenSSH の
-      # `channel_post_port_listener` が accept 直後に宛先へ実接続してしまうため）。
-      # `fkRemote` は powarder がデータパスに介在しないためプローブできない。
+      # Only run the actual Tier2 probe when probe=true (not run by
+      # default: as noted in the doc comment on
+      # `proxy/upstream.probeUpstream`, OpenSSH's
+      # `channel_post_port_listener` makes a real connection to the
+      # destination right after accept). `fkRemote` cannot be probed since
+      # powarder never sits in its data path.
       if probe and ok and fw.spec.kind == fkLocal:
         let probeFut = probeUpstream(fw.upstream)
-        # RpcHandler は同期 proc なので、ここだけは `waitFor` で同期・非同期の
-        # 境界を跨ぐ（`tick()` 系とは異なり、これは async ループの実行中に別の
-        # Future の完了を待つ「ネストした waitFor」ではなく、単発の同期呼び出しから
-        # 一度だけ async 処理へ橋渡しする使い方）。無応答で無限に止まらないよう
-        # `withTimeout` で上限を設ける。
+        # RpcHandler is a synchronous proc, so this is the one place that
+        # crosses the sync/async boundary via `waitFor` (unlike the
+        # `tick()` family, this is not a "nested waitFor" waiting on
+        # another Future while an async loop is already running, but a
+        # single one-off bridge from a synchronous call into async
+        # processing). A `withTimeout` caps how long we wait, so an
+        # unresponsive probe cannot stall this forever.
         let completed =
           try: waitFor(withTimeout(probeFut, 3000))
           except CatchableError: false
         let reachable = completed and (try: probeFut.read() except CatchableError: false)
         ok = reachable
         if not reachable:
-          detail = "Tier2 プローブに失敗しました（宛先に到達できません）"
+          detail = "Tier2 probe failed (destination unreachable)"
     result.add %*{"name": name, "ok": ok, "detail": detail}
 
 proc handleHostList(d: Daemon; params: JsonNode): JsonNode =
@@ -690,19 +726,22 @@ proc registerHandlers(d: Daemon) =
   d.server.register(mHostList, proc(p: JsonNode): JsonNode = handleHostList(d, p))
 
 # ---------------------------------------------------------------------------
-# 構築
+# Construction
 # ---------------------------------------------------------------------------
 
 proc newDaemon*(opts: DaemonOpts): Daemon =
-  ## 起動シーケンスのうち**ロック取得を除く**全て（設定読み込み・状態読み込み・
-  ## registry 生成・IPC サーバ生成・ハンドラ登録）を行う。
+  ## Performs everything in the startup sequence **except acquiring the
+  ## lock** (config loading, state loading, registry creation, IPC server
+  ## creation, handler registration).
   ##
-  ## **ロックはここでは取得しない。** `runDaemon` は「ロックが取れなければ
-  ## `Daemon` を構築すること自体を諦めて終了コード7で抜ける」という分岐が
-  ## 必要（`newIpcServer` や `ensureRuntimeDir` などは無関係に、多重起動を
-  ## 検出したら即座に何も作らず抜けたい）ため、ロック取得の責務は `runDaemon`
-  ## 側に置く。テストから `newDaemon` を単体で呼ぶ場合、`result.lock` は
-  ## 未取得のダミー値（`fd: -1`）になる（`shutdown` はこれを見て何もしない）。
+  ## **The lock is not acquired here.** `runDaemon` needs the branch "if the
+  ## lock cannot be acquired, give up on constructing a `Daemon` at all and
+  ## exit with code 7" (regardless of `newIpcServer`, `ensureRuntimeDir`,
+  ## etc., we want to detect a duplicate launch and exit immediately without
+  ## creating anything), so the responsibility of acquiring the lock is
+  ## placed on `runDaemon`'s side. When `newDaemon` is called standalone
+  ## from a test, `result.lock` becomes an unacquired dummy value
+  ## (`fd: -1`) (`shutdown` sees this and does nothing).
   ensureRuntimeDir()
   ensureStateDirs()
 
@@ -719,18 +758,22 @@ proc newDaemon*(opts: DaemonOpts): Daemon =
       else:
         stderr.writeLine("powarder: error: " & w)
   except ConfigError as e:
-    # 設定ミスでデーモンが上がらないより、空設定で上がって `ps` 等で状況が
-    # 見える方が良い、という方針（`config/statefile.loadState` と同じ発想）。
-    stderr.writeLine("powarder: warning: 設定ファイルの読み込みに失敗しました。空の設定で起動します: " & e.msg)
+    # A policy of "better to come up with an empty config so the situation
+    # is visible via `ps` etc. than to have a config mistake keep the
+    # daemon from coming up at all" (the same idea as
+    # `config/statefile.loadState`).
+    stderr.writeLine("powarder: warning: failed to load the config file. Starting with an empty config: " & e.msg)
     cfg = defaultConfig()
 
   let persisted = loadState(stateFile())
   let reg = newRegistry()
-  # 孤児マスター/forward の adopt（M6）。`newIpcServer`（asyncdispatch）より
-  # 前でも後でも問題は無い（`runDaemon` は fork() を一切しない設計なので、
-  # asyncdispatch に触れた後に fork するケースの kqueue 破損は起こらない。
-  # `daemon/run.nim` モジュール doc comment の「★最重要の制約」を参照）が、
-  # 「前回の記録を読み込んだ直後」という意味的な位置としてここに置く。
+  # Adopting orphan masters/forwards (M6). It does not matter whether this
+  # runs before or after `newIpcServer` (asyncdispatch) -- `runDaemon` is
+  # designed to never call fork() at all, so the kqueue corruption that
+  # happens when forking after touching asyncdispatch cannot occur here
+  # (see the "IMPORTANT constraint" in the module doc comment on
+  # `daemon/run.nim`) -- but it is placed here for the semantic reason of
+  # being "right after loading the previous record".
   logAdoptReport(adoptOrphans(reg, persisted))
 
   let sockPath = if opts.socketPath.len >
@@ -762,11 +805,11 @@ proc newDaemon*(opts: DaemonOpts): Daemon =
   registerHandlers(result)
 
 # ---------------------------------------------------------------------------
-# メインループ
+# Main loop
 # ---------------------------------------------------------------------------
 
 proc syncSignalFlags(d: Daemon) =
-  ## シグナルハンドラがセットしたグローバルフラグを `Daemon` へ反映する。
+  ## Reflects the global flags set by the signal handler into `Daemon`.
   if signalShutdownRequested:
     d.shuttingDown = true
   if signalReloadRequested:
@@ -774,11 +817,12 @@ proc syncSignalFlags(d: Daemon) =
     d.reloadRequested = true
 
 proc tickOnce*(d: Daemon): Future[ReconcileReport] {.async.} =
-  ## メインループの1イテレーション分だけを進める公開 proc。
+  ## Public proc that advances just one iteration of the main loop.
   ##
-  ## テスタビリティのために `mainLoop`（`await sleepAsync` を含む無限ループ）
-  ## から本体を切り出した。テストはこれを直接・繰り返し呼ぶことで
-  ## 「デーモンのループを実際に回さずに、進行だけを数回分再現する」ことができる。
+  ## Split out from `mainLoop` (the infinite loop containing
+  ## `await sleepAsync`) for testability. Tests can call this directly and
+  ## repeatedly to "replay just a few steps of progress without actually
+  ## running the daemon's loop".
   syncSignalFlags(d)
 
   result = ReconcileReport(actions: @[], warnings: @[])
@@ -793,30 +837,35 @@ proc tickOnce*(d: Daemon): Future[ReconcileReport] {.async.} =
   for w in r2.warnings:
     result.warnings.add(w)
 
-  # 状態の永続化。`state.json` は **クラッシュ後に孤児マスターを adopt する
-  # ための唯一の手がかり**（`-O` には「現在張られている forward の一覧」を
-  # 返すサブコマンドが無いため）なので、記録が残る前にクラッシュすると
-  # adopt できず、生きている孤児マスターを見逃してしまう。
+  # State persistence. `state.json` is **the only clue for adopting orphan
+  # masters after a crash** (since `-O` has no subcommand that returns "the
+  # list of forwards currently attached"), so if the daemon crashes before
+  # the record is saved, adopt cannot happen and a live orphan master gets
+  # missed.
   #
-  # **「reconcile が行動したら保存」では取りこぼす。** reconcile がホストを
-  # 作った直後はまだ `spawnMaster` が走っておらず `pid = 0` / `argv = @[]` で、
-  # その欠けた記録を保存してしまう。pid が埋まるのは次の tick の `tickAll` の
-  # 中だが、そのとき reconcile は差分ゼロなので行動として現れない。
-  # 実際にこれで adopt が `aoMismatch` になった（pid=0 のプロセスは存在しない）。
+  # **"Save whenever reconcile takes an action" misses cases.** Right after
+  # reconcile creates a host, `spawnMaster` has not run yet, so it is still
+  # `pid = 0` / `argv = @[]`, and that incomplete record would get saved.
+  # The pid gets filled in during the next tick's `tickAll`, but at that
+  # point reconcile sees zero diff, so it does not show up as "an action
+  # was taken". This actually caused adopt to end up as `aoMismatch` (no
+  # process exists for pid=0).
   #
-  # よって**前回保存した内容と実際に比較して、変わっていれば保存する**。
-  # 変化が無い tick では書かないので I/O は増えない。定期保存も保険として残す。
+  # So **compare against what was actually saved last time, and save only
+  # if it changed**. Ticks with no change do not write, so I/O does not
+  # increase. The periodic save is also kept as a safety net.
   let snapshot = buildPersistedState(d)
-  let snapshotJson = $(%snapshot) ## savedAt は buildPersistedState が "" にするので比較に影響しない
+  let snapshotJson = $(%snapshot) ## savedAt does not affect the comparison since buildPersistedState sets it to ""
   if snapshotJson != d.lastPersistedJson or
       secondsSince(d.lastStateSaveAt) * 1000 >= d.opts.stateSaveIntervalMs:
     d.persistState()
     d.lastPersistedJson = snapshotJson
     d.lastStateSaveAt = getMonoTime()
 
-  # ログローテーション（M6）。毎 tick（既定 500ms）ごとに全ログファイルの
-  # `getFileSize` を呼ぶのは無駄なので、`logRotateIntervalMs`（60秒）に
-  # 間引く（`lastStateSaveAt` と同じ間引きパターン）。
+  # Log rotation (M6). Calling `getFileSize` on every log file on every
+  # tick (default 500ms) would be wasteful, so it is throttled to
+  # `logRotateIntervalMs` (60 seconds) (the same throttling pattern as
+  # `lastStateSaveAt`).
   if secondsSince(d.lastLogRotateAt) * 1000 >= logRotateIntervalMs:
     discard rotateAll(logsDir())
     d.lastLogRotateAt = getMonoTime()
@@ -829,21 +878,23 @@ proc mainLoop(d: Daemon) {.async.} =
     await sleepAsync(d.opts.tickIntervalMs)
 
 # ---------------------------------------------------------------------------
-# 終了
+# Shutdown
 # ---------------------------------------------------------------------------
 
 proc shutdown*(d: Daemon) =
-  ## graceful shutdown。
+  ## Graceful shutdown.
   ##
-  ## **async ループが完全に停止した後に呼ぶこと。** `reg.teardownAll()` は
-  ## 内部で `waitFor` を使う（`forward.teardown` / `hostsession.teardown` の
-  ## doc comment を参照）ため、`tick` が回っている最中（async ループの実行中）
-  ## に呼ぶとイベントループ内で `waitFor` がネストしてしまう。
+  ## **Call this only after the async loop has fully stopped.**
+  ## `reg.teardownAll()` internally uses `waitFor` (see the doc comment on
+  ## `forward.teardown` / `hostsession.teardown`), so calling it while
+  ## `tick` is still running (i.e. while the async loop is executing) would
+  ## nest `waitFor` inside the event loop.
   ##
-  ## 手順: 1. IPC サーバを閉じる（accept を止める）→ 2. `teardownAll`
-  ## （Forward を先に、HostSession を後に片付ける） → 3. 最終状態の保存 →
-  ## 4. ロック解放（ロックファイル自体の削除も行う。`server.close()` が
-  ## ソケットファイルの削除まで面倒を見てくれるのと対にしている）。
+  ## Steps: 1. Close the IPC server (stop accepting) -> 2. `teardownAll`
+  ## (clean up Forward first, then HostSession) -> 3. Save the final state
+  ## -> 4. Release the lock (this also removes the lock file itself,
+  ## mirroring how `server.close()` takes care of removing the socket
+  ## file).
   if d.server != nil:
     try: d.server.close()
     except CatchableError: discard
@@ -861,33 +912,35 @@ proc shutdown*(d: Daemon) =
       removeFile(lockPathToRemove)
 
 # ---------------------------------------------------------------------------
-# 公開エントリポイント
+# Public entry point
 # ---------------------------------------------------------------------------
 
 proc runDaemon*(opts = DaemonOpts()): int =
-  ## フォアグラウンドで動く。終了コードを返す。**`daemonize()` は絶対に
-  ## 呼ばない**（モジュール doc comment の「★最重要の制約」を参照）。
+  ## Runs in the foreground. Returns an exit code. **Never call
+  ## `daemonize()`** (see the "IMPORTANT constraint" in the module doc
+  ## comment).
   ##
-  ## 起動シーケンス（順序が重要）:
+  ## Startup sequence (order matters):
   ## 1. `ensureRuntimeDir` / `ensureStateDirs`
-  ## 2. シングルトンロックの取得。取れなければ終了コード `exitAlreadyRunning`(7)。
-  ##    取れたら `writePid`。**`writePid` は取得済みの fd をそのまま使う実装**
-  ##    （`platform/lock.nim` の doc comment 参照: POSIX の fcntl ロックは
-  ##    (プロセス, inode) 単位なので、同じファイルを別 fd で開き直して close
-  ##    すると、そのプロセスが持つ当該ファイルへの全ロックが解放されてしまう。
-  ##    そのため `writePid` はロック取得に使った fd を再利用する設計になっている
-  ##    ―― ここで新たに `open()` し直してはいけない）。
-  ## 3〜6. `newDaemon`（設定 / 状態 / registry / IPC サーバ）
-  ## 7. シグナルハンドラ登録
-  ## 8. メインループを async で回す
+  ## 2. Acquire the singleton lock. If it cannot be acquired, exit code
+  ##    `exitAlreadyRunning` (7). If acquired, `writePid`. **`writePid` is
+  ##    implemented to reuse the already-acquired fd as-is** (see the doc
+  ##    comment on `platform/lock.nim`: a POSIX fcntl lock is keyed on
+  ##    (process, inode), so reopening the same file under a different fd
+  ##    and closing it would release every lock this process holds on that
+  ##    file. That is why `writePid` is designed to reuse the fd used to
+  ##    acquire the lock -- do not `open()` it anew here).
+  ## 3-6. `newDaemon` (config / state / registry / IPC server)
+  ## 7. Register signal handlers
+  ## 8. Run the main loop as async
   ensureRuntimeDir()
   ensureStateDirs()
 
   let lockFilePath = lockPath()
   let gotLock = tryAcquireSingletonLock(lockFilePath)
   if gotLock.isNone:
-    stderr.writeLine("powarder: すでにデーモンが起動しています（ロック: " &
-        lockFilePath & "）")
+    stderr.writeLine("powarder: the daemon is already running (lock: " &
+        lockFilePath & ")")
     return exitAlreadyRunning
 
   let acquiredLock = gotLock.get
@@ -900,29 +953,33 @@ proc runDaemon*(opts = DaemonOpts()): int =
 
     installSignalHandlers()
 
-    # `serve()` の accept ループと `mainLoop()` を同時に走らせる必要がある。
+    # `serve()`'s accept loop and `mainLoop()` need to run at the same time.
     #
-    # **選択**: `asyncCheck serve(d.server)` で accept ループをバックグラウンド
-    # タスクとして登録してから `waitFor mainLoop(d)` する形にした。
-    # 理由: asyncdispatch はシングルスレッドの協調的ディスパッチャ1つを
-    # プロセス全体で共有するので、`serve()` が await で止まっている間も、
-    # 同じディスパッチャ上で動く `mainLoop` 側の `sleepAsync` の完了や、IPC
-    # クライアントからの新規接続はどちらも通常どおり処理される（Future 同士を
-    # 手で組み合わせる `waitFor(a and b)` のような形は、`std/asyncdispatch` に
-    # 標準の `and` 演算子が無く、`serve()` がそもそも `close()` されるまで
-    # 完了しない Future であるため「両方が終わるのを待つ」という組み合わせ方
-    # 自体がこの用途に合わない）。`serve()` が `close()` 経由の正常終了以外の
-    # 理由で失敗したときは `asyncCheck` の仕組みにより次の `poll()`（＝
-    # `waitFor mainLoop(d)` の内部ループ）で例外が再送出され、デーモンは
-    # `mainLoop` ごと異常終了する。これは「IPC 層が壊れた」ことを示す状況で
-    # あり、揉み消さずに気付けるようにするための意図的な挙動。
+    # **Choice made**: register the accept loop as a background task with
+    # `asyncCheck serve(d.server)`, then `waitFor mainLoop(d)`.
+    # Reason: asyncdispatch shares a single, single-threaded cooperative
+    # dispatcher across the whole process, so while `serve()` is suspended
+    # on an await, both the completion of `mainLoop`'s `sleepAsync` and new
+    # connections from IPC clients -- running on that same dispatcher --
+    # are still processed as usual (a form that manually combines Futures,
+    # like `waitFor(a and b)`, does not fit this use case: `std/asyncdispatch`
+    # has no built-in `and` operator, and `serve()` is a Future that never
+    # completes until `close()` is called in the first place, so "wait for
+    # both to finish" is not a combination that makes sense here). If
+    # `serve()` fails for a reason other than a normal close via `close()`,
+    # the `asyncCheck` mechanism re-raises the exception at the next
+    # `poll()` (i.e. inside `waitFor mainLoop(d)`'s internal loop), and the
+    # daemon terminates abnormally along with `mainLoop`. This indicates a
+    # situation where "the IPC layer is broken", and it is a deliberate
+    # behavior meant to surface that rather than paper over it.
     asyncCheck serve(d.server)
     waitFor mainLoop(d)
   finally:
     if d != nil:
       shutdown(d)
     else:
-      # `newDaemon` 自体が例外を投げた場合でも、取得済みのロックは必ず解放する。
+      # Even if `newDaemon` itself throws, always release the lock we
+      # already acquired.
       acquiredLock.release()
       removeFile(lockFilePath)
 

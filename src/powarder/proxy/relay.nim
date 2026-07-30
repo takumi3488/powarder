@@ -1,19 +1,20 @@
-## クライアントソケットと上流ソケットの間の双方向バイト中継。
+## Bidirectional byte relay between the client socket and the upstream socket.
 
 import std/asyncdispatch
 import std/asyncnet
 
 const
-  RelayBufSize* = 16384 ## SSH チャネルの1メッセージ最大ペイロードが概ね 16KB のため
+  RelayBufSize* = 16384 ## Because an SSH channel's max payload per message is roughly 16KB
 
 proc pump(src, dst: AsyncSocket; buf: pointer; bufLen: int;
           onBytes: proc (n: int) {.closure, gcsafe.}) {.async.} =
-  ## `src` から読んで `dst` へそのまま流す片方向ループ。
+  ## A one-way loop that reads from `src` and streams it straight to `dst`.
   ##
-  ## `recvInto` は切断されていてデータが無い場合に例外を投げず `0` を返す。
-  ## さらに既定フラグ `{SocketFlag.SafeDisconn}` では `ECONNRESET` / `EPIPE` /
-  ## `ENETRESET` も EOF 相当（`0`）として扱われるため、`if n <= 0: break` だけで
-  ## 正常系・異常切断系の両方をカバーできる。
+  ## `recvInto` returns `0` rather than raising an exception when the
+  ## connection is closed and there is no data. Furthermore, with the
+  ## default flag `{SocketFlag.SafeDisconn}`, `ECONNRESET` / `EPIPE` /
+  ## `ENETRESET` are also treated as EOF-equivalent (`0`), so `if n <= 0:
+  ## break` alone covers both the normal case and abnormal disconnects.
   while true:
     let n = await src.recvInto(buf, bufLen)
     if n <= 0: break
@@ -22,22 +23,26 @@ proc pump(src, dst: AsyncSocket; buf: pointer; bufLen: int;
 
 proc relay*(client, upstream: AsyncSocket;
             onRx, onTx: proc (n: int) {.closure, gcsafe.}) {.async.} =
-  ## `client` <-> `upstream` を中継する。片方が EOF になったら両方閉じる
-  ## （half-close は扱わない。SSH のポートフォワード越しで half-close を
-  ## 活かすアプリはほぼ無く、コードが大幅に単純になるため）。
+  ## Relays `client` <-> `upstream`. Closes both as soon as either side
+  ## hits EOF (half-close is not handled: almost no application makes use
+  ## of half-close over an SSH port forward, and this keeps the code much
+  ## simpler).
   ##
-  ## `recvInto`（string を返す `recv` ではなく）+ 接続の生存期間中つかい回す
-  ## 事前確保バッファを使い、毎回のアロケーションを避ける。
+  ## Uses `recvInto` (rather than `recv`, which returns a string) plus a
+  ## pre-allocated buffer reused for the lifetime of the connection, to
+  ## avoid allocating on every call.
   var bufA = newString(RelayBufSize)
   var bufB = newString(RelayBufSize)
   let c2u = pump(client, upstream, addr bufA[0], RelayBufSize, onRx)
   let u2c = pump(upstream, client, addr bufB[0], RelayBufSize, onTx)
   await c2u or u2c
-  # AsyncSocket.close() は冪等（`if socket.closed: return`）なので二重 close も安全。
+  # AsyncSocket.close() is idempotent (`if socket.closed: return`), so a
+  # double close is safe too.
   client.close()
   upstream.close()
-  # 片方が終わった後、もう一方の Future を放置すると未処理 Future の警告が
-  # 出るので、close() 後に明示的に await し、例外は握りつぶす。
+  # If the other Future is left unattended after one side finishes, an
+  # unhandled Future warning appears, so explicitly await it after close()
+  # and swallow any exception.
   try: await c2u
   except CatchableError: discard
   try: await u2c

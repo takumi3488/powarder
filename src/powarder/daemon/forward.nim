@@ -1,52 +1,63 @@
-## 個々のポートフォワード1本のライフサイクル管理。
+## Lifecycle management for a single port forward.
 ##
-## powarder は「1ホスト = 1つの長命マスター」(`daemon/hostsession`) を維持し、
-## 個々のフォワードはそのマスターに `-O forward` で後付けする
-## (`daemon/muxclient`)。**`fkLocal`（`-L`）では ssh に UDS を張らせ、
-## ユーザー指定ポートは powarder 自身が listen してその UDS へ中継する**
-## (`proxy/listener`)。このモジュールは上記2つを繋ぐ層であり、
+## powarder maintains "1 host = 1 long-lived master" (`daemon/hostsession`),
+## and each forward is attached to that master afterward via `-O forward`
+## (`daemon/muxclient`). **For `fkLocal` (`-L`), ssh is made to bind a UDS,
+## and powarder itself listens on the user-specified port and relays to
+## that UDS** (`proxy/listener`). This module is the layer that connects
+## the above two,
 ##
 ## ```
-## クライアント → [powarder が listen] → [ssh が listen: UDS] → 踏み台 → 宛先
+## client -> [powarder listens] -> [ssh listens: UDS] -> jump host -> destination
 ## ```
 ##
-## の構図のうち「ssh 側に forward を張る/外す」と「powarder 側のリスナーを
-## 起動する/閉じる」を1本の `Forward` として一体管理する。
+## and it manages, as a single `Forward`, both "attaching/detaching the
+## forward on the ssh side" and "starting/closing the powarder-side
+## listener" from the picture above.
 ##
-## **状態遷移の判断はすべて `core/statemachine` に委譲する。** ここでは
-## `nextForwardState` / `healthVerdict` / `isDiscard` の適用結果をそのまま
-## 反映するだけで、独自の if 文で遷移条件を書き直すことはしない。
+## **All state-transition decisions are delegated to `core/statemachine`.**
+## Here we just apply the results of `nextForwardState` / `healthVerdict` /
+## `isDiscard` as-is; we never rewrite transition conditions with our own
+## if statements.
 ##
-## ## 同期 / 非同期
+## ## Sync / async
 ##
-## `tick()` は `daemon/hostsession.tick` と同じ理由で**同期関数**にする
-## （デーモンは 500ms ループから両方を呼ぶ）。一方 `proxy/listener.serve()` は
-## async proc なので、その `Future[void]` は `proxyTask` に保持し、`close()` の
-## 後に回収（読み取り）する。`tick` 内で Future の完了を待つ必要が生じても
-## `waitFor` は使わない（イベントループ内からのネストになり得るため）。
-## 未完了なら何もせず次回の `tick` に持ち越す（ポーリング）。
+## `tick()` is made a **synchronous function**, for the same reason as
+## `daemon/hostsession.tick` (the daemon calls both from its 500ms loop).
+## On the other hand `proxy/listener.serve()` is an async proc, so its
+## `Future[void]` is held in `proxyTask` and collected (read) after
+## `close()`. Even if we need to wait for the Future's completion inside
+## `tick`, we never use `waitFor` (it could end up nested inside the event
+## loop). If it isn't finished yet, do nothing and carry it over to the
+## next `tick` (polling).
 ##
-## `teardown()` だけは例外的に `waitFor` を使う同期関数にする。**これは
-## デーモンの async ループが完全に停止した後に呼ばれる前提**
-## （`daemon/hostsession.teardown` と同じ制約）。tick が回っている最中に
-## `teardown` を呼んではいけない。
+## `teardown()` alone is, as an exception, a synchronous function that
+## uses `waitFor`. **This is premised on being called after the daemon's
+## async loop has fully stopped** (the same constraint as
+## `daemon/hostsession.teardown`). Never call `teardown` while `tick` is
+## still running.
 ##
-## ## ヘルスチェック: Tier 3 が主体
+## ## Health check: Tier 3 is the primary mechanism
 ##
-## 定期プローブ（Tier 2、`proxy/upstream.probeUpstream` を周期実行する方式）は
-## デフォルトで行わない。`probeUpstream` は OpenSSH の
-## `channel_post_port_listener()` の実装上、宛先への実接続を必ず発生させて
-## しまうため、定期実行すると宛先の接続ログにノイズを撒き続けることになる。
+## Periodic probing (Tier 2, the approach of running
+## `proxy/upstream.probeUpstream` on a cycle) is not done by default.
+## Because of how OpenSSH's `channel_post_port_listener()` is implemented,
+## `probeUpstream` always causes a real connection to the destination, so
+## running it periodically would keep polluting the destination's
+## connection logs with noise.
 ##
-## 代わりに **Tier 3（実トラフィックの副産物）** を使う: `proxy/stats` の
-## `failedConns` が前回 tick から増えていたら、実際のクライアント接続が上流に
-## 繋がらなかったということなので不健全とみなす。この設計の利点は
-## **トラフィックの多いフォワードほど異常検知が速くなる**こと
-## （次の定期プローブを待たずに、接続が来た瞬間に検知できる）。
+## Instead we use **Tier 3 (a byproduct of real traffic)**: if
+## `proxy/stats`'s `failedConns` has increased since the previous tick, it
+## means an actual client connection failed to reach the upstream, so we
+## treat it as unhealthy. The advantage of this design is that **the
+## busier a forward is, the faster anomalies are detected** (detection
+## happens the moment a connection comes in, without waiting for the next
+## periodic probe).
 ##
-## `fkRemote` は powarder がデータパスに介在しないため統計を原理的に取れず
-## Tier 3 が使えない。`-R` のヘルスチェックは「マスターが生きているか」
-## （`hostsession` の責務）だけに留まる。
+## Since powarder does not sit on the data path for `fkRemote`, statistics
+## can't be collected in principle, so Tier 3 can't be used. Health
+## checking for `-R` is limited to just "is the master alive" (the
+## responsibility of `hostsession`).
 
 import std/[os, options, asyncdispatch]
 
@@ -64,41 +75,43 @@ import powarder/proxy/upstream
 
 type
   Forward* = ref object
-    id*: string ## forwardspec.forwardId() の結果。実体（bind 対象）から決定的に導出される
+    id*: string ## Result of forwardspec.forwardId(). Deterministically derived from the entity (bind target)
     tunnelName*: string
     spec*: ForwardSpec
-    host*: HostSession ## 所属マスター（参照。所有はしない）
-    upstream*: UpstreamTarget ## fkLocal: ukUnix の UDS パス / fkRemote: 未使用
-    proxy*: Option[ForwardProxy]          ## fkLocal のみ。fkRemote では none
-    proxyTask*: Option[Future[void]] ## serve() の Future。close 後に await して未処理 Future を残さない
+    host*: HostSession           ## The owning master (reference only; not owned)
+    upstream*: UpstreamTarget    ## fkLocal: the UDS path for ukUnix / fkRemote: unused
+    proxy*: Option[ForwardProxy] ## fkLocal only. none for fkRemote
+    proxyTask*: Option[Future[void]] ## The Future from serve(). Awaited after close() so no unhandled Future is left behind
     state*: ForwardState
     consecutiveHealthFailures*: int
-    lastSeenFailedConns*: int ## Tier3 判定用。前回 tick 時点の stats.failedConns
-    attachRetried*: bool ## bind 失敗後の「1回だけ再試行」を使ったか
+    lastSeenFailedConns*: int ## For Tier3 judgement. stats.failedConns as of the previous tick
+    attachRetried*: bool ## Whether the "one retry only" after a bind failure has been used
     lastError*: string
     lastErrorKind*: ErrorKind
-    # ---- 以下、公開型定義には無い内部専用フィールド（テストからは触らない）。
-    # fwDetaching の副作用確認（cancel -> probe）を tick をまたいで段階的に
-    # 進めるための進捗フラグ。`hostsession.HostSession.lastPeriodicCheckAt` と
-    # 同じ考え方。
-    detachCancelIssued: bool ## -O cancel を既に投げたか（1回でよい）
-    detachProbeTask: Option[Future[bool]] ## probeUpstream() の進行中 Future
-    detachConfirmed: bool ## 副作用確認済み。isDiscardable がこれを見る
-    detachStuck: bool ## cancel の副作用が確認できず recycle 待ちで詰まっている
+    # ---- Below: internal-only fields not in the public type definition (tests must not touch these).
+    # Progress flag for advancing the fwDetaching side-effect confirmation
+    # (cancel -> probe) step by step across ticks. Same idea as
+    # `hostsession.HostSession.lastPeriodicCheckAt`.
+    detachCancelIssued: bool ## Whether -O cancel has already been issued (only needs to happen once)
+    detachProbeTask: Option[Future[bool]] ## In-flight Future from probeUpstream()
+    detachConfirmed: bool ## Side effect confirmed. isDiscardable checks this
+    detachStuck: bool ## Stuck waiting for host recycle because the cancel side effect could not be confirmed
 
 # ---------------------------------------------------------------------------
-# 内部ヘルパー: 状態遷移
+# Internal helper: state transition
 # ---------------------------------------------------------------------------
 
 proc transition(fw: Forward; event: ForwardEvent) =
-  ## `statemachine.nextForwardState` の結果をそのまま適用する内部ヘルパー。
-  ## `none` が返るのは本来ここに来ないはずの実装バグを意味するが、
-  ## `hostsession.transition` と同じ理由でデーモン全体を巻き込んで落ちることは
-  ## 避け、状態を変えずに黙って無視する。
+  ## Internal helper that applies the result of `statemachine.nextForwardState`
+  ## as-is. A returned `none` means an implementation bug that should never
+  ## reach here, but for the same reason as `hostsession.transition`, we
+  ## avoid crashing the whole daemon over it and silently ignore it without
+  ## changing the state.
   ##
-  ## **例外**: `fwDetaching` + `feDetachConfirmed` は「破棄可能」を表す正常な
-  ## `none`（`ForwardState` に「破棄済み」の値が無いため）。この組み合わせは
-  ## `finishDetach` が `isDiscard` 経由で個別に扱うので、ここからは呼ばない。
+  ## **Exception**: `fwDetaching` + `feDetachConfirmed` is a normal `none`
+  ## that represents "discardable" (because `ForwardState` has no
+  ## "discarded" value). This combination is handled separately by
+  ## `finishDetach` via `isDiscard`, so it is never invoked from here.
   let next = nextForwardState(fw.state, event)
   if next.isSome:
     fw.state = next.get()
@@ -108,40 +121,44 @@ proc transition(fw: Forward; event: ForwardEvent) =
 # ---------------------------------------------------------------------------
 
 proc recordSshAttachFailure(fw: Forward; outcome: MuxOutcome) =
-  ## ssh 側の `-O forward` 失敗（bind 失敗の再試行も尽きた場合を含む）を記録する。
-  ## `core/errorclass` の分類はマスターの stderr ログ全体を対象にした設計で
-  ## `-O forward` 単発の結果（`MuxOutcome`）とは語彙が異なるため、ここでは
-  ## 専用の文言を組み立てる。
+  ## Records an ssh-side `-O forward` failure (including the case where the
+  ## bind-failure retry has also been exhausted). `core/errorclass`'s
+  ## classification is designed to target the master's entire stderr log,
+  ## and its vocabulary differs from a single `-O forward` result
+  ## (`MuxOutcome`), so here we build dedicated wording.
   fw.lastErrorKind = ekUnknown
-  fw.lastError = "ssh -O forward が失敗しました (" & $outcome & ")"
+  fw.lastError = "ssh -O forward failed (" & $outcome & ")"
 
 proc attach(fw: Forward) =
-  ## fwPending から実際の attach を試みる。ssh 側（-O forward）と powarder 側
-  ## （fkLocal のみ、ユーザー指定ポートの listener）の両方が確認できて初めて
-  ## fwActive に遷移する。途中はすべて fwAttaching のまま進める。
+  ## Attempts the actual attach from fwPending. Transitions to fwActive
+  ## only once both the ssh side (-O forward) and the powarder side
+  ## (fkLocal only, the listener for the user-specified port) are
+  ## confirmed. Everything in between proceeds while staying in
+  ## fwAttaching.
   ##
-  ## 手順（順序が重要。詳細は各ステップのコメントを参照）:
-  ## 1. UDS の残骸を消す
-  ## 2. `-O forward` を張る
-  ## 3. bind 失敗なら1回だけ再試行する
-  ## 4. 成功したら fkLocal のみ powarder 側リスナーを起動する
-  ## 5. リスナーの bind に失敗したら ssh 側を cancel で巻き戻す
+  ## Steps (order matters. See each step's comment for details):
+  ## 1. Remove UDS leftovers
+  ## 2. Attach `-O forward`
+  ## 3. If bind fails, retry once
+  ## 4. On success, start the powarder-side listener (fkLocal only)
+  ## 5. If the listener's bind fails, roll back the ssh side with cancel
   transition(fw, feAttachStarted) ## fwPending -> fwAttaching
 
   let udsPath = if fw.spec.kind == fkLocal: fw.upstream.path else: ""
 
-  # 手順1: UDS の残骸を消す。
-  # **`os.fileExists` を使ってはいけない** — `S_ISREG` しか見ないのでソケット
-  # には常に false を返す。`paths.socketExists` を使う。
+  # Step 1: remove UDS leftovers.
+  # **Must not use `os.fileExists`** -- it only checks `S_ISREG`, so it
+  # always returns false for a socket. Use `paths.socketExists` instead.
   if fw.spec.kind == fkLocal and socketExists(udsPath):
     removeFile(udsPath)
 
-  # 手順2: ssh 側に forward を張る
+  # Step 2: attach the forward on the ssh side
   var outcome = muxclient.addForward(fw.host.ctlPath, fw.host.host, fw.spec, udsPath)
 
-  # 手順3: bind 失敗は「まだ再試行していなければ」1回だけ再試行する。
-  # ssh は `-o StreamLocalBindUnlink=yes` 付きで起動されているので通常はここに
-  # 来ないが、権限の問題などで残骸が消せないケースの保険。
+  # Step 3: on a bind failure, retry once, only if we haven't retried yet.
+  # ssh is started with `-o StreamLocalBindUnlink=yes`, so we normally
+  # don't reach here, but this is a safety net for cases like permission
+  # issues where the leftover can't be removed.
   if outcome == moBindFailed and not fw.attachRetried:
     fw.attachRetried = true
     if fw.spec.kind == fkLocal:
@@ -149,22 +166,28 @@ proc attach(fw: Forward) =
     outcome = muxclient.addForward(fw.host.ctlPath, fw.host.host, fw.spec, udsPath)
 
   if outcome != moSuccess:
-    # 初回で bind 失敗以外だった場合、または再試行後もなお失敗した場合は
-    # feAttachFailedOther 相当（2回目以降の bind 失敗を feAttachBindFailed で
-    # 表現しないのは statemachine.nim の設計メモのとおり）。
+    # If the first attempt failed with something other than a bind
+    # failure, or if it still fails after the retry, this corresponds to
+    # feAttachFailedOther (we deliberately don't represent a second-or-later
+    # bind failure as feAttachBindFailed, per the design note in
+    # statemachine.nim).
     recordSshAttachFailure(fw, outcome)
     transition(fw, feAttachFailedOther) ## fwAttaching -> fwError
     return
 
-  # 手順4: ssh 側は張れた。fkLocal なら powarder 側のリスナーを起動する。
+  # Step 4: the ssh side is attached. If fkLocal, start the powarder-side
+  # listener.
   #
-  # **既に起動済み（ホスト再接続による re-attach）ならそのまま使い回す。**
-  # bindPort も UDS パスも forwardId から決定的に導出され、ホストの再接続
-  # だけでは変わらない。リスナーを毎回作り直すと、既にこのプロセスが握って
-  # いる同じユーザー指定ポートへ二重に bind しようとして必ず失敗する。
-  # 各クライアント接続は毎回 `dialUpstream` で UDS へ新規に接続し直すので
-  # （`proxy/listener.handleConnection` を参照）、UDS の中身がマスター再接続で
-  # 入れ替わっていても powarder 側のリスナーは無停止で動き続けられる。
+  # **If it's already running (a re-attach from a host reconnect), just
+  # reuse it.** Both bindPort and the UDS path are deterministically
+  # derived from forwardId, and a host reconnect alone doesn't change
+  # them. If we recreated the listener every time, it would always fail
+  # trying to double-bind the same user-specified port this process
+  # already holds. Each client connection reconnects to the UDS fresh via
+  # `dialUpstream` every time (see `proxy/listener.handleConnection`), so
+  # even if what's behind the UDS has been swapped out by a master
+  # reconnect, the powarder-side listener can keep running without
+  # interruption.
   if fw.spec.kind == fkLocal and fw.proxy.isNone:
     try:
       let proxy = newForwardProxy(fw.spec.bindAddr, fw.spec.bindPort,
@@ -172,10 +195,11 @@ proc attach(fw: Forward) =
       fw.proxy = some(proxy)
       fw.proxyTask = some(serve(proxy))
     except CatchableError:
-      # 手順5: ユーザー指定ポートが既に使用中など。これは ssh 側の失敗とは
-      # 別物なので errorclass.ekPortInUse として記録し、既に張ってしまった
-      # ssh 側の forward を cancelForward で巻き戻す（張ったまま放置すると
-      # 次回 attach で残骸扱いになる）。
+      # Step 5: e.g. the user-specified port is already in use. This is
+      # distinct from an ssh-side failure, so we record it as
+      # errorclass.ekPortInUse and roll back the ssh-side forward we
+      # already attached with cancelForward (leaving it attached would be
+      # treated as a leftover on the next attach).
       discard muxclient.cancelForward(fw.host.ctlPath, fw.host.host, fw.spec, udsPath)
       let expl = explain(ekPortInUse, langEn,
           initErrorContext(bindPort = int(fw.spec.bindPort)))
@@ -184,24 +208,25 @@ proc attach(fw: Forward) =
       transition(fw, feAttachFailedOther) ## fwAttaching -> fwError
       return
 
-  # fkRemote はリモート側が listen するので powarder は介在しない
-  # （プロキシは起動しない）。
+  # fkRemote has the remote side listen, so powarder does not get
+  # involved (no proxy is started).
   transition(fw, feAttachSucceeded) ## fwAttaching -> fwActive
   fw.consecutiveHealthFailures = 0
   fw.lastSeenFailedConns =
     if fw.proxy.isSome: fw.proxy.get().stats.failedConns else: 0
 
 # ---------------------------------------------------------------------------
-# ヘルスチェック（Tier 3）
+# Health check (Tier 3)
 # ---------------------------------------------------------------------------
 
 proc healthCheck(fw: Forward) =
-  ## `fwActive` / `fwDegraded` で毎 tick 呼ばれる。判定は
-  ## `statemachine.healthVerdict` に一任する（モジュール doc comment の
-  ## 「ヘルスチェック: Tier 3 が主体」を参照）。
+  ## Called every tick in `fwActive` / `fwDegraded`. The judgement is left
+  ## entirely to `statemachine.healthVerdict` (see the module doc
+  ## comment's "Health check: Tier 3 is the primary mechanism" section).
   if fw.spec.kind != fkLocal or fw.proxy.isNone:
-    # fkRemote は統計を取れないので Tier3 は使えない。マスター生死の監視は
-    # hostsession の責務なのでここでは何もしない。
+    # fkRemote can't collect statistics, so Tier3 can't be used.
+    # Monitoring whether the master is alive is hostsession's
+    # responsibility, so we do nothing here.
     return
 
   let currentFailed = fw.proxy.get().stats.failedConns
@@ -213,7 +238,8 @@ proc healthCheck(fw: Forward) =
 
   let verdict = healthVerdict(fw.consecutiveHealthFailures, fw.state)
   if verdict == fwPending:
-    # 強制 re-attach。次の attach で「1回だけ再試行」をまた使えるようにする。
+    # Forced re-attach. Make the "one retry only" available again for the
+    # next attach.
     fw.attachRetried = false
     fw.consecutiveHealthFailures = 0
   fw.state = verdict
@@ -223,12 +249,13 @@ proc healthCheck(fw: Forward) =
 # ---------------------------------------------------------------------------
 
 proc finishDetach(fw: Forward) =
-  ## cancel + 副作用確認（または fkRemote の場合は cancel のみ）が完了した。
-  ## `nextForwardState(fwDetaching, feDetachConfirmed)` は `none` を返す設計
-  ## （`ForwardState` に「破棄済み」の値が無いため）なので、`isDiscard` で
-  ## それが正常な「破棄してよい」の合図であることを確認したうえで、`state`
-  ## 自体は変えず `detachConfirmed` フラグで破棄可能を表す
-  ## （`isDiscardable` はこのフラグを見る）。
+  ## The cancel + side-effect confirmation (or, for fkRemote, just the
+  ## cancel) has completed. `nextForwardState(fwDetaching,
+  ## feDetachConfirmed)` is designed to return `none` (because
+  ## `ForwardState` has no "discarded" value), so after confirming via
+  ## `isDiscard` that this is the normal signal for "OK to discard", we
+  ## represent discardability with the `detachConfirmed` flag without
+  ## changing `state` itself (`isDiscardable` checks this flag).
   doAssert isDiscard(fw.state, feDetachConfirmed)
   if fw.spec.kind == fkLocal:
     removeFile(fw.upstream.path)
@@ -236,90 +263,98 @@ proc finishDetach(fw: Forward) =
   fw.detachConfirmed = true
 
 proc checkDetachProgress(fw: Forward) =
-  ## `fwDetaching` で毎 tick 呼ばれる。detach の手順を tick をまたいで段階的に
-  ## 進める（`tick` は同期関数で、`serve()` の Future や `probeUpstream` の
-  ## Future を `waitFor` で待つとイベントループ内でネストしてしまうため）。
+  ## Called every tick in `fwDetaching`. Advances the detach steps stage
+  ## by stage across ticks (`tick` is a synchronous function, and waiting
+  ## for `serve()`'s Future or `probeUpstream`'s Future with `waitFor`
+  ## would nest inside the event loop).
   ##
-  ## 手順（`requestDetach` の doc comment、モジュール先頭の設計と対応）:
-  ## 1. プロキシの `Future` を回収する（`close()` 自体は `requestDetach` で
-  ##    既に呼んである）
-  ## 2. `-O cancel`（1回だけ発行する。exit code は信用しない）
-  ## 3. 副作用を実測して確認する（`probeUpstream` が false を返すことを見る。
-  ##    宛先へ実接続を発生させるため1回だけに留める）
-  ## 4. UDS 残骸を消す
-  ## 5. 参照カウントを減らす
+  ## Steps (correspond to `requestDetach`'s doc comment and the design at
+  ## the top of the module):
+  ## 1. Collect the proxy's `Future` (`close()` itself has already been
+  ##    called in `requestDetach`)
+  ## 2. `-O cancel` (issued only once. The exit code is not trusted)
+  ## 3. Confirm the side effect empirically (check that `probeUpstream`
+  ##    returns false. Limited to just once since it causes a real
+  ##    connection to the destination)
+  ## 4. Remove UDS leftovers
+  ## 5. Decrement the reference count
   if fw.detachConfirmed or fw.detachStuck:
-    return ## 既に確定済み（破棄可能、またはホスト recycle 待ちで詰まっている）
+    return ## Already finalized (discardable, or stuck waiting for host recycle)
 
-  # 手順1: プロキシの Future を回収する
+  # Step 1: collect the proxy's Future
   if fw.proxyTask.isSome:
     let fut = fw.proxyTask.get()
     if not fut.finished:
-      return ## 次回の tick に持ち越す
+      return ## Carry over to the next tick
     try:
-      fut.read() ## 失敗していれば例外が飛ぶので握りつぶす
+      fut.read() ## If it failed, an exception will be thrown, so swallow it
     except CatchableError:
       discard
     fw.proxyTask = none(Future[void])
 
-  # 手順2: -O cancel（1回だけ発行する）。exit code は一切信用できない
-  # （成功・失敗どちらも 0 を返す）ので、ここでは結果を見ずに投げるだけ。
-  # 真の判定は手順3の副作用確認で行う。
+  # Step 2: -O cancel (issued only once). The exit code cannot be trusted
+  # at all (both success and failure return 0), so here we just fire it
+  # without checking the result. The true judgement is done via the
+  # side-effect confirmation in step 3.
   if not fw.detachCancelIssued:
     let udsPath = if fw.spec.kind == fkLocal: fw.upstream.path else: ""
     discard muxclient.cancelForward(fw.host.ctlPath, fw.host.host, fw.spec, udsPath)
     fw.detachCancelIssued = true
-    return ## 副作用確認は次 tick 以降で行う
+    return ## Side-effect confirmation happens from the next tick onward
 
-  # fkRemote は「宛先への実接続」による副作用確認手段が無い
-  # （powarder がデータパスに介在しないため）。cancel を投げた事実だけで
-  # 確定させる。
+  # fkRemote has no means of side-effect confirmation via "a real
+  # connection to the destination" (because powarder doesn't sit on the
+  # data path). We finalize based solely on the fact that cancel was
+  # issued.
   if fw.spec.kind == fkRemote:
     finishDetach(fw)
     return
 
-  # 手順3: 副作用を実測して確認する。
-  # **注意**: `probeUpstream` は宛先に実接続を発生させる（OpenSSH の
-  # `channel_post_port_listener` が accept 直後に `direct-tcpip` を開くため
-  # 回避不可能）。detach 時の1回だけなので許容する（繰り返しプローブはしない）。
+  # Step 3: confirm the side effect empirically.
+  # **Note**: `probeUpstream` causes a real connection to the destination
+  # (this is unavoidable, since OpenSSH's `channel_post_port_listener`
+  # opens a `direct-tcpip` right after accept). We allow this since it's
+  # only once at detach time (we don't probe repeatedly).
   if fw.detachProbeTask.isNone:
     fw.detachProbeTask = some(probeUpstream(fw.upstream))
-    return ## 次回の tick で結果を回収する
+    return ## Collect the result on the next tick
 
   let probeFut = fw.detachProbeTask.get()
   if not probeFut.finished:
-    return ## 次回の tick に持ち越す
+    return ## Carry over to the next tick
   let stillReachable = probeFut.read()
   fw.detachProbeTask = none(Future[bool])
 
   if stillReachable:
-    # cancel が嘘をついている（成功報告なのに実際には解除されていない）。
-    # ホストごと recycle が必要な状態としてここで詰まる（自動では復旧しない）。
+    # cancel is lying (it reported success, but it wasn't actually
+    # released). We get stuck here as a state that requires recycling
+    # the whole host (no automatic recovery).
     fw.detachStuck = true
     fw.lastErrorKind = ekUnknown
-    fw.lastError = "cancel 後も UDS " & fw.upstream.path &
-        " へ接続できてしまうため、ホストごと recycle が必要です"
+    fw.lastError = "Still able to connect to UDS " & fw.upstream.path &
+        " even after cancel; the whole host needs to be recycled"
     return
 
   finishDetach(fw)
 
 # ---------------------------------------------------------------------------
-# 公開 API
+# Public API
 # ---------------------------------------------------------------------------
 
 proc newForward*(tunnelName: string; spec: ForwardSpec;
     host: HostSession): Forward =
-  ## `id` を `forwardspec.forwardId(spec, host.host)` で決め、`fkLocal` なら
-  ## `paths.forwardSocketPath(forwardspec.udsBasename(id))` で UDS パスを決める。
-  ## `host.addForwardRef(id)` を呼んで参照カウントを増やす。
-  ## 状態は `fwPending`。プロセスもプロキシもまだ起動しない（実際の attach は
-  ## `tick()` 経由で行う）。
+  ## Determines `id` via `forwardspec.forwardId(spec, host.host)`, and if
+  ## `fkLocal`, determines the UDS path via
+  ## `paths.forwardSocketPath(forwardspec.udsBasename(id))`. Calls
+  ## `host.addForwardRef(id)` to increment the reference count. The state
+  ## is `fwPending`. Neither the process nor the proxy is started yet
+  ## (the actual attach happens via `tick()`).
   let id = forwardId(spec, host.host)
   let upstream =
     if spec.kind == fkLocal:
       UpstreamTarget(kind: ukUnix, path: forwardSocketPath(udsBasename(id)))
     else:
-      UpstreamTarget(kind: ukUnix, path: "") ## fkRemote では未使用
+      UpstreamTarget(kind: ukUnix, path: "") ## unused for fkRemote
 
   result = Forward(
     id: id,
@@ -344,28 +379,31 @@ proc newForward*(tunnelName: string; spec: ForwardSpec;
 
 proc adoptForward*(tunnelName: string; spec: ForwardSpec;
     host: HostSession): Forward =
-  ## 孤児 Forward の adopt（M6）用コンストラクタ。呼び出し側
-  ## （`daemon/orphan.adoptOrphans`）が UDS への `probeUpstream` で「まだ
-  ## 生きている」ことを確認済みの `fkLocal` Forward を、いきなり `fwActive`
-  ## として引き継ぐ。
+  ## Constructor for adopting orphaned Forwards (M6). The caller
+  ## (`daemon/orphan.adoptOrphans`) takes an `fkLocal` Forward already
+  ## confirmed "still alive" via `probeUpstream` against the UDS, and
+  ## takes it over directly as `fwActive`.
   ##
-  ## **`attach()` は経由しない。** `attach()` の手順1は UDS の残骸を無条件に
-  ## `removeFile` するが、ここで扱うのは残骸ではなく生きている UDS なので、
-  ## 消してしまうと引き継ぐはずのフォワードを自分で壊すことになる。
+  ## **Does not go through `attach()`.** Step 1 of `attach()`
+  ## unconditionally does `removeFile` on the UDS leftover, but what
+  ## we're handling here is not a leftover but a live UDS, so removing it
+  ## would destroy the very forward we're supposed to take over.
   ##
-  ## fkLocal は powarder 側リスナーもここで起動する（前回のプロセスが握って
-  ## いた `bindPort` を引き継ぐだけなので、adopt 直後の1回はまず衝突しない
-  ## 想定）。bind に失敗した場合は例外を投げず `fwError` にして返す
-  ## （`attach()` のユーザー指定ポート使用中ハンドリングと同じ方針だが、
-  ## adopt では ssh 側を巻き戻す cancelForward は行わない。まだ生きている
-  ## UDS を壊さないという上記の理由と同様、意図せず forward を失う方向には
-  ## 倒さない）。
+  ## For fkLocal, the powarder-side listener is also started here (since
+  ## it just takes over the `bindPort` the previous process held, a
+  ## conflict right after adopt is not expected). If the bind fails, we
+  ## don't raise an exception but return it as `fwError` (the same
+  ## policy as `attach()`'s handling of the user-specified port already
+  ## being in use, but adopt does not perform the ssh-side rollback via
+  ## cancelForward. For the same reason as above -- not destroying the
+  ## still-live UDS -- we avoid erring toward unintentionally losing the
+  ## forward).
   let id = forwardId(spec, host.host)
   let upstream =
     if spec.kind == fkLocal:
       UpstreamTarget(kind: ukUnix, path: forwardSocketPath(udsBasename(id)))
     else:
-      UpstreamTarget(kind: ukUnix, path: "") ## fkRemote では未使用（このパスは通常呼ばれない）
+      UpstreamTarget(kind: ukUnix, path: "") ## unused for fkRemote (this path is not normally called)
 
   result = Forward(
     id: id,
@@ -398,19 +436,22 @@ proc adoptForward*(tunnelName: string; spec: ForwardSpec;
     except CatchableError as e:
       result.state = fwError
       result.lastErrorKind = ekPortInUse
-      result.lastError = "adopt 時の powarder 側リスナー起動に失敗しました: " & e.msg
+      result.lastError = "Failed to start the powarder-side listener during adopt: " & e.msg
 
 proc tick*(fw: Forward) =
-  ## デーモンの 500ms ループから毎回呼ばれる。現在の状態に応じて必要な処理を
-  ## 1回だけ進める（`hostsession.tick` と同じ設計）。
+  ## Called every time from the daemon's 500ms loop. Advances whatever
+  ## processing is needed for the current state, once (same design as
+  ## `hostsession.tick`).
   ##
-  ## 所属ホストが `isConnected` でなくなったら、どの状態からでも
-  ## `feHostLost` で `fwPending` に戻す（`statemachine` の「任意の状態から」
-  ## ルール）。`fwDetaching` 中にこれが起きるケースは稀な想定
-  ## （`statemachine.nim` の設計メモを参照。daemon 層が `requestDetach` 済みの
-  ## 対象を管理対象から外していれば実質発生しない）だが、備えとして
-  ## `requestDetach` は毎回 detach 用の内部フラグをリセットするので、
-  ## 万一その後に再度 detach されても正しくやり直せる。
+  ## If the owning host is no longer `isConnected`, revert to `fwPending`
+  ## via `feHostLost` from any state (the "from any state" rule in
+  ## `statemachine`). The case where this happens during `fwDetaching` is
+  ## expected to be rare (see the design note in `statemachine.nim`;
+  ## effectively this doesn't happen if the daemon layer removes targets
+  ## that have already been `requestDetach`'d from management), but as a
+  ## safeguard, `requestDetach` resets the internal detach-related flags
+  ## every time, so even if detach happens again afterward, it can be
+  ## redone correctly.
   if not fw.host.isConnected():
     if fw.state != fwPending:
       transition(fw, feHostLost)
@@ -420,23 +461,26 @@ proc tick*(fw: Forward) =
   of fwPending:
     attach(fw)
   of fwAttaching:
-    discard ## attach() が同期的に完結させるので、tick 単独でここに来ることは無い
+    discard ## Since attach() completes synchronously, tick alone never reaches here
   of fwActive, fwDegraded:
     healthCheck(fw)
   of fwDetaching:
     checkDetachProgress(fw)
   of fwError:
-    discard ## 自動では復帰しない。requestDetach か feHostLost 経由のみ
+    discard ## Does not recover automatically. Only via requestDetach or feHostLost
 
 proc requestDetach*(fw: Forward) =
-  ## 設定から消えた / stop されたときに呼ぶ。`fwDetaching` へ遷移させる。
+  ## Called when removed from the config / stopped. Transitions to
+  ## `fwDetaching`.
   ##
-  ## 手順1（プロキシを先に閉じ、新規接続を受け付けなくする）はここで即座に
-  ## 行う。`close()` は同期関数。`proxyTask` の回収（await 相当）は
-  ## `tick`（`checkDetachProgress`）に委ねる。
+  ## Step 1 (close the proxy first so it stops accepting new connections)
+  ## is done immediately here. `close()` is a synchronous function.
+  ## Collecting `proxyTask` (the equivalent of await) is left to `tick`
+  ## (`checkDetachProgress`).
   ##
-  ## 前回の detach サイクルの内部状態が残っていても正しく最初からやり直せる
-  ## よう、副作用確認用の内部フラグをここで毎回リセットする。
+  ## Even if internal state remains from a previous detach cycle, we
+  ## reset the side-effect-confirmation internal flags every time here so
+  ## it can be redone correctly from the start.
   fw.detachCancelIssued = false
   fw.detachProbeTask = none(Future[bool])
   fw.detachConfirmed = false
@@ -446,17 +490,19 @@ proc requestDetach*(fw: Forward) =
   transition(fw, feDetachRequested)
 
 proc teardown*(fw: Forward) =
-  ## 同期的に完全に片付ける（デーモンの graceful shutdown 用）。
+  ## Fully cleans up synchronously (for the daemon's graceful shutdown).
   ##
-  ## **デーモンの async ループが停止した後に呼ばれる前提。** `tick` が回って
-  ## いる最中に呼んではいけない（`waitFor` をイベントループ内からネストして
-  ## 呼ぶことになり問題が起きるため。`hostsession.teardown` と同じ制約）。
+  ## **Premised on being called after the daemon's async loop has
+  ## stopped.** Must not be called while `tick` is still running (calling
+  ## `waitFor` nested from inside the event loop would cause a problem;
+  ## same constraint as `hostsession.teardown`).
   ##
-  ## `tick` 駆動の段階的な detach（`checkDetachProgress`）とは異なり、これは
-  ## どの状態から呼ばれても「呼び出しが返った時点で後始末が終わっている」
-  ## ことを保証する。副作用の実測確認（`probeUpstream`）は行わない
-  ## （teardown はとにかく片付けきる契約であり、そのために宛先へ余分な実接続を
-  ## 発生させる必要は無いため）。
+  ## Unlike the `tick`-driven staged detach (`checkDetachProgress`), this
+  ## guarantees that "cleanup is finished by the time the call returns",
+  ## no matter what state it's called from. It does not perform empirical
+  ## side-effect confirmation (`probeUpstream`) (teardown's contract is
+  ## to finish cleaning up no matter what, and there's no need to cause
+  ## an extra real connection to the destination for that).
   if fw.proxy.isSome:
     let proxy = fw.proxy.get()
     proxy.close()
@@ -480,11 +526,13 @@ proc teardown*(fw: Forward) =
   fw.detachConfirmed = true
 
 proc isDiscardable*(fw: Forward): bool =
-  ## `fwDetaching` かつ副作用確認が済んで、レジストリから削除してよい状態か。
+  ## Whether it's `fwDetaching` and side-effect confirmation is done,
+  ## i.e. OK to remove from the registry.
   fw.state == fwDetaching and fw.detachConfirmed
 
 proc stats*(fw: Forward): Option[ForwardStats] =
-  ## `fkLocal` ならプロキシの統計。`fkRemote` は none（統計が原理的に取れない）。
+  ## The proxy's statistics for `fkLocal`. none for `fkRemote` (statistics
+  ## cannot be collected in principle).
   if fw.spec.kind == fkLocal and fw.proxy.isSome:
     some(fw.proxy.get().stats)
   else:

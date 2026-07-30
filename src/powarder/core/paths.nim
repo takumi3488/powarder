@@ -1,12 +1,14 @@
-## 設定・状態・ランタイムディレクトリの解決。
+## Resolution of config, state, and runtime directories.
 ##
-## UDS のパスは `sockaddr_un.sun_path` の長さ制限（macOS 104 / Linux 108 バイト）に収める
-## 必要がある。powarder は ControlPath と forward の UDS を両方ランタイムディレクトリに置くので、
-## ディレクトリ名を 1 文字・ファイル名を 8 桁 hex に抑え、それでも収まらない場合は
-## `/tmp/powarder-<uid>` にフォールバックする。
+## UDS paths must fit within `sockaddr_un.sun_path`'s length limit (104 bytes
+## on macOS / 108 on Linux). Since powarder places both the ControlPath and
+## the forward UDS in the runtime directory, the directory name is kept to 1
+## character and the filename to 8 hex digits; if it still doesn't fit, it
+## falls back to `/tmp/powarder-<uid>`.
 ##
-## このモジュールは環境変数とファイルシステムを触るので純粋ではない。
-## テスト時は `POWARDER_CONFIG` / `POWARDER_RUNTIME_DIR` / `XDG_*` を差し替えて隔離する。
+## This module touches environment variables and the filesystem, so it is not
+## pure. During tests, isolate it by overriding `POWARDER_CONFIG` /
+## `POWARDER_RUNTIME_DIR` / `XDG_*`.
 
 import std/[os, posix, strutils]
 
@@ -14,19 +16,20 @@ const
   appName* = "powarder"
 
   maxSunPath* = 104
-    ## macOS の `sockaddr_un.sun_path` は 104 バイト。Linux は 108 だが厳しい側に合わせる。
+    ## macOS's `sockaddr_un.sun_path` is 104 bytes. Linux is 108, but we
+    ## follow the stricter limit.
 
   envConfig* = "POWARDER_CONFIG"
   envRuntimeDir* = "POWARDER_RUNTIME_DIR"
   envStateDir* = "POWARDER_STATE_DIR"
 
-  ctlSubdir* = "c" ## ControlPath 置き場。1 文字なのは sun_path 節約のため
-  fwdSubdir* = "f" ## forward の UDS 置き場
+  ctlSubdir* = "c" ## Where the ControlPath lives. 1 character to save sun_path space
+  fwdSubdir* = "f" ## Where the forward UDS lives
 
 func expandHome(p: string): string =
   if p.startsWith("~/"): getHomeDir() / p[2 .. ^1] else: p
 
-# ---------------------------------------------------------------- 設定 / 状態
+# ---------------------------------------------------------------- Config / state
 
 proc configDir*(): string =
   let xdg = getEnv("XDG_CONFIG_HOME")
@@ -34,12 +37,12 @@ proc configDir*(): string =
   else: getHomeDir() / ".config" / appName
 
 proc configFile*(): string =
-  ## `POWARDER_CONFIG` があればそれを優先する。
+  ## Prefers `POWARDER_CONFIG` if set.
   let override = getEnv(envConfig)
   if override.len > 0: expandHome(override) else: configDir() / "config.json"
 
 proc localConfigFile*(): string =
-  ## カレントディレクトリのプロジェクトローカル設定。`up` / `down` だけが探索する。
+  ## The project-local config in the current directory. Only `up` / `down` look for this.
   getCurrentDir() / (appName & ".json")
 
 proc stateDir*(): string =
@@ -54,11 +57,11 @@ proc logsDir*(): string = stateDir() / "logs"
 proc tunnelLogPath*(name: string): string = logsDir() / (name & ".log")
 proc daemonLogPath*(): string = logsDir() / "daemon.log"
 
-# -------------------------------------------------------------- ランタイム
+# -------------------------------------------------------------- Runtime
 
 proc isUsableDir(p: string): bool =
-  ## 自分が所有していて他人から書けないディレクトリか。
-  ## シンボリックリンク経由の乗っ取りを防ぐため所有者とパーミッションを検証する。
+  ## Is this a directory we own and that others can't write to?
+  ## Verifies owner and permissions to guard against symlink-based takeover.
   if not dirExists(p): return false
   var st: Stat
   if lstat(p.cstring, st) != 0: return false
@@ -67,21 +70,23 @@ proc isUsableDir(p: string): bool =
   (st.st_mode.cint and 0o077) == 0
 
 proc socketExists*(path: string): bool =
-  ## パスが unix domain socket として存在するか。
+  ## Whether the path exists as a unix domain socket.
   ##
-  ## **`os.fileExists` を使ってはいけない。** あれは `S_ISREG`（通常ファイル）だけを true に
-  ## するので、ソケットに対しては常に false を返す。ControlPath の出現待ち（readiness 判定）や
-  ## forward UDS の残骸検出でここを間違えると「ソケットは在るのに無いと判定して延々待つ」
-  ## という気付きにくいバグになる。
+  ## **Do not use `os.fileExists`.** It only returns true for `S_ISREG`
+  ## (regular files), so it always returns false for a socket. Getting this
+  ## wrong when waiting for the ControlPath to appear (readiness check) or
+  ## when detecting a leftover forward UDS produces the hard-to-notice bug of
+  ## "the socket exists but we judge it doesn't, and wait forever".
   ##
-  ## 残骸の削除には `os.removeFile` がそのまま使える（内部が `unlink` で、対象が無くても
-  ## エラーにならないので存在チェック無しに呼んでよい）。
+  ## `os.removeFile` can be used as-is to remove a leftover file (internally
+  ## it's `unlink`, which doesn't error if the target is absent, so it's fine
+  ## to call without an existence check first).
   var st: Stat
   if lstat(path.cstring, st) != 0: return false
   S_ISSOCK(st.st_mode)
 
 proc longestSocketPath(runtime: string): string =
-  ## そのランタイムディレクトリで生成しうる最長の UDS パス。長さ検証に使う。
+  ## The longest UDS path that can be generated in that runtime directory. Used for length validation.
   runtime / fwdSubdir / repeat('0', 8)
 
 proc runtimeDirCandidates(): seq[string] =
@@ -94,8 +99,8 @@ proc runtimeDirCandidates(): seq[string] =
     if xdgRun.len > 0 and isUsableDir(xdgRun):
       result.add xdgRun / appName
   else:
-    # macOS には XDG_RUNTIME_DIR に相当する標準が無いが、$TMPDIR がユーザー専有で
-    # mode 0700 なので代替になる。
+    # macOS has no equivalent standard to XDG_RUNTIME_DIR, but $TMPDIR is
+    # user-exclusive with mode 0700, so it serves as a substitute.
     let tmp = getEnv("TMPDIR")
     if tmp.len > 0:
       result.add tmp.strip(chars = {'/'}, leading = false) / appName
@@ -103,14 +108,14 @@ proc runtimeDirCandidates(): seq[string] =
   result.add "/tmp" / (appName & "-" & $getuid())
 
 proc runtimeDir*(): string =
-  ## 実際に使うランタイムディレクトリ。候補を順に見て、
-  ## **UDS パスが sun_path に収まる最初のもの**を選ぶ。
+  ## The runtime directory actually used. Looks at the candidates in order and
+  ## picks **the first one whose UDS path fits within sun_path**.
   let candidates = runtimeDirCandidates()
   for c in candidates:
     if longestSocketPath(c).len < maxSunPath:
       return c
-  # どれも収まらない場合は最後の候補（/tmp ベース）を返す。呼び出し側が
-  # ensureRuntimeDir() で検証して明示的に失敗させる。
+  # If none fit, return the last candidate (the /tmp-based one). The caller
+  # validates via ensureRuntimeDir() and fails explicitly.
   candidates[^1]
 
 proc ipcSocketPath*(): string = runtimeDir() / (appName & ".sock")
@@ -118,22 +123,22 @@ proc lockPath*(): string = runtimeDir() / (appName & ".lock")
 proc pidPath*(): string = runtimeDir() / (appName & ".pid")
 
 proc controlPath*(fingerprint: string): string =
-  ## ControlMaster の制御ソケット。fingerprint の先頭 8 文字だけ使う。
+  ## The ControlMaster's control socket. Uses only the first 8 characters of the fingerprint.
   runtimeDir() / ctlSubdir / fingerprint[0 ..< min(8, fingerprint.len)]
 
 proc forwardSocketPath*(basename: string): string =
-  ## ssh に張らせる forward の UDS。`basename` は forwardspec.udsBasename() の結果。
+  ## The forward UDS ssh sets up. `basename` is the result of forwardspec.udsBasename().
   runtimeDir() / fwdSubdir / basename
 
-# ------------------------------------------------------------------ 作成
+# ------------------------------------------------------------------ Creation
 
 proc ensureDir0700(p: string) =
   createDir(p)
   setFilePermissions(p, {fpUserRead, fpUserWrite, fpUserExec})
 
 proc ensureRuntimeDir*() =
-  ## ランタイムディレクトリ群を 0700 で用意する。
-  ## UDS パスが sun_path に収まらない場合はここで明示的に失敗させる。
+  ## Sets up the runtime directory tree with mode 0700.
+  ## Fails explicitly here if the UDS path doesn't fit within sun_path.
   let rt = runtimeDir()
   let longest = longestSocketPath(rt)
   if longest.len >= maxSunPath:

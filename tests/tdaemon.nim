@@ -1,35 +1,43 @@
-## `powarder/daemon/run` のテスト。
+## Tests for `powarder/daemon/run`.
 ##
-## 実 SSH サーバなしにテストするため、`tests/fixtures/ssh` という fake ssh を
-## `PATH` の先頭に置いて powarder に `ssh` として掴ませる（`tforward.nim` /
-## `treconcile.nim` と同じ手法。環境構築もそのまま踏襲する）。
+## To test without a real SSH server, a fake ssh at `tests/fixtures/ssh` is
+## placed at the front of `PATH` so powarder picks it up as `ssh` (the same
+## technique as `tforward.nim` / `treconcile.nim`; the environment setup is
+## copied as-is too).
 ##
-## `runDaemon()` は無限ループ（`mainLoop`）を回すため、テストプロセス内で直接
-## 呼ぶことはできない。加えて `tests/tipc.nim` で判明した通り、asyncdispatch
-## （`newAsyncSocket` に一度でも触れる）を使った**後**に `fork()` すると、子の
-## kqueue fd が壊れて `accept()` が失敗するようになる。
+## `runDaemon()` runs an infinite loop (`mainLoop`), so it cannot be called
+## directly inside the test process. In addition, as discovered in
+## `tests/tipc.nim`, calling `fork()` **after** touching asyncdispatch (even
+## once, via `newAsyncSocket`) breaks the child's kqueue fd, causing
+## `accept()` to fail.
 ##
-## そのため、このファイルでは方針を使い分ける:
+## For that reason, this file switches strategy depending on the test:
 ##
-## 1. **多重起動防止**（1本目）だけは `fork()` を使う。ただし forked された
-##    子プロセスは「ロック取得に失敗 -> `newIpcServer` 等の asyncdispatch には
-##    一切触れずに即座に return 7」という経路しか通らないので、親プロセスが
-##    このテストの前後で asyncdispatch に触れていても子は影響を受けない
-##    （`tests/tplatform.nim` と同じ fork の使い方）。
-## 2. **それ以外の全テスト**は `newDaemon()` でハンドラ一式を持つ `Daemon` を
-##    直接構築し、`d.server.handlers[methodName](params)` を IPC ソケット越しに
-##    経由せず直接呼ぶ。ハンドラは素の `proc (params: JsonNode): JsonNode`
-##    なので、実際のソケット通信・accept ループ（`serve()`）を一切回さずに
-##    RPC スキーマとロジックを検証できる。
-## 3. メインループを進める必要があるテスト（`tunnel.up` 後に実際に
-##    `fwActive` になるのを待つ、など）は、公開 proc `tickOnce(d)` を
-##    `waitFor` の中で繰り返し呼ぶ（`treconcile.nim` の `waitUntil` /
-##    `pollAsync` と同じ「ポーリングしながら async イベントループを回す」手法）。
+## 1. Only the **duplicate-launch prevention** test (the first one) uses
+##    `fork()`. However, the forked child only ever takes the path
+##    "lock acquisition fails -> return 7 immediately without touching
+##    asyncdispatch such as `newIpcServer` at all", so the child is
+##    unaffected even if the parent process has touched asyncdispatch
+##    before or after this test (the same fork usage as
+##    `tests/tplatform.nim`).
+## 2. **All other tests** construct a `Daemon` directly via `newDaemon()`,
+##    which carries the full set of handlers, and call
+##    `d.server.handlers[methodName](params)` directly, without going
+##    through the IPC socket. Because handlers are plain
+##    `proc (params: JsonNode): JsonNode`, the RPC schema and logic can be
+##    verified without ever running the actual socket communication /
+##    accept loop (`serve()`).
+## 3. Tests that need to advance the main loop (e.g. waiting for
+##    `fwActive` to actually be reached after `tunnel.up`) repeatedly call
+##    the public proc `tickOnce(d)` inside `waitFor` (the same "poll while
+##    spinning the async event loop" technique as `waitUntil` /
+##    `pollAsync` in `treconcile.nim`).
 
 import std/[unittest, os, posix, json, tables, strutils]
 import std/asyncdispatch
-import std/nativesockets ## `ForwardSpec` の自動生成 `==` などが `Port` の `==` を
-                          ## 使うために必要（他のテストファイルと同じ理由）。
+import std/nativesockets ## Needed because the auto-generated `==` for
+                          ## `ForwardSpec` etc. uses `Port`'s `==` (same
+                          ## reason as the other test files).
 
 import powarder/core/types
 import powarder/core/paths
@@ -46,11 +54,11 @@ const testStateDir = "/tmp/pw-d-state"
 const testConfigDir = "/tmp/pw-d-cfg"
 
 # ---------------------------------------------------------------------------
-# セットアップ / ヘルパー
+# Setup / helpers
 # ---------------------------------------------------------------------------
 
 proc withMode(mode: string; body: proc()) =
-  ## `POWARDER_FAKE_SSH_MODE` を一時的に切り替えてテスト本体を実行する。
+  ## Temporarily switch `POWARDER_FAKE_SSH_MODE` and run the test body.
   let had = existsEnv("POWARDER_FAKE_SSH_MODE")
   let old = getEnv("POWARDER_FAKE_SSH_MODE")
   putEnv("POWARDER_FAKE_SSH_MODE", mode)
@@ -78,17 +86,18 @@ proc setupSuite() =
 setupSuite()
 
 proc processAlive(pid: int): bool =
-  ## `platform/procinfo.pidAlive` と同じ判定だが、`platform/` のうち
-  ## run.nim が使わないモジュールへは依存しないという既存テストの慣習
-  ## （`treconcile.nim` の同名ヘルパーの doc comment を参照）に倣い、
-  ## テスト内で最小限だけ複製する。
+  ## Same check as `platform/procinfo.pidAlive`, but following the existing
+  ## test convention of not depending on `platform/` modules that run.nim
+  ## doesn't use (see the doc comment on the same-named helper in
+  ## `treconcile.nim`), it is minimally duplicated here in the test.
   if kill(Pid(pid), 0.cint) == 0:
     return true
   cint(osLastError()) == EPERM
 
 var allDaemons: seq[Daemon]
-  ## 後片付け漏れを防ぐため、生成した Daemon を全部覚えておいてファイルの
-  ## 末尾で shutdown する（`treconcile.nim` の `allRegistries` と同じ手法）。
+  ## To avoid missing cleanup, remember every Daemon created and shut them
+  ## all down at the end of the file (same technique as `allRegistries` in
+  ## `treconcile.nim`).
 
 proc track(d: Daemon): Daemon =
   allDaemons.add(d)
@@ -98,7 +107,8 @@ var daemonCounter = 0
 
 proc freshOpts(tunnels: seq[TunnelConfig] = @[];
     activeProfiles: seq[string] = @[]): DaemonOpts =
-  ## テストごとに独立した設定ファイル・ソケットパスを持つ `DaemonOpts` を作る。
+  ## Create a `DaemonOpts` with a config file and socket path independent
+  ## per test.
   inc daemonCounter
   let cfgPath = testConfigDir / ("cfg-" & $daemonCounter & ".json")
   saveConfig(cfgPath, ConfigFile(version: 1, tunnels: tunnels,
@@ -115,9 +125,10 @@ proc newTc(name, host: string; spec: ForwardSpec; autostart = true;
 
 proc waitUntilD(d: Daemon; cond: proc(): bool {.closure.}; tries = 300;
     delayMs = 20): Future[bool] {.async.} =
-  ## `tickOnce` を呼びながら `cond` が満たされるのを待つ。detach の副作用確認
-  ## （`probeUpstream`）や attach の完了はイベントループを回す必要があるため
-  ## `sleepAsync` で間を作る（`treconcile.pollAsync` と同じ手法）。
+  ## Wait for `cond` to be satisfied while calling `tickOnce`. Checking the
+  ## side effects of detach (`probeUpstream`) or the completion of attach
+  ## requires spinning the event loop, so `sleepAsync` is used to create
+  ## gaps between calls (same technique as `treconcile.pollAsync`).
   for i in 0 ..< tries:
     discard await d.tickOnce()
     if cond():
@@ -135,11 +146,11 @@ proc findEntry(list: JsonNode; name: string): JsonNode =
   nil
 
 # ---------------------------------------------------------------------------
-# 1. 多重起動防止: ロックを保持中に runDaemon すると終了コード7
+# 1. Duplicate-launch prevention: running runDaemon while the lock is held exits with code 7
 # ---------------------------------------------------------------------------
 
-suite "多重起動防止":
-  test "ロックを保持している間に runDaemon すると終了コード7で終了する":
+suite "duplicate-launch prevention":
+  test "runDaemon exits with code 7 while the lock is held":
     let rt = "/tmp/pw-d-lock-rt"
     removeDir(rt)
     createDir(rt)
@@ -152,10 +163,12 @@ suite "多重起動防止":
 
     let pid = fork()
     if pid == 0:
-      # 子プロセス: ロック取得に失敗し、`newIpcServer`（asyncdispatch）には
-      # 一切触れずに即座に return する経路しか通らない。したがって親プロセスが
-      # このテストの前後で asyncdispatch を使っていても子には影響しない
-      # （run.nim モジュール doc comment / このファイル冒頭の設計メモ参照）。
+      # Child process: lock acquisition fails, and only the path that
+      # returns immediately without ever touching asyncdispatch (e.g.
+      # `newIpcServer`) is taken. So the child is unaffected even if the
+      # parent process uses asyncdispatch before or after this test (see
+      # the run.nim module doc comment / the design note at the top of
+      # this file).
       let code = runDaemon(DaemonOpts(socketPath: rt / "sub.sock"))
       exitnow(code.cint)
 
@@ -175,7 +188,7 @@ suite "多重起動防止":
 # ---------------------------------------------------------------------------
 
 suite "daemon.ping / daemon.info":
-  test "daemon.ping は ok/pid/version を返す":
+  test "daemon.ping returns ok/pid/version":
     let d = track(newDaemon(freshOpts()))
     let res = d.server.handlers[mDaemonPing](nil)
     check res["ok"].getBool == true
@@ -183,7 +196,7 @@ suite "daemon.ping / daemon.info":
     check res["version"].getStr == daemonVersion
     shutdown(d)
 
-  test "daemon.info はスキーマ通りのフィールドを持つ":
+  test "daemon.info has fields matching the schema":
     let d = track(newDaemon(freshOpts()))
     let res = d.server.handlers[mDaemonInfo](nil)
     check res["pid"].getInt == getCurrentProcessId()
@@ -197,11 +210,11 @@ suite "daemon.ping / daemon.info":
     shutdown(d)
 
 # ---------------------------------------------------------------------------
-# 3. tunnel.up でトンネルが登録され、tunnel.list に現れる
+# 3. tunnel.up registers a tunnel and it shows up in tunnel.list
 # ---------------------------------------------------------------------------
 
 suite "tunnel.up / tunnel.list":
-  test "tunnel.up でトンネルが登録され、tunnel.list に現れる":
+  test "tunnel.up registers a tunnel and it shows up in tunnel.list":
     let spec = ForwardSpec(kind: fkLocal, bindAddr: defaultBindAddr,
         bindPort: Port(19301), targetHost: "db.internal", targetPort: Port(5432))
     let tc = newTc("up-1", "host-daemon-up-1", spec, autostart = false)
@@ -209,7 +222,7 @@ suite "tunnel.up / tunnel.list":
 
     withMode("ok", proc() =
       proc scenario() {.async.} =
-        # autostart = false かつ override 無しなので、up 前は無効（"stopped"）表示
+        # autostart = false and no override, so before up it shows disabled ("stopped")
         block:
           let before = findEntry(listAll(d), "up-1")
           check before != nil
@@ -228,7 +241,7 @@ suite "tunnel.up / tunnel.list":
       waitFor scenario())
     shutdown(d)
 
-  test "存在しない名前を指定すると failed に入る":
+  test "specifying a nonexistent name goes into failed":
     let d = track(newDaemon(freshOpts(@[])))
     let res = d.server.handlers[mTunnelUp](%*{"names": %*["no-such-tunnel"]})
     check res["started"].len == 0
@@ -237,11 +250,11 @@ suite "tunnel.up / tunnel.list":
     shutdown(d)
 
 # ---------------------------------------------------------------------------
-# 4. tunnel.list: -R の行では conns/total_conns/rx/tx/last_activity_seconds が null
+# 4. tunnel.list: for -R rows, conns/total_conns/rx/tx/last_activity_seconds are null
 # ---------------------------------------------------------------------------
 
-suite "tunnel.list: -R の統計は null":
-  test "-R のトンネルは conns/total_conns/rx/tx/last_activity_seconds が null":
+suite "tunnel.list: -R stats are null":
+  test "for a -R tunnel, conns/total_conns/rx/tx/last_activity_seconds are null":
     let spec = ForwardSpec(kind: fkRemote, bindAddr: defaultBindAddr,
         bindPort: Port(19302), targetHost: "internal.example", targetPort: Port(80))
     let tc = newTc("remote-1", "host-daemon-remote-1", spec, autostart = true)
@@ -264,11 +277,11 @@ suite "tunnel.list: -R の統計は null":
     shutdown(d)
 
 # ---------------------------------------------------------------------------
-# 5. tunnel.stop → 状態が変わり、reload しても勝手に再開しない
+# 5. tunnel.stop -> state changes, and it does not restart on its own even after reload
 # ---------------------------------------------------------------------------
 
-suite "tunnel.stop と daemon.reload":
-  test "stop 後は fwActive でなくなり、無関係な reload をしても再開しない":
+suite "tunnel.stop and daemon.reload":
+  test "after stop it is no longer fwActive, and an unrelated reload does not restart it":
     let spec = ForwardSpec(kind: fkLocal, bindAddr: defaultBindAddr,
         bindPort: Port(19303), targetHost: "db.internal", targetPort: Port(5432))
     let tc = newTc("stop-1", "host-daemon-stop-1", spec, autostart = true)
@@ -283,19 +296,19 @@ suite "tunnel.stop と daemon.reload":
         let stopRes = d.server.handlers["tunnel.stop"](%*{"names": %*["stop-1"]})
         check stopRes["stopped"][0].getStr == "stop-1"
 
-        # 同期的に反映される（reconcile はハンドラの中で直接呼ばれる）
+        # Reflected synchronously (reconcile is called directly inside the handler)
         block:
           let e = findEntry(listAll(d), "stop-1")
           check e != nil
           check e["state"].getStr != "fwActive"
 
-        # 数 tick 進めても再度 fwActive にはならない
+        # Even after advancing a few ticks, it does not become fwActive again
         for i in 0 ..< 5:
           discard await d.tickOnce()
           await sleepAsync(20)
         check findEntry(listAll(d), "stop-1")["state"].getStr != "fwActive"
 
-        # 無関係な reload をしても勝手に再開しない
+        # An unrelated reload does not restart it on its own
         discard d.server.handlers[mDaemonReload](nil)
         for i in 0 ..< 5:
           discard await d.tickOnce()
@@ -307,11 +320,11 @@ suite "tunnel.stop と daemon.reload":
     shutdown(d)
 
 # ---------------------------------------------------------------------------
-# 6. 同じ host の2トンネルが1つのマスターを共有し、host.list が1件だけ返す
+# 6. Two tunnels for the same host share one master, and host.list returns only one entry
 # ---------------------------------------------------------------------------
 
-suite "マスター共有":
-  test "同じ host を指す2トンネルが1つのマスターを共有し、host.list が1件だけ返す":
+suite "master sharing":
+  test "two tunnels pointing at the same host share one master, and host.list returns only one entry":
     let hostName = "host-daemon-shared"
     let spec1 = ForwardSpec(kind: fkLocal, bindAddr: defaultBindAddr,
         bindPort: Port(19304), targetHost: "db1.internal", targetPort: Port(1))
@@ -338,11 +351,11 @@ suite "マスター共有":
     shutdown(d)
 
 # ---------------------------------------------------------------------------
-# 7. tunnel.inspect: 存在しない名前は RpcError(errTunnelNotFound)
+# 7. tunnel.inspect: a nonexistent name is RpcError(errTunnelNotFound)
 # ---------------------------------------------------------------------------
 
 suite "tunnel.inspect":
-  test "存在しないトンネル名は RpcError(errTunnelNotFound)":
+  test "a nonexistent tunnel name is RpcError(errTunnelNotFound)":
     let d = track(newDaemon(freshOpts(@[])))
     var caught = false
     try:
@@ -354,11 +367,11 @@ suite "tunnel.inspect":
     shutdown(d)
 
 # ---------------------------------------------------------------------------
-# 8. daemon.reload: 設定の変更を反映する
+# 8. daemon.reload: reflects configuration changes
 # ---------------------------------------------------------------------------
 
 suite "daemon.reload":
-  test "設定に1つトンネルを追加してから reload すると反映される":
+  test "adding a tunnel to the config and then reloading reflects it":
     let spec0 = ForwardSpec(kind: fkLocal, bindAddr: defaultBindAddr,
         bindPort: Port(19306), targetHost: "db.internal", targetPort: Port(5432))
     let tc0 = newTc("base-1", "host-daemon-base-1", spec0, autostart = true)
@@ -388,11 +401,11 @@ suite "daemon.reload":
     shutdown(d)
 
 # ---------------------------------------------------------------------------
-# 9. ハンドラが例外を投げてもデーモンの状態が壊れない
+# 9. Daemon state is not corrupted even if a handler raises an exception
 # ---------------------------------------------------------------------------
 
-suite "ハンドラの例外耐性":
-  test "ハンドラが例外を投げても daemon の状態は壊れず、他のハンドラは動き続ける":
+suite "handler exception resilience":
+  test "even if a handler raises an exception, the daemon's state is not corrupted and other handlers keep working":
     let d = track(newDaemon(freshOpts(@[])))
     d.server.register("test.boom", proc(p: JsonNode): JsonNode =
       raise newException(ValueError, "boom"))
@@ -404,7 +417,7 @@ suite "ハンドラの例外耐性":
       caught = true
     check caught
 
-    # daemon の状態は壊れておらず、他のハンドラは引き続き動く
+    # The daemon's state is not corrupted, and other handlers keep working
     check d.reg.forwards.len == 0
     check d.reg.hosts.len == 0
     let pingRes = d.server.handlers[mDaemonPing](nil)
@@ -412,16 +425,16 @@ suite "ハンドラの例外耐性":
     shutdown(d)
 
 # ---------------------------------------------------------------------------
-# 10. graceful shutdown: reg.forwards / reg.hosts が空になり、残骸が無い
+# 10. graceful shutdown: reg.forwards / reg.hosts become empty, no leftovers
 # ---------------------------------------------------------------------------
 
 suite "graceful shutdown":
-  test "shutdown 後に reg.forwards / reg.hosts が空になり、プロセスの残骸が無い":
+  test "after shutdown, reg.forwards / reg.hosts are empty and no process is left behind":
     let spec = ForwardSpec(kind: fkLocal, bindAddr: defaultBindAddr,
         bindPort: Port(19308), targetHost: "db.internal", targetPort: Port(5432))
     let tc = newTc("shutdown-1", "host-daemon-shutdown-1", spec,
         autostart = true)
-    let d = newDaemon(freshOpts(@[tc])) ## この test 自身で shutdown まで確認するので track しない
+    let d = newDaemon(freshOpts(@[tc])) ## Not tracked because this test itself verifies through shutdown
 
     withMode("ok", proc() =
       proc scenario() {.async.} =
@@ -444,11 +457,11 @@ suite "graceful shutdown":
       waitFor scenario())
 
 # ---------------------------------------------------------------------------
-# 後片付け: すべての Daemon を shutdown し、ランタイム/状態/設定ディレクトリを消す
+# Cleanup: shutdown all Daemons and remove the runtime/state/config directories
 # ---------------------------------------------------------------------------
 
 for d in allDaemons:
-  shutdown(d) ## 各テストで既に片付けていれば一瞬で終わる安全網
+  shutdown(d) ## Safety net that finishes instantly if each test already cleaned up
 
 removeDir(testRuntimeDir)
 removeDir(testStateDir)
@@ -458,12 +471,16 @@ delEnv("POWARDER_FAKE_SSH_LOG")
 delEnv(envRuntimeDir)
 delEnv(envStateDir)
 
-# fake ssh のリスナー（nc / python3 / perl）は、`hostsession.teardown` が最終手段の
-# SIGKILL を送ると fake ssh 側の trap が発火しないため孤児化して残る。残ったままだと
-# 親から継承した pipe が閉じず、`nimble test` が EOF を待って**ハングする**
-# （実測: Linux コンテナで3時間ハングした）。fake ssh 側で fd を閉じる方法は
-# dash の挙動と asyncdispatch の fd 継承の2点で壊れたため、ここで確実に掃除する。
+# The fake ssh listener (nc / python3 / perl) is orphaned when
+# `hostsession.teardown`'s last resort, SIGKILL, is sent, because the fake
+# ssh side's trap does not fire. If it is left behind, the pipe inherited
+# from the parent does not close, and `nimble test` **hangs** waiting for
+# EOF (observed in practice: hung for 3 hours in a Linux container). The
+# approach of closing the fd on the fake ssh side broke due to two issues
+# -- dash's behavior and asyncdispatch's fd inheritance -- so it is
+# reliably cleaned up here instead.
 #
-# `[p]` のブラケットは `pkill` が自分自身のコマンドラインにマッチして自滅するのを
-# 防ぐための定石（実測で踏んだ。exit 144 になる）。
+# The `[p]` bracket trick is the standard way to prevent `pkill` from
+# matching its own command line and killing itself (hit this in practice;
+# it results in exit 144).
 discard execShellCmd("pkill -f '" & testRuntimeDir & "' >/dev/null 2>&1 || true")

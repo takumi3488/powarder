@@ -1,17 +1,18 @@
-## `powarder/cli/argv` と `powarder/cli/output` のテスト。
+## Tests for `powarder/cli/argv` and `powarder/cli/output`.
 
 import std/unittest
 import std/os
 import std/strutils
-import std/nativesockets ## `Port` の `==` を使うために必要
+import std/nativesockets ## needed for `Port`'s `==`
 import powarder/core/types
 import powarder/core/errorclass
 import powarder/cli/argv
 import powarder/cli/output
 
 proc withEnv(pairs: openArray[(string, string)], body: proc()) =
-  ## 環境変数を一時的に差し替える。テスト間で状態が漏れないようにする
-  ## （`tests/tpaths.nim` のヘルパーを踏襲）。
+  ## Temporarily overrides environment variables, restoring them afterward
+  ## so state doesn't leak across tests (mirrors the helper in
+  ## `tests/tpaths.nim`).
   var saved: seq[(string, bool, string)]
   for (k, v) in pairs:
     saved.add (k, existsEnv(k), getEnv(k))
@@ -23,7 +24,7 @@ proc withEnv(pairs: openArray[(string, string)], body: proc()) =
       if existed: putEnv(k, old) else: delEnv(k)
 
 # ===========================================================================
-# argv: 正常系（実装1の要件表を全行網羅）
+# argv: happy path (covers every row of the implementation-1 requirements table)
 # ===========================================================================
 
 suite "parseArgv - run":
@@ -86,7 +87,7 @@ suite "parseArgv - logs":
     check p.tailLines == 100
     check p.positional == @["prod-db"]
 
-  test "logs のみだと tailLines は既定の 50":
+  test "logs alone defaults tailLines to 50":
     let p = parseArgv(["logs", "prod-db"])
     check p.tailLines == 50
 
@@ -105,51 +106,51 @@ suite "parseArgv - daemon / completion":
     check p.subcommand == "completion"
     check p.subsubcommand == "zsh"
 
-suite "parseArgv - エイリアス / メタコマンド":
-  test "ls は ps のエイリアス":
+suite "parseArgv - aliases / meta commands":
+  test "ls is an alias for ps":
     let p = parseArgv(["ls"])
     check p.subcommand == "ps"
 
-  test "--version は versionRequested":
+  test "--version sets versionRequested":
     check parseArgv(["--version"]).versionRequested
 
-  test "version は versionRequested":
+  test "version sets versionRequested":
     check parseArgv(["version"]).versionRequested
 
-  test "--help は helpRequested":
+  test "--help sets helpRequested":
     check parseArgv(["--help"]).helpRequested
 
-  test "help は helpRequested":
+  test "help sets helpRequested":
     check parseArgv(["help"]).helpRequested
 
-  test "引数なしは helpRequested":
+  test "no arguments sets helpRequested":
     check parseArgv([]).helpRequested
 
-suite "parseArgv - 複数 positional":
+suite "parseArgv - multiple positional args":
   test "stop a b c":
     let p = parseArgv(["stop", "a", "b", "c"])
     check p.subcommand == "stop"
     check p.positional == @["a", "b", "c"]
 
 # ===========================================================================
-# argv: エラーになるべき入力
+# argv: inputs that should error
 # ===========================================================================
 
-suite "parseArgv - エラー":
-  test "-L の後に値が無い":
+suite "parseArgv - errors":
+  test "-L with no following value":
     expect ArgvError:
       discard parseArgv(["run", "-L"])
 
-  test "-L の値が不正 (parseForwardSpec 由来の ValueError がそのまま伝播する)":
+  test "invalid -L value (the ValueError from parseForwardSpec propagates as-is)":
     var msg = ""
     try:
       discard parseArgv(["run", "-L", "bogus", "host"])
       fail()
     except ValueError as e:
       msg = e.msg
-    check "-L" in msg ## どの引数が悪いか分かる情報を含めている
+    check "-L" in msg ## includes info about which argument was bad
 
-  test "-R の値が不正でもフラグ名がメッセージに残る":
+  test "invalid -R value still keeps the flag name in the message":
     var msg = ""
     try:
       discard parseArgv(["run", "-R", "not-a-port:host:80", "host"])
@@ -158,62 +159,62 @@ suite "parseArgv - エラー":
       msg = e.msg
     check "-R" in msg
 
-  test "未知のフラグ (--bogus)":
+  test "unknown flag (--bogus)":
     expect ArgvError:
       discard parseArgv(["run", "--bogus"])
 
-  test "-n の値が数値でない":
+  test "-n value is not a number":
     expect ArgvError:
       discard parseArgv(["logs", "-n", "abc", "prod-db"])
 
-  test "daemon の後に未知のサブサブコマンド":
+  test "unknown sub-subcommand after daemon":
     expect ArgvError:
       discard parseArgv(["daemon", "bogus"])
 
-  test "completion の後に未知のシェル":
+  test "unknown shell after completion":
     expect ArgvError:
       discard parseArgv(["completion", "powershell"])
 
-  test "--config の後に値が無い":
+  test "--config with no following value":
     expect ArgvError:
       discard parseArgv(["up", "--config"])
 
 # ===========================================================================
-# argv: -f の多義性（サブコマンドで意味が変わる）
+# argv: -f is polysemous (its meaning changes by subcommand)
 # ===========================================================================
 
-suite "parseArgv - -f の多義性":
-  test "logs -f は follow":
+suite "parseArgv - -f polysemy":
+  test "logs -f means follow":
     let p = parseArgv(["logs", "-f", "x"])
     check p.follow
     check p.configPath == ""
 
-  test "up -f は configPath":
+  test "up -f means configPath":
     let p = parseArgv(["up", "-f", "x"])
     check p.configPath == "x"
     check not p.follow
 
-  test "down -f も configPath":
+  test "down -f also means configPath":
     let p = parseArgv(["down", "-f", "x"])
     check p.configPath == "x"
 
 # ===========================================================================
-# argv: -- 以降は全部 positional
+# argv: everything after -- is positional
 # ===========================================================================
 
-suite "parseArgv - -- リテラル":
-  test "-- 以降はフラグとして解釈されず positional になる":
+suite "parseArgv - -- literal":
+  test "everything after -- is treated as positional, not flags":
     let p = parseArgv(["run", "--", "-L", "8080:x:80", "host"])
     check p.subcommand == "run"
     check p.positional == @["-L", "8080:x:80", "host"]
     check p.localForwards.len == 0
 
 # ===========================================================================
-# argv: -L の繰り返しが順序を保つ
+# argv: repeated -L preserves order
 # ===========================================================================
 
-suite "parseArgv - -L の繰り返し順序":
-  test "2つの -L が入力順のまま蓄積される":
+suite "parseArgv - repeated -L order":
+  test "two -L flags accumulate in input order":
     let p = parseArgv(["run", "-L", "111:a:111", "-L", "222:b:222", "-L",
                         "333:c:333", "host"])
     check p.localForwards.len == 3
@@ -226,7 +227,7 @@ suite "parseArgv - -L の繰り返し順序":
 # ===========================================================================
 
 suite "output: table":
-  test "桁揃えされ、行末に余分な空白が無い":
+  test "columns are aligned with no trailing whitespace":
     let w = newWriter(noColor = true)
     let header = @["NAME", "TYPE", "STATUS"]
     let rows = @[@["prod-db", "-L", "healthy"], @["webhook", "-R", "up"]]
@@ -235,12 +236,13 @@ suite "output: table":
     check lines.len == 3
     for line in lines:
       check line == line.strip(leading = false, trailing = true)
-    # 内容そのものは splitWhitespace で復元できる（列パディングは空白のみのため）
+    # The content itself can be recovered via splitWhitespace (since column
+    # padding uses only spaces)
     check lines[0].splitWhitespace() == header
     check lines[1].splitWhitespace() == rows[0]
     check lines[2].splitWhitespace() == rows[1]
 
-  test "色が有効なときヘッダだけ bold になる":
+  test "only the header is bold when color is enabled":
     let w = Writer(useColor: true, mode: omAuto, quiet: false)
     let rendered = table(w, @["NAME"], @[@["x"]])
     let lines = rendered.splitLines()
@@ -248,37 +250,37 @@ suite "output: table":
     check "\e[1m" notin lines[1]
 
 # ===========================================================================
-# output: --json / NO_COLOR / --no-color / --quiet で色・絵文字が無効化される
+# output: --json / NO_COLOR / --no-color / --quiet disable color and emoji
 # ===========================================================================
 
-suite "output: 色と絵文字の無効化":
-  test "--json のとき useColor は false":
+suite "output: disabling color and emoji":
+  test "--json makes useColor false":
     let w = newWriter(json = true)
     check not w.useColor
     check w.mode == omJson
-    check success(w, "done") == "OK: done" ## 絵文字 ✔ の代わりにプレーンテキスト
+    check success(w, "done") == "OK: done" ## plain text instead of the ✔ emoji
     check failure(w, "bad") == "FAIL: bad"
     check warn(w, "careful") == "WARN: careful"
 
-  test "--no-color のとき useColor は false":
+  test "--no-color makes useColor false":
     let w = newWriter(noColor = true)
     check not w.useColor
     check w.mode == omPlain
     check success(w, "done") == "OK: done"
 
-  test "NO_COLOR 環境変数が存在するだけで useColor は false になる":
+  test "the mere presence of the NO_COLOR env var makes useColor false":
     withEnv({"NO_COLOR": "1"}, proc() =
       let w = newWriter()
       check not w.useColor)
 
-  test "quiet のとき success/info は空文字列、failure/warn は残る":
+  test "under quiet, success/info are empty strings but failure/warn remain":
     let w = newWriter(quiet = true)
     check success(w, "x") == ""
     check info(w, "y") == ""
     check failure(w, "z") == "FAIL: z"
     check warn(w, "w") == "WARN: w"
 
-  test "色が有効なときは ✔/✘/⚠ の絵文字と ANSI エスケープを含む":
+  test "when color is enabled, includes the ✔/✘/⚠ emoji and ANSI escapes":
     let w = Writer(useColor: true, mode: omAuto, quiet: false)
     check "✔" in success(w, "done")
     check "✘" in failure(w, "bad")
@@ -290,26 +292,26 @@ suite "output: 色と絵文字の無効化":
 # ===========================================================================
 
 suite "output: renderError":
-  test "3段構成（見出し・原因と対処・生の stderr）を含み、生の stderr が必ず残る":
+  test "includes the three-part structure (headline, cause and remedy, raw stderr) and always keeps the raw stderr":
     let w = newWriter(noColor = true)
     let ctx = initErrorContext(host = "prod-bastion", bindPort = 5432)
     let rawStderr = "bind [127.0.0.1]:5432: Address already in use\n"
     let rendered = renderError(w, ekPortInUse, ctx, langJa, rawStderr)
     let lines = rendered.splitLines()
 
-    # 1段目: 見出し（何が失敗したか）
+    # Part 1: headline (what failed)
     check lines[0].startsWith("FAIL:")
     check "prod-bastion" in lines[0]
     check lines[1] == ""
 
-    # 2段目: 原因の説明と対処のヒント
+    # Part 2: explanation of the cause and remediation hints
     check "5432" in rendered
-    check "ポート" in rendered
+    check "port" in rendered
 
-    # 3段目: 生の stderr が必ず含まれる
+    # Part 3: the raw stderr is always included
     check "(ssh: bind [127.0.0.1]:5432: Address already in use)" in rendered
 
-  test "英語ロケールでも生の stderr は同じ内容が残る":
+  test "the raw stderr keeps the same content under the English locale too":
     let w = newWriter(noColor = true)
     let ctx = initErrorContext(host = "prod-bastion", bindPort = 5432)
     let rawStderr = "bind [127.0.0.1]:5432: Address already in use\n"
@@ -322,24 +324,24 @@ suite "output: renderError":
 # ===========================================================================
 
 suite "output: detectLang":
-  test "LANG=ja_JP.UTF-8 で langJa":
+  test "LANG=ja_JP.UTF-8 gives langJa":
     withEnv({"LC_ALL": "", "LANG": "ja_JP.UTF-8"}, proc() =
       check detectLang() == langJa)
 
-  test "LANG=en_US.UTF-8 で langEn":
+  test "LANG=en_US.UTF-8 gives langEn":
     withEnv({"LC_ALL": "", "LANG": "en_US.UTF-8"}, proc() =
       check detectLang() == langEn)
 
-  test "LC_ALL が LANG より優先される":
+  test "LC_ALL takes priority over LANG":
     withEnv({"LC_ALL": "ja_JP.UTF-8", "LANG": "en_US.UTF-8"}, proc() =
       check detectLang() == langJa)
 
 # ===========================================================================
-# output: -R の行は統計列が "-" になる
+# output: -R rows have "-" stat columns
 # ===========================================================================
 
-suite "output: -R 行の統計列":
-  test "-R は CONNS/RX-TX/LAST が '-' なテーブル行を作れる":
+suite "output: -R row stat columns":
+  test "-R can build a table row where CONNS/RX-TX/LAST are '-'":
     let w = newWriter(noColor = true)
     let header = @["NAME", "TYPE", "BIND", "TARGET", "HOST", "CONNS", "RX/TX",
                    "LAST", "UPTIME", "STATUS"]
@@ -353,7 +355,7 @@ suite "output: -R 行の統計列":
     check lines.len == 3
     check lines[1].splitWhitespace() == localRow
     check lines[2].splitWhitespace() == remoteRow
-    # -R の行では原理的に取れない統計列が "-" になっていること
+    # stat columns that can't be obtained in principle for -R rows must be "-"
     check remoteRow[5] == "-" ## CONNS
     check remoteRow[6] == "-" ## RX/TX
     check remoteRow[7] == "-" ## LAST

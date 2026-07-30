@@ -1,33 +1,35 @@
-## ssh の `-L` / `-R` 引数と完全互換な文字列と `ForwardSpec` の相互変換。
+## Conversion between `ForwardSpec` and strings fully compatible with ssh's
+## `-L` / `-R` arguments.
 ##
-## CLI 引数とファイル設定ファイルの両方の入口になるため、ssh 本体のフォーマットに
-## 厳密に追従する。IPv6 アドレスは `[addr]` のブラケット記法で扱う。
+## This is the entry point for both CLI arguments and config file settings, so
+## it strictly follows ssh's own format. IPv6 addresses are handled with the
+## `[addr]` bracket notation.
 ##
-## このモジュールは I/O を一切行わない。`std/asyncnet` / `std/osproc` / `std/os` を
-## import しない。
+## This module performs no I/O. It does not import `std/asyncnet` /
+## `std/osproc` / `std/os`.
 
 import std/strutils
-import std/nativesockets ## `Port` の `$` / `==` を使うために必要
-                          ## （types.nim は `export Port` で型のみ再輸出しているため）
+import std/nativesockets ## needed to use `Port`'s `$` / `==`
+                          ## (types.nim re-exports only the type via `export Port`)
 import powarder/core/types
 import powarder/core/hashid
 
 # ---------------------------------------------------------------------------
-# 内部ヘルパー
+# Internal helpers
 # ---------------------------------------------------------------------------
 
 proc bracketize(host: string): string =
-  ## IPv6 リテラル（`:` を含む）だけブラケットで包む。IPv4 やホスト名は
-  ## `:` を含まないため素通りする。
+  ## Wraps only IPv6 literals (which contain `:`) in brackets. IPv4 addresses
+  ## and hostnames don't contain `:`, so they pass through unchanged.
   if host.contains(':'):
     "[" & host & "]"
   else:
     host
 
 proc tokenizeFields(s: string): seq[string] =
-  ## `[bind_address:]port:host:hostport` を `:` で分割する。
-  ## `[...]` で囲まれた IPv6 リテラル内部の `:` はトップレベルの区切りとして
-  ## 扱わない。
+  ## Splits `[bind_address:]port:host:hostport` on `:`.
+  ## A `:` inside an IPv6 literal enclosed in `[...]` is not treated as a
+  ## top-level separator.
   result = @[]
   var i = 0
   let n = s.len
@@ -35,14 +37,14 @@ proc tokenizeFields(s: string): seq[string] =
     if i < n and s[i] == '[':
       let closeIdx = s.find(']', i + 1)
       if closeIdx < 0:
-        raise newException(ValueError, "閉じていない '[' があります: " & s)
+        raise newException(ValueError, "Unterminated '[' found: " & s)
       result.add(s[i + 1 ..< closeIdx])
       i = closeIdx + 1
       if i >= n:
         break
       if s[i] != ':':
         raise newException(ValueError,
-            "IPv6 リテラル ']' の直後は ':' である必要があります: " & s)
+            "The character right after the IPv6 literal's ']' must be ':': " & s)
       inc i
       if i == n:
         result.add("")
@@ -60,37 +62,39 @@ proc tokenizeFields(s: string): seq[string] =
           break
 
 proc parsePortStrict(token, input: string): Port =
-  ## ポート番号として妥当（1-65535の整数）かを検証しつつ `Port` へ変換する。
+  ## Validates that the token is a valid port number (an integer from 1 to
+  ## 65535) and converts it to `Port`.
   var value: int
   try:
     value = parseInt(token)
   except ValueError:
     raise newException(ValueError,
-        "ポート番号が数値ではありません (\"" & token & "\"): " & input)
+        "Port number is not numeric (\"" & token & "\"): " & input)
   if value < 1 or value > 65535:
     raise newException(ValueError,
-        "ポート番号が範囲外です (1-65535 の範囲で指定してください、実際は " &
+        "Port number out of range (must be between 1 and 65535, got " &
         $value & "): " & input)
   Port(value)
 
 # ---------------------------------------------------------------------------
-# 公開 API
+# Public API
 # ---------------------------------------------------------------------------
 
 proc parseForwardSpec*(s: string, kind: ForwardKind): ForwardSpec =
-  ## ssh 互換の `[bind_address:]port:host:hostport` をパースする。
+  ## Parses the ssh-compatible `[bind_address:]port:host:hostport` format.
   ##
-  ## - フィールドが3個なら `bind_address` は省略されたとみなし
-  ##   `defaultBindAddr` を使う。4個なら先頭が `bind_address`。
-  ## - `*` は ssh が「全アドレス」として受け付ける慣習に合わせて `0.0.0.0` に
-  ##   正規化する（内部表現・比較を単純にするための判断。往復変換では
-  ##   `0.0.0.0` として出力される）。
-  ## - IPv6 は `[addr]` のブラケット記法のみ受け付ける。
-  ## - port は 1-65535 の整数でなければならない（0 は ssh 本体も
-  ##   `-O forward` 経由では `Bad local forwarding specification` として
-  ##   拒否するため、powarder でも同様に拒否する）。
+  ## - With 3 fields, `bind_address` is considered omitted and
+  ##   `defaultBindAddr` is used. With 4 fields, the first one is
+  ##   `bind_address`.
+  ## - `*` is normalized to `0.0.0.0`, matching ssh's convention of accepting
+  ##   it as "all addresses" (this simplifies the internal representation and
+  ##   comparisons; the round-trip conversion outputs `0.0.0.0`).
+  ## - IPv6 is accepted only in `[addr]` bracket notation.
+  ## - port must be an integer from 1 to 65535 (ssh itself also rejects 0 via
+  ##   `-O forward` as `Bad local forwarding specification`, so powarder
+  ##   rejects it the same way).
   if s.len == 0:
-    raise newException(ValueError, "空文字列は指定できません")
+    raise newException(ValueError, "Empty string is not allowed")
 
   let fields = tokenizeFields(s)
 
@@ -112,17 +116,17 @@ proc parseForwardSpec*(s: string, kind: ForwardKind): ForwardSpec =
     targetPortTok = fields[3]
   else:
     raise newException(ValueError,
-        "フィールド数が不正です ([bind_address:]port:host:hostport の3または" &
-        "4フィールドである必要があります、実際は " &
-        $fields.len & "個): " & s)
+        "Invalid field count (must be 3 or 4 fields as in " &
+        "[bind_address:]port:host:hostport, got " &
+        $fields.len & "): " & s)
 
   if bindAddr == "*":
     bindAddr = "0.0.0.0"
 
   if bindAddr.len == 0:
-    raise newException(ValueError, "bind_address が空です: " & s)
+    raise newException(ValueError, "bind_address is empty: " & s)
   if targetHost.len == 0:
-    raise newException(ValueError, "転送先ホストが空です: " & s)
+    raise newException(ValueError, "target host is empty: " & s)
 
   let bindPort = parsePortStrict(bindPortTok, s)
   let targetPort = parsePortStrict(targetPortTok, s)
@@ -131,21 +135,22 @@ proc parseForwardSpec*(s: string, kind: ForwardKind): ForwardSpec =
               targetHost: targetHost, targetPort: targetPort)
 
 proc formatForwardSpec*(spec: ForwardSpec): string =
-  ## `parseForwardSpec` の逆変換。`bindAddr` が `defaultBindAddr` と等しい
-  ## 場合でも省略せず明示的に出力する（往復変換で情報が落ちないように）。
-  ## IPv6 リテラルにはブラケットを付ける。
+  ## The inverse of `parseForwardSpec`. Even when `bindAddr` equals
+  ## `defaultBindAddr`, it is still output explicitly rather than omitted (so
+  ## no information is lost on round-trip conversion). IPv6 literals are
+  ## bracketed.
   bracketize(spec.bindAddr) & ":" & $spec.bindPort & ":" &
     bracketize(spec.targetHost) & ":" & $spec.targetPort
 
 proc toSshForwardArg*(spec: ForwardSpec, udsPath = ""): string =
-  ## `ssh -O forward -L` / `-R` に渡す引数文字列を組み立てる。
+  ## Builds the argument string passed to `ssh -O forward -L` / `-R`.
   ##
-  ## - `fkLocal` かつ `udsPath` が非空: powarder は ssh に UDS を張らせ、
-  ##   自身が listen する `bindPort` は ssh には渡さない。
+  ## - `fkLocal` with a non-empty `udsPath`: powarder has ssh set up the UDS,
+  ##   and does not pass its own listening `bindPort` to ssh.
   ##   -> `<udsPath>:<targetHost>:<targetPort>`
-  ## - `fkLocal` かつ `udsPath` が空: TCP フォールバック。
+  ## - `fkLocal` with an empty `udsPath`: TCP fallback.
   ##   -> `<bindAddr>:<bindPort>:<targetHost>:<targetPort>`
-  ## - `fkRemote`: UDS は使わない（リモート側が listen するため）。
+  ## - `fkRemote`: UDS is not used (the remote side does the listening).
   ##   -> `<bindAddr>:<bindPort>:<targetHost>:<targetPort>`
   let targetHostStr = bracketize(spec.targetHost)
   if spec.kind == fkLocal and udsPath.len > 0:
@@ -155,13 +160,13 @@ proc toSshForwardArg*(spec: ForwardSpec, udsPath = ""): string =
       targetHostStr & ":" & $spec.targetPort
 
 proc forwardId*(spec: ForwardSpec, host: string): string =
-  ## Forward の一意な識別子。bind する実体から決定的に導出する。
+  ## Forward's unique identifier, deterministically derived from what it binds.
   ##
-  ## - `fkLocal`: ローカルポートはマシン全体でグローバルに一意でなければ
-  ##   ならないため `host` を含めない。これにより「2つのトンネルが同じ
-  ##   ローカルポートを取り合っている」設定ミスを検出できる。
-  ## - `fkRemote`: リモート側の bind はホストごとに一意でよいため `host`
-  ##   を含める。
+  ## - `fkLocal`: the local port must be globally unique across the whole
+  ##   machine, so `host` is not included. This lets us detect the
+  ##   misconfiguration of "two tunnels fighting over the same local port".
+  ## - `fkRemote`: the remote-side bind only needs to be unique per host, so
+  ##   `host` is included.
   case spec.kind
   of fkLocal:
     "L:" & spec.bindAddr & ":" & $spec.bindPort
@@ -169,12 +174,14 @@ proc forwardId*(spec: ForwardSpec, host: string): string =
     "R:" & host & ":" & spec.bindAddr & ":" & $spec.bindPort
 
 proc udsBasename*(id: string): string =
-  ## `forwardId` の結果から UDS ファイル名を導出する。`sun_path` の長さ
-  ## 制限のため、`hashid.hashHex` で8桁（32bit・小文字16進）に短縮する。
+  ## Derives the UDS filename from `forwardId`'s result. Because of the
+  ## `sun_path` length limit, it is shortened to 8 hex digits (32 bits,
+  ## lowercase hex) via `hashid.hashHex`.
   ##
-  ## 8桁hex = 32bit なので理論上は衝突しうるが、同時に存在するフォワードは
-  ## 数十本程度であり誕生日問題を踏まえても衝突確率は無視できる。万一衝突
-  ## しても `-O forward` が `Port forwarding failed` を返すため沈黙して
-  ## 壊れることはなく、`daemon/forward.nim` 側で残骸を unlink して1回
-  ## 再試行する経路に乗る。
+  ## 8 hex digits = 32 bits, so a collision is theoretically possible, but
+  ## with only a few dozen forwards existing at once, the collision
+  ## probability is negligible even accounting for the birthday problem. Even
+  ## in the rare event of a collision, it does not fail silently: `-O forward`
+  ## returns `Port forwarding failed`, which routes into the path where
+  ## `daemon/forward.nim` unlinks the leftover file and retries once.
   hashHex(id, 8)

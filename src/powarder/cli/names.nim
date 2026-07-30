@@ -1,18 +1,20 @@
-## ad-hoc な `powarder run` で `--name` が省略されたときの自動命名。
+## Automatic naming for ad-hoc `powarder run` invocations that omit `--name`.
 ##
-## docker が付ける "boring_wozniak" のような「形容詞-名詞」形式に倣う。
-## `randomName()` は `std/random` の**グローバル**な既定 RNG を使う。呼び出す
-## たびに `randomize()`（現在時刻でグローバル状態を再シードする）を呼んでから
-## 使うため、この呼び出し位置がそのまま「毎回違う名前になる」ことの根拠になる。
-## CLI は 1 起動につき `run` を高々数回しか呼ばないため、毎回再シードするコストは
-## 無視できる。
+## Follows the "adjective-noun" style docker uses for names like
+## "boring_wozniak". `randomName()` uses `std/random`'s **global** default RNG.
+## It calls `randomize()` (which reseeds the global state from the current
+## time) before every use, and that call is exactly what guarantees "a
+## different name every time." The CLI calls `run` at most a handful of times
+## per invocation, so the cost of reseeding every time is negligible.
 ##
-## テストで決定的な結果が必要な場合は `randomName(seed)` を使うこと。こちらは
-## グローバル状態を一切触らない専用の `Rand` を都度 `initRand(seed)` で作るので、
-## 他のテスト・他のモジュールが使うグローバル RNG の状態を汚さない。
+## Use `randomName(seed)` when a test needs a deterministic result. It creates
+## its own dedicated `Rand` via `initRand(seed)` each time, touching no global
+## state at all, so it never pollutes the global RNG state used by other tests
+## or other modules.
 ##
-## このモジュールは呼び出しごとに RNG の状態を進める（`randomName()` は
-## グローバル状態、`randomName(seed)` はローカル変数）以外の I/O を行わない。
+## This module performs no I/O beyond advancing RNG state on each call
+## (`randomName()` advances global state, `randomName(seed)` advances a local
+## variable).
 
 import std/random
 
@@ -40,13 +42,13 @@ proc joinName(adjIdx, nounIdx: int): string =
   adjectives[adjIdx] & "-" & nouns[nounIdx]
 
 proc randomName*(seed: int): string =
-  ## 決定的版（テスト用）。同じ `seed` からは常に同じ名前を返す。
-  ## グローバルな RNG 状態には一切触れない専用の `Rand` を使う。
+  ## Deterministic variant (for tests). Always returns the same name for the
+  ## same `seed`. Uses a dedicated `Rand` that never touches global RNG state.
   var rng = initRand(seed.int64)
   joinName(rng.rand(adjectives.high), rng.rand(nouns.high))
 
 proc randomName*(): string =
-  ## 非決定的版。`std/random` のグローバル既定 RNG を現在時刻で再シードしてから
-  ## 使う（モジュール doc comment 参照）。
+  ## Non-deterministic variant. Reseeds `std/random`'s global default RNG from
+  ## the current time before use (see the module doc comment).
   randomize()
   joinName(rand(adjectives.high), rand(nouns.high))

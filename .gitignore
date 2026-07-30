@@ -3,6 +3,6 @@ nimcache/
 *.exe
 htmldocs/
 
-# nim c -r が tests/ に吐く実行バイナリ（ソースは追跡する）
+# executable binaries that `nim c -r` writes under tests/ (sources are tracked)
 tests/t*
 !tests/t*.nim

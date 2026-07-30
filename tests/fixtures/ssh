@@ -1,23 +1,25 @@
 #!/bin/sh
-# fake ssh フィクスチャ。
+# fake ssh fixture.
 #
-# 実 SSH サーバなしに daemon/muxclient（および後続の hostsession）をテスト
-# するためのスタブ。`PATH` の先頭にこのスクリプトを置いて powarder に `ssh` として
-# 掴ませる。挙動は環境変数 POWARDER_FAKE_SSH_MODE で切り替える。
+# A stub for testing daemon/muxclient (and later hostsession) without a real
+# SSH server. Place this script at the front of `PATH` so powarder picks it
+# up as `ssh`. Behavior is switched via the POWARDER_FAKE_SSH_MODE
+# environment variable.
 #
-# 出力文言は実測した本物の OpenSSH（core/muxparse.nim のテストに使われている
-# ものと同じ）を一字一句再現する。文言を変えると muxparse の判定がそのまま
-# 通らなくなるので、変更する場合は core/muxparse.nim / tests/tmuxparse.nim 側の
-# 実測データとの整合を必ず確認すること。
+# The output wording reproduces real, measured OpenSSH output verbatim (the
+# same wording used in core/muxparse.nim's tests). Changing the wording will
+# break muxparse's parsing as-is, so if you change it, be sure to check
+# consistency with the measured data in core/muxparse.nim / tests/tmuxparse.nim.
 
 mode="${POWARDER_FAKE_SSH_MODE:-ok}"
 orig_args="$*"
 
-# --- 引数の記録 -------------------------------------------------------------
-# POWARDER_FAKE_SSH_LOG が設定されていたら、受け取った全引数を1行にして追記する。
-# 引数の区切りには ASCII unit separator (0x1F) を使う。空白区切りにすると、
-# ホスト名やパスに空白が含まれるケース（quoteShell のテスト）で引数の境界が
-# 分からなくなるため、テスト側が正確に argv を復元できるようにしている。
+# --- Argument logging -------------------------------------------------------
+# If POWARDER_FAKE_SSH_LOG is set, append all received arguments as one line.
+# Arguments are separated with the ASCII unit separator (0x1F). Space-
+# separated would make argument boundaries ambiguous when a hostname or path
+# contains a space (the quoteShell test case), so this lets the test side
+# reconstruct argv exactly.
 if [ -n "$POWARDER_FAKE_SSH_LOG" ]; then
   logline=""
   first=1
@@ -32,7 +34,7 @@ if [ -n "$POWARDER_FAKE_SSH_LOG" ]; then
   printf '%s\n' "$logline" >> "$POWARDER_FAKE_SSH_LOG"
 fi
 
-# --- 引数の解析 --------------------------------------------------------------
+# --- Argument parsing --------------------------------------------------------
 is_master=0
 is_config=0
 action=""
@@ -61,12 +63,13 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     -o)
-      # -o Key=Value は読み飛ばす（値そのものは fake ssh の挙動に影響しない）
+      # Skip -o Key=Value (the value itself doesn't affect fake ssh's behavior)
       shift 2
       ;;
     -L | -R)
-      # forward/cancel の spec 引数。fake ssh の挙動は spec の中身に依存しないので
-      # 値は捨てる（記録は POWARDER_FAKE_SSH_LOG 側で行う）。
+      # forward/cancel spec argument. fake ssh's behavior doesn't depend on
+      # the spec's contents, so discard the value (logging is handled via
+      # POWARDER_FAKE_SSH_LOG).
       shift 2
       ;;
     -*)
@@ -81,62 +84,76 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# --- no-master: -O のどのサブコマンドも制御ソケットに繋がらない扱いにする ----
+# --- no-master: treat every -O subcommand as unable to reach the control socket ----
 if [ -n "$action" ] && [ "$mode" = "no-master" ]; then
   printf 'Control socket connect(%s): No such file or directory\n' "$ctl_path" >&2
   exit 255
 fi
 
-# --- -M -N: ControlMaster 起動モード -----------------------------------------
+# --- -M -N: ControlMaster startup mode ---------------------------------------
 if [ "$is_master" -eq 1 ]; then
   case "$mode" in
     auth-failed)
-      # 認証失敗。制御ソケットを作らず即座に失敗する（sleep しない）。
+      # Authentication failure. Fail immediately without creating the
+      # control socket (no sleep).
       printf '%s: Permission denied (publickey).\n' "$host" >&2
       exit 255
       ;;
     slow-start)
-      # readiness ポーリングのテスト用に、制御ソケットを作る前に3秒待つ。
+      # For readiness-polling tests, wait 3 seconds before creating the
+      # control socket.
       sleep 3
       ;;
   esac
 
-  # 実際に制御ソケット（UDS）を作る。`socketExists()` による readiness 判定が
-  # 本物同様に動くようにするため、ただのファイルではなく本物の UDS にする。
+  # Actually create the control socket (UDS). To make readiness detection
+  # via `socketExists()` behave the same as with the real thing, this must
+  # be a real UDS, not just a plain file.
   #
-  # **UDS を作れるツールは環境によって違う。** 実測:
-  #   - macOS: `nc`（BSD netcat。`-U` あり）
-  #   - nimlang/nim:2.2.10（Debian trixie）: nc / socat / python3 が無く **perl だけ**
-  #   - GitHub Actions の ubuntu: `nc`（netcat-openbsd）
-  # 1つのツールに賭けると環境を移した瞬間にテストが大量に落ちる（実際に Debian で
-  # `tdaemon.nim` の4件が落ちた）ので、使えるものを順に試すフォールバックにする。
+  # **The tool available to create a UDS differs by environment.** Measured:
+  #   - macOS: `nc` (BSD netcat, has `-U`)
+  #   - nimlang/nim:2.2.10 (Debian trixie): no nc / socat / python3, **only perl**
+  #   - GitHub Actions ubuntu: `nc` (netcat-openbsd)
+  # Betting on a single tool breaks a large number of tests the moment the
+  # environment changes (in fact, 4 tests in `tdaemon.nim` failed on
+  # Debian), so this falls back through whichever tool is usable, trying
+  # each in turn.
   #
-  # `nc -h` の出力を grep してオプションの有無を判定する方法は netcat の実装差
-  # （traditional / openbsd / BSD）で当てにならないため、**実際に起動して
-  # ソケットが現れたかどうか**で採否を決める。
-  # ★継承した余分な fd を必ず閉じてからリスナーを exec すること。
+  # Grepping `nc -h` output to determine whether an option exists is
+  # unreliable across netcat implementation differences (traditional /
+  # openbsd / BSD), so acceptance is decided by **actually starting it and
+  # checking whether the socket appears**.
+  # IMPORTANT: always close inherited extra fds before exec'ing the listener.
   #
-  # powarder のテストバイナリは `startProcess` で fake ssh を起動するが、
-  # `std/osproc` は `poParentStreams` を指定しない限り **stdin/stdout/stderr 用の
-  # pipe を必ず作る**（実測）。その pipe の fd は fake ssh に、さらにその子である
-  # リスナーへと継承される。リスナーは長命なので、リスナーが残ったままだと
-  # **親（テストバイナリ → nimble）がその pipe の EOF を永久に待ってハングする**
-  # （実測: Linux コンテナで `nimble test` が3時間ハングした。孤児リスナーの fd に
-  # `3,5,8,9,10,12 -> pipe:[...]` が残り、`nimble` が読んでいた pipe が閉じなかった）。
+  # powarder's test binary launches fake ssh via `startProcess`, but
+  # `std/osproc` **always creates pipes for stdin/stdout/stderr** unless
+  # `poParentStreams` is given (confirmed by measurement). Those pipe fds
+  # are inherited by fake ssh, and then by its child, the listener. The
+  # listener is long-lived, so if it's left running, **the parent (test
+  # binary -> nimble) will hang forever waiting for that pipe's EOF**
+  # (confirmed: `nimble test` hung for 3 hours in a Linux container. The
+  # orphaned listener's fds `3,5,8,9,10,12 -> pipe:[...]` remained, and the
+  # pipe that `nimble` was reading from never closed).
   #
-  # ★**ここで fd 3 以降を閉じてはいけない。** 2通り試して両方壊れた:
-  #   (1) `exec N>&-` を 3..63 に無条件で当てる
-  #       → `dash`（Debian / Ubuntu の /bin/sh）は開いていない fd へのリダイレクトを
-  #         エラーとし、**非対話シェルを即座に終了させる**（macOS の bash は黙って許容）。
-  #         `2>/dev/null || true` では抑えられない（シェル自体が死ぬ）。
-  #   (2) `[ -e /dev/fd/N ]` で存在確認してから閉じる
-  #       → 親が asyncdispatch を初期化済み（epoll / socket の fd を持つ）だと
-  #         リスナーの起動自体が壊れる。最小再現で確認: asyncdispatch 無しなら
-  #         tick 1 で hsConnected、有りなら「UDS を作れるツールがありません」。
+  # IMPORTANT: **do not close fd 3 and above here.** Two approaches were
+  # tried and both broke things:
+  #   (1) Unconditionally apply `exec N>&-` across 3..63
+  #       -> `dash` (Debian / Ubuntu's /bin/sh) treats a redirect to an
+  #          unopened fd as an error and **terminates the non-interactive
+  #          shell immediately** (macOS's bash silently allows it).
+  #          `2>/dev/null || true` can't suppress it (the shell itself
+  #          dies).
+  #   (2) Check existence with `[ -e /dev/fd/N ]` before closing
+  #       -> if the parent has already initialized asyncdispatch (holding
+  #          epoll / socket fds), the listener startup itself breaks.
+  #          Confirmed with a minimal repro: without asyncdispatch,
+  #          hsConnected appears at tick 1; with it, we get
+  #          "fake ssh: no tool available to create a UDS".
   #
-  # そのため fd は 0/1/2 のリダイレクトだけに留め、**ハングは「テストの最後に
-  # runtime dir に紐づくリスナーを確実に掃除する」ことで防ぐ**方針にした
-  # （各テストファイル末尾の pkill を参照）。リスナーが残らなければ pipe も閉じる。
+  # So fds are only redirected for 0/1/2, and **hangs are prevented instead
+  # by reliably cleaning up the listener tied to the runtime dir at the end
+  # of each test** (see the pkill at the end of each test file). If no
+  # listener is left behind, the pipe closes too.
   _spawn_listener() {
     exec "$@" </dev/null >/dev/null 2>&1
   }
@@ -179,42 +196,47 @@ while (1) { sleep 3600; }' "$ctl_path" ) &
   done
 
   if [ -z "$nc_pid" ]; then
-    echo "fake ssh: UDS を作れるツールがありません" >&2
-    echo "fake ssh: nc -U / python3 / perl のいずれかが必要です" >&2
+    echo "fake ssh: no tool available to create a UDS" >&2
+    echo "fake ssh: requires one of nc -U / python3 / perl" >&2
     exit 1
   fi
 
-  # M6 の孤児 adopt テスト向け: 実マスター（このスクリプト自身）の pid を
-  # ctl_path の隣に記録しておく。`-O check` はこれを読んで返す（無ければ
-  # `$$` にフォールバックする。下の `check)` 分岐を参照）。これが無いと
-  # `-O check` の pid が「check 呼び出し自身の短命な pid」になってしまい、
-  # adopt の生死判定・cmdline 照合が実マスターの pid と食い違って壊れる。
+  # For the M6 orphan-adopt test: record the real master's (this script's
+  # own) pid next to ctl_path. `-O check` reads and returns this (falling
+  # back to `$$` if absent; see the `check)` branch below). Without this,
+  # `-O check`'s pid would be the short-lived pid of the check invocation
+  # itself, and the adopt logic's liveness check / cmdline matching would
+  # break by disagreeing with the real master's pid.
   echo "$$" > "${ctl_path}.pid"
 
   cleanup() {
     kill "$nc_pid" 2>/dev/null
-    # **リスナーが実際に終わるまで待つ。** kill を送っただけで exit すると、
-    # 親のシェルが先に消えてリスナーが孤児化（PPID=1）し、テスト終了後も
-    # 残り続ける（実測: torphan のテスト後に nc が5個、9分以上残っていた）。
+    # **Actually wait for the listener to finish.** If we exit right after
+    # sending kill, the parent shell disappears first, the listener becomes
+    # an orphan (PPID=1), and it keeps running after the test ends
+    # (measured: 5 leftover nc processes remained for over 9 minutes after
+    # the torphan test).
     wait "$nc_pid" 2>/dev/null
     rm -f "$ctl_path" "${ctl_path}.pid"
   }
   trap 'cleanup; exit 0' TERM INT
 
-  # `wait` を使う（`while kill -0 + sleep` のポーリングではなく）。
-  # POSIX sh の `wait` はシグナルで中断されるので trap が確実に・即座に発火し、
-  # かつ待機中に CPU を使わない。ポーリングだと `sleep` の粒度分だけ trap の
-  # 発火が遅れ、その間に親が終了するとリスナーが取り残される。
+  # Use `wait` (rather than polling with `while kill -0 + sleep`).
+  # POSIX sh's `wait` is interrupted by a signal, so the trap fires reliably
+  # and immediately, without burning CPU while waiting. With polling, the
+  # trap would fire late by up to `sleep`'s granularity, and if the parent
+  # exits during that window the listener would be left behind.
   wait "$nc_pid" 2>/dev/null
   cleanup
   exit 0
 fi
 
-# --- -G: ssh_config 解決モード -----------------------------------------------
+# --- -G: ssh_config resolution mode -------------------------------------------
 if [ "$is_config" -eq 1 ]; then
-  # 実測: OpenSSH は非対話端末からの実行時に stderr へ pseudo-terminal の
-  # 警告を出すことがある。core/sshgparse.parseSshG は stdout だけを見る契約
-  # なので、その契約が守られているかをテストできるようここでも常に出す。
+  # Measured: OpenSSH can emit a pseudo-terminal warning to stderr when run
+  # from a non-interactive terminal. core/sshgparse.parseSshG's contract is
+  # to look only at stdout, so this is always emitted here too, to let
+  # tests verify that contract is honored.
   printf 'Pseudo-terminal will not be allocated because stdin is not a terminal.\n' >&2
   cat <<EOF
 host $host
@@ -261,10 +283,10 @@ fi
 # --- -O check / forward / cancel / exit --------------------------------------
 case "$action" in
   check)
-    # 実マスターの pid が記録されていればそれを返す（`-M -N` 分岐が書く
-    # `${ctl_path}.pid`）。無ければ（＝マスターを一度も起動していない
-    # 呼び出し元。tmuxclient.nim の単体テストなど）このプロセス自身の pid に
-    # フォールバックする。
+    # If the real master's pid was recorded, return it (written to
+    # `${ctl_path}.pid` by the `-M -N` branch). If not (i.e. a caller that
+    # never started a master, such as tmuxclient.nim's unit tests), fall
+    # back to this process's own pid.
     if [ -f "${ctl_path}.pid" ]; then
       real_pid=$(cat "${ctl_path}.pid")
     else
@@ -301,8 +323,8 @@ case "$action" in
     exit 0
     ;;
   *)
-    # ここに来るのは想定外の呼び出し方をした場合。テストが気付けるよう
-    # 黙って成功扱いにはせず、明示的に失敗させる。
+    # Reaching here means an unexpected invocation. Fail explicitly instead
+    # of silently treating it as success, so tests can notice.
     printf 'fake ssh: unrecognized invocation: %s\n' "$orig_args" >&2
     exit 1
     ;;

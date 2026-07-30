@@ -1,91 +1,104 @@
-## `ssh -O forward` / `-O cancel` / `-O check` の実行結果を判定する。
+## Judges the outcome of `ssh -O forward` / `-O cancel` / `-O check` runs.
 ##
-## powarder の中で最も壊れやすい部分をここに閉じ込める。ssh マルチプレックス制御
-## コマンドの成否は「終了コード」と「stderr の文言」の組み合わせでしか判定できず、
-## しかもその組み合わせ方はサブコマンドごとに異なる（詳細は各 proc の doc comment）。
-## OpenSSH のバージョンが上がって文言が変わったときに、この一致判定が古いままだと
-## powarder は「成功したのに失敗扱い」「失敗したのに成功扱い」を起こしうる。
-## そのためテスト（`tests/tmuxparse.nim`）で実測データを固定し、この文言が変わった
-## 瞬間にテストが落ちて気付けるようにしてある。
+## This confines the most fragile part of powarder to a single place. Whether
+## an ssh multiplex control command succeeded can only be judged from the
+## combination of the "exit code" and the "stderr wording", and that
+## combination differs per subcommand (see each proc's doc comment for
+## details). If OpenSSH's version bumps change the wording and this matching
+## logic goes stale, powarder can end up treating a success as a failure or a
+## failure as a success. That's why the tests (`tests/tmuxparse.nim`) pin down
+## empirically observed data, so a test breaks the moment this wording changes.
 ##
-## このモジュールは I/O を一切行わない。`std/asyncnet` / `std/osproc` / `std/os` を
-## import しない。「ssh -O ... を実際に起動して (exitCode, stdout, stderr) を得る」のは
-## 呼び出し側（`daemon/muxclient.nim` の想定）の責務であり、ここではそれを受け取って
-## 判定するだけの純粋関数だけを提供する。
+## This module performs no I/O. It does not import `std/asyncnet` /
+## `std/osproc` / `std/os`. Actually running `ssh -O ...` to obtain
+## `(exitCode, stdout, stderr)` is the caller's responsibility (expected to be
+## `daemon/muxclient.nim`); this module only provides pure functions that take
+## that result and judge it.
 
 import std/strutils
 
 # ---------------------------------------------------------------------------
-# マッチ対象の文字列定数
+# String constants to match against
 #
-# OpenSSH のバージョンアップで mux.c / ssh.c の出力文言が変わった場合、
-# まずここを確認・修正する。実際に確認する手順は `mux_client_forward()` /
-# `mux_client_request_forwards()` / `control_client()` (mux.c) 周辺。
+# If an OpenSSH version bump changes the output wording in mux.c / ssh.c,
+# check and fix this section first. The actual place to verify is around
+# `mux_client_forward()` / `mux_client_request_forwards()` / `control_client()`
+# (mux.c).
 # ---------------------------------------------------------------------------
 
 const
   msgControlSocketConnect = "Control socket connect("
-    ## 制御ソケットに繋がらない場合の前半部分だけを見る。
-    ## 実際のメッセージはパスとエラー文言込みで
-    ## `Control socket connect(/tmp/x.sock): No such file or directory` (ENOENT) や
-    ## `Control socket connect(/tmp/x.sock): Connection refused` (ECONNREFUSED) になり、
-    ## パスやエラー文言は可変なので前半の固定部分だけをマッチ対象にする。
+    ## Only look at the fixed first-half part for when the control socket
+    ## can't be reached.
+    ## The actual message includes the path and error text, e.g.
+    ## `Control socket connect(/tmp/x.sock): No such file or directory` (ENOENT) or
+    ## `Control socket connect(/tmp/x.sock): Connection refused` (ECONNREFUSED),
+    ## and since the path and error text vary, only the fixed first-half part is used for matching.
 
   msgMasterRefused = "Master refused forwarding request:"
-    ## マスターがポリシー（`PermitLocalCommand` 等ではなく mux 自体の許可設定）で
-    ## forward/cancel 要求を拒否した場合。mux.c の `mux_client_forward()` は
-    ## forward・cancel の両方でこの同じ文言を使う。
+    ## When the master rejects a forward/cancel request due to policy (the
+    ## mux's own permission setting, not e.g. `PermitLocalCommand`). mux.c's
+    ## `mux_client_forward()` uses this same wording for both forward and
+    ## cancel.
 
   msgBindFailed = "Port forwarding failed"
-    ## `-O forward` で実際に bind できなかった場合。実測では
-    ## `mux_client_forward: forwarding request failed: Port forwarding failed` の
-    ## 形で出るが、判定には後半の固有部分だけを使う。
+    ## When `-O forward` fails to actually bind. Empirically this appears as
+    ## `mux_client_forward: forwarding request failed: Port forwarding failed`,
+    ## but only the distinctive latter half is used for matching.
 
   msgNotForwarded = "port not forwarded"
-    ## `-O cancel` の対象が forward 表に存在しない場合。実測では
-    ## `mux_client_forward: forwarding request failed: port not forwarded` の形。
+    ## When the `-O cancel` target does not exist in the forward table.
+    ## Empirically this appears as
+    ## `mux_client_forward: forwarding request failed: port not forwarded`.
 
   msgBadSpecLocal = "Bad local forwarding specification"
   msgBadSpecRemote = "Bad remote forwarding specification"
-    ## `-L` / `-R` の構文エラー。ssh.c の引数パース段階（mux 層より手前）で
-    ## 弾かれるため、通常は `moNoMaster` 等と同時に出ることはない。
+    ## A `-L` / `-R` syntax error. This is rejected at ssh.c's argument-parsing
+    ## stage (before the mux layer), so it normally does not appear alongside
+    ## `moNoMaster` etc.
 
   msgMasterRunningPrefix = "Master running (pid="
-    ## `-O check` でマスターが生存している場合に **stderr** に出る
-    ## （stdout ではない。実測確認済み）。この直後に pid の数字が続き `)` で閉じる。
+    ## Appears on **stderr** (not stdout, empirically confirmed) when
+    ## `-O check` finds the master alive. Immediately followed by the pid
+    ## digits, closed with `)`.
 
 type
   MuxOutcome* = enum
-    moSuccess ## 成功（新規 bind した場合と、既存エントリへの冪等成功の両方を含む）
-    moBindFailed     ## bind に失敗した（Port forwarding failed）
-    moNotForwarded   ## cancel 対象が forward 表に無い（port not forwarded）
-    moRefused        ## マスターがポリシーで拒否した
-    moNoMaster       ## 制御ソケットに繋がらない
-    moBadSpec        ## forward 指定の構文エラー
-    moUnknownFailure ## 上記に当てはまらない失敗
+    moSuccess ## Success (covers both a fresh bind and idempotent success against an existing entry)
+    moBindFailed     ## Bind failed (Port forwarding failed)
+    moNotForwarded   ## Cancel target not in the forward table (port not forwarded)
+    moRefused        ## Master rejected due to policy
+    moNoMaster       ## Cannot connect to the control socket
+    moBadSpec        ## Syntax error in the forward specification
+    moUnknownFailure ## A failure that doesn't match any of the above
 
 proc parseForwardResult*(exitCode: int; stdout, stderr: string): MuxOutcome =
-  ## `ssh -O forward` の結果を判定する。
+  ## Judges the result of `ssh -O forward`.
   ##
-  ## **exitCode は判定に使える**（実測: 成功 0 / 失敗 255）。ただし exitCode が 0 で
-  ## あることは「新規に bind した」ことを意味しない。既存と全く同じ forward 指定を
-  ## 再送した場合も ssh は同じく 0 を返す（冪等成功）。呼び出し側は「新規に張れたか」
-  ## を知りたい場合、この結果だけでなく事前に自分の状態（`ForwardState`）を見て判断する
-  ## 必要がある。
+  ## **exitCode is usable for judging** (empirically: 0 on success / 255 on
+  ## failure). However, exitCode being 0 does not mean a "fresh bind" was
+  ## made. Resending the exact same forward specification as an existing one
+  ## also returns 0 from ssh (idempotent success). If the caller wants to know
+  ## whether a fresh bind was actually made, it needs to check its own prior
+  ## state (`ForwardState`) in addition to this result.
   ##
-  ## stdout は実測で常に空であり、判定には使わない（引数として受け取るのは API 形状を
-  ## `parseCancelResult` / `parseCheckResult` と揃えるため）。
+  ## stdout is empirically always empty and is not used for judging (it is
+  ## accepted as an argument just to keep the API shape consistent with
+  ## `parseCancelResult` / `parseCheckResult`).
   ##
-  ## 優先順位（複数パターンが同時にマッチしうる場合、上から順に判定する）:
-  ## 1. `moNoMaster`   -- 制御ソケットに繋がっていない。これが真なら ssh は forward 要求
-  ##                      自体を送れていないので、以降のどの判定よりも根本的な原因であり
-  ##                      最優先とする。
-  ## 2. `moBadSpec`    -- `-L`/`-R` の構文エラー。理論上は mux 層に届く前に弾かれるため
-  ##                      `moNoMaster` と同時に出ることはないはずだが、フェイルセーフとして
-  ##                      2番目に置く。
-  ## 3. `moRefused`    -- マスターのポリシー拒否。
-  ## 4. `moBindFailed` -- 実際の bind 失敗。
-  ## 5. どれにも当てはまらない失敗は `moUnknownFailure`。
+  ## Priority order (when multiple patterns could match simultaneously, judge
+  ## from the top down):
+  ## 1. `moNoMaster`   -- cannot connect to the control socket. If this is
+  ##                      true, ssh could not even send the forward request
+  ##                      itself, so it is the most fundamental cause and
+  ##                      takes top priority.
+  ## 2. `moBadSpec`    -- `-L`/`-R` syntax error. This should theoretically
+  ##                      never occur alongside `moNoMaster` since it's
+  ##                      rejected before reaching the mux layer, but it's
+  ##                      placed second as a fail-safe.
+  ## 3. `moRefused`    -- master's policy rejection.
+  ## 4. `moBindFailed` -- actual bind failure.
+  ## 5. A failure that doesn't match any of these is `moUnknownFailure`.
   discard stdout
   if exitCode == 0:
     return moSuccess
@@ -100,17 +113,19 @@ proc parseForwardResult*(exitCode: int; stdout, stderr: string): MuxOutcome =
   moUnknownFailure
 
 proc parseCancelResult*(exitCode: int; stdout, stderr: string): MuxOutcome =
-  ## `ssh -O cancel` の結果を判定する。
+  ## Judges the result of `ssh -O cancel`.
   ##
-  ## **exitCode は一切信用できない**（実測: 成功・失敗どちらも 0 を返す）。
-  ## 判定は stderr の文言だけで行う。stderr が空（空白文字だけの場合も含む）なら
-  ## `moSuccess`。
+  ## **exitCode cannot be trusted at all** (empirically: both success and
+  ## failure return 0). Judging is done purely from the stderr wording. If
+  ## stderr is empty (including when it contains only whitespace), it's
+  ## `moSuccess`.
   ##
-  ## 優先順位（上から順に判定する）:
-  ## 1. `moNoMaster`     -- 制御ソケット自体に繋がっていない。
-  ## 2. `moRefused`      -- マスターのポリシー拒否（forward と cancel で同じ文言を共有する）。
-  ## 3. `moNotForwarded` -- cancel 対象が forward 表に無い。
-  ## 4. 上記のどれにも当てはまらず stderr が非空なら `moUnknownFailure`。
+  ## Priority order (judge from the top down):
+  ## 1. `moNoMaster`     -- cannot connect to the control socket itself.
+  ## 2. `moRefused`      -- master's policy rejection (forward and cancel
+  ##                        share the same wording).
+  ## 3. `moNotForwarded` -- cancel target not in the forward table.
+  ## 4. If none of the above match and stderr is non-empty, `moUnknownFailure`.
   discard stdout
   discard exitCode
   if stderr.strip().len == 0:
@@ -125,11 +140,11 @@ proc parseCancelResult*(exitCode: int; stdout, stderr: string): MuxOutcome =
 
 proc parseCheckResult*(exitCode: int; stdout, stderr: string): tuple[
     alive: bool; pid: int] =
-  ## `ssh -O check` の結果を判定する。
+  ## Judges the result of `ssh -O check`.
   ##
-  ## マスター生存時のメッセージ `Master running (pid=N)` は **stderr** に出る
-  ## （stdout ではない。実測確認済み）。pid の数字部分を取り出せない場合は
-  ## `(alive: false, pid: 0)` を返す。
+  ## The message `Master running (pid=N)` for a live master appears on
+  ## **stderr** (not stdout, empirically confirmed). If the pid digits
+  ## can't be extracted, returns `(alive: false, pid: 0)`.
   discard stdout
   discard exitCode
   let idx = stderr.find(msgMasterRunningPrefix)

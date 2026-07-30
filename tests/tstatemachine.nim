@@ -1,6 +1,7 @@
-## `powarder/core/statemachine` のユニットテスト。
-## 全状態 x 全イベントの組み合わせを総当たりし、期待される遷移先と、
-## それ以外の組み合わせが `none`（不正な遷移）になることを確認する。
+## Unit tests for `powarder/core/statemachine`.
+## Exhaustively checks every (state, event) combination: the expected
+## transitions land where they should, and every other combination yields
+## `none` (an invalid transition).
 
 import std/[unittest, options]
 
@@ -8,35 +9,35 @@ import powarder/core/types
 import powarder/core/statemachine
 
 suite "nextBackoff":
-  test "初期値 0 または未設定から呼ぶと 1 を返す":
+  test "calling from the initial value 0 (or unset) returns 1":
     check nextBackoff(0.0) == 1.0
     check nextBackoff(-5.0) == 1.0
 
-  test "1 → 2 → 4 → 8 → 16 → 30(上限) と倍々に増える":
+  test "doubles as 1 -> 2 -> 4 -> 8 -> 16 -> 30 (cap)":
     check nextBackoff(1.0) == 2.0
     check nextBackoff(2.0) == 4.0
     check nextBackoff(4.0) == 8.0
     check nextBackoff(8.0) == 16.0
     check nextBackoff(16.0) == 30.0
 
-  test "上限に達したあとは頭打ちのまま":
+  test "stays capped once the limit is reached":
     check nextBackoff(30.0) == 30.0
     check nextBackoff(100.0) == 30.0
 
-  test "maxSeconds を指定するとその値で頭打ちになる":
+  test "specifying maxSeconds caps out at that value instead":
     check nextBackoff(1.0, maxSeconds = 5.0) == 2.0
     check nextBackoff(4.0, maxSeconds = 5.0) == 5.0
     check nextBackoff(5.0, maxSeconds = 5.0) == 5.0
 
 suite "shouldGiveUp":
-  test "maxConsecutiveFailures == 0 なら常に false（既定は無限リトライ）":
+  test "always false when maxConsecutiveFailures == 0 (default: infinite retry)":
     let policy = initRetryPolicy()
     check policy.maxConsecutiveFailures == 0
     check not shouldGiveUp(0, policy)
     check not shouldGiveUp(1, policy)
     check not shouldGiveUp(1_000_000, policy)
 
-  test "maxConsecutiveFailures > 0 なら閾値以上で true":
+  test "true once at or above the threshold when maxConsecutiveFailures > 0":
     let policy = initRetryPolicy(maxConsecutiveFailures = 3)
     check not shouldGiveUp(0, policy)
     check not shouldGiveUp(2, policy)
@@ -44,8 +45,8 @@ suite "shouldGiveUp":
     check shouldGiveUp(4, policy)
 
 suite "nextHostState":
-  ## (現在状態, イベント, 遷移先) の正解表。ここに載っていない
-  ## (状態, イベント) の組み合わせはすべて `none` になるべき。
+  ## The answer key of (current state, event, target state). Any
+  ## (state, event) combination not listed here should yield `none`.
   const expected = [
     (hsIdle, hePreparedToConnect, hsConnecting),
     (hsIdle, heStopRequested, hsStopped),
@@ -74,32 +75,33 @@ suite "nextHostState":
         return some(target)
     none(HostSessionState)
 
-  test "正解表どおりの遷移が起きる（明示ケース）":
+  test "transitions happen exactly as the answer key says (explicit cases)":
     for (s, e, target) in expected:
       check nextHostState(s, e) == some(target)
 
-  test "全状態 x 全イベントを総当たりし、正解表以外は none になる":
+  test "exhaustively checking every state x event, anything outside the answer key is none":
     var checkedCount = 0
     for s in HostSessionState:
       for e in HostEvent:
         check nextHostState(s, e) == expectedNext(s, e)
         inc checkedCount
-    # 7 状態 x 9 イベント = 63 通りをすべて検証したことを保証する
+    # confirms all 7 states x 9 events = 63 combinations were checked
     check checkedCount == 63
 
-  test "heRestartRequested は hsFailed 以外からは受け付けない":
+  test "heRestartRequested is only accepted from hsFailed":
     for s in HostSessionState:
       if s != hsFailed:
         check nextHostState(s, heRestartRequested).isNone
 
-  test "heRetryLimitReached は hsReconnecting 以外からは受け付けない":
+  test "heRetryLimitReached is only accepted from hsReconnecting":
     for s in HostSessionState:
       if s != hsReconnecting:
         check nextHostState(s, heRetryLimitReached).isNone
 
 suite "nextForwardState":
-  ## feHostLost / feDetachRequested は「任意の状態から」有効なため
-  ## ループ内で個別に扱う。それ以外の (状態, イベント) の正解表。
+  ## feHostLost / feDetachRequested are valid "from any state", so they're
+  ## handled separately in the loop below. This is the answer key for the
+  ## remaining (state, event) combinations.
   const expected = [
     (fwPending, feHostConnected, fwPending),
     (fwPending, feAttachStarted, fwAttaching),
@@ -123,23 +125,23 @@ suite "nextForwardState":
         return some(target)
     none(ForwardState)
 
-  test "正解表どおりの遷移が起きる（明示ケース）":
+  test "transitions happen exactly as the answer key says (explicit cases)":
     for (s, e, target) in expected:
       check nextForwardState(s, e) == some(target)
 
-  test "feHostLost はどの状態からでも fwPending へ遷移する":
+  test "feHostLost transitions to fwPending from any state":
     for s in ForwardState:
       check nextForwardState(s, feHostLost) == some(fwPending)
 
-  test "feDetachRequested はどの状態からでも fwDetaching へ遷移する":
+  test "feDetachRequested transitions to fwDetaching from any state":
     for s in ForwardState:
       check nextForwardState(s, feDetachRequested) == some(fwDetaching)
 
-  test "fwDetaching が feDetachConfirmed を受けると破棄扱い（none だが isDiscard は true）":
+  test "fwDetaching receiving feDetachConfirmed is treated as discarded (none, but isDiscard is true)":
     check nextForwardState(fwDetaching, feDetachConfirmed).isNone
     check isDiscard(fwDetaching, feDetachConfirmed)
 
-  test "全状態 x 全イベントを総当たりし、正解表・特殊ケース以外は none になる":
+  test "exhaustively checking every state x event, anything outside the answer key / special case is none":
     var checkedCount = 0
     for s in ForwardState:
       for e in ForwardEvent:
@@ -151,34 +153,34 @@ suite "nextForwardState":
           if nextForwardState(s, e).isNone:
             check not isDiscard(s, e)
         inc checkedCount
-    # 6 状態 x 11 イベント = 66 通りをすべて検証したことを保証する
+    # confirms all 6 states x 11 events = 66 combinations were checked
     check checkedCount == 66
 
 suite "healthVerdict":
-  test "fwActive: 閾値未満なら fwActive のまま":
+  test "fwActive: stays fwActive below the threshold":
     check healthVerdict(0, fwActive) == fwActive
     check healthVerdict(1, fwActive) == fwActive
     check healthVerdict(2, fwActive) == fwActive
 
-  test "fwActive: degradeThreshold 以上で fwDegraded":
+  test "fwActive: becomes fwDegraded at or above degradeThreshold":
     check degradeThreshold == 3
     check healthVerdict(3, fwActive) == fwDegraded
     check healthVerdict(8, fwActive) == fwDegraded
 
-  test "fwActive/fwDegraded: reattachThreshold 以上で強制 fwPending":
+  test "fwActive/fwDegraded: forced to fwPending at or above reattachThreshold":
     check reattachThreshold == 9
     check healthVerdict(9, fwActive) == fwPending
     check healthVerdict(100, fwActive) == fwPending
     check healthVerdict(9, fwDegraded) == fwPending
 
-  test "fwDegraded: 0 回に戻れば回復して fwActive":
+  test "fwDegraded: recovers to fwActive once the count returns to 0":
     check healthVerdict(0, fwDegraded) == fwActive
 
-  test "fwDegraded: degradeThreshold 以上 reattachThreshold 未満は fwDegraded 継続":
+  test "fwDegraded: stays fwDegraded between degradeThreshold and reattachThreshold":
     check healthVerdict(3, fwDegraded) == fwDegraded
     check healthVerdict(8, fwDegraded) == fwDegraded
 
-  test "fwActive/fwDegraded 以外は no-op（current をそのまま返す）":
+  test "anything other than fwActive/fwDegraded is a no-op (returns current as-is)":
     check healthVerdict(100, fwPending) == fwPending
     check healthVerdict(100, fwAttaching) == fwAttaching
     check healthVerdict(100, fwDetaching) == fwDetaching

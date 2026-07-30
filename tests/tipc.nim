@@ -1,18 +1,22 @@
-## `powarder/ipc/server` と `powarder/ipc/client` の結合テスト。
+## Integration tests for `powarder/ipc/server` and `powarder/ipc/client`.
 ##
-## サーバは非同期（`std/asyncdispatch`）、クライアントは同期（`std/net`）という
-## 組み合わせなので、同一プロセス内で `asyncCheck serve(s)` してから同期の
-## `call()` を呼ぶと、`call()` の `recvLine` がブロックしている間イベント
-## ループが一切回らずデッドロックする。
+## The server is async (`std/asyncdispatch`) while the client is
+## synchronous (`std/net`). With that combination, if you `asyncCheck
+## serve(s)` and then call the synchronous `call()` within the same
+## process, the event loop never gets a chance to run while `call()`'s
+## `recvLine` is blocking, which deadlocks.
 ##
-## これを回避するため、`tests/tplatform.nim` に倣い `posix.fork()` でサーバを
-## 別プロセスとして起動する（他の2案 ―― サーバ側も同期の `std/net` にする /
-## クライアント呼び出しを別スレッドにする ―― よりも、実物の `IpcServer` を
-## そのままテストできる点を優先した）。子プロセスは `serve()` の accept
-## ループに入ったまま親が `SIGKILL` するまで戻らない。子プロセスの終了に
-## `quit()` を使うと Nim ランタイムの終了処理と `unittest` のグローバル状態を
-## 巻き込んでしまい、子プロセスがテストスイートを二重実行してしまう
-## （`tests/tplatform.nim` の注記の通り）ため、`posix.exitnow`（`_exit`）を使う。
+## To avoid this, following the pattern in `tests/tplatform.nim`, the
+## server is started as a separate process via `posix.fork()` (this was
+## preferred over the other two options -- making the server side
+## synchronous `std/net` too, or running the client call on a separate
+## thread -- because it lets the real `IpcServer` be tested as-is). The
+## child process stays inside `serve()`'s accept loop and never returns
+## until the parent sends `SIGKILL`. Using `quit()` to end the child
+## process would drag in the Nim runtime's shutdown handling and
+## `unittest`'s global state, causing the child process to run the whole
+## test suite a second time (as noted in `tests/tplatform.nim`), so
+## `posix.exitnow` (`_exit`) is used instead.
 
 import std/[unittest, os, posix, json, options, net, nativesockets, asyncdispatch]
 import powarder/ipc/protocol
@@ -20,9 +24,11 @@ import powarder/ipc/server
 import powarder/ipc/client
 import powarder/core/paths
 
-# デフォルトパス解決（`path` 省略時）に迷い込んだ場合でも実マシンで動いている
-# かもしれない本物の powarder デーモンのソケットに触れないようにする安全策。
-# 各テストは明示的な短いパスを使うので通常はここに依存しないが、念のため。
+# A safeguard in case default path resolution (when `path` is omitted) is
+# accidentally exercised, so it doesn't touch a real powarder daemon's
+# socket that might be running on the actual machine. Each test uses an
+# explicit short path, so this shouldn't normally matter, but it's kept
+# just in case.
 putEnv(envRuntimeDir, getTempDir() / "pw-ipc-test-rt")
 
 proc pingHandler(params: JsonNode): JsonNode =
@@ -30,9 +36,10 @@ proc pingHandler(params: JsonNode): JsonNode =
 
 proc forkTestServer(path: string;
     setup: proc(s: IpcServer) {.closure, gcsafe.}): Pid =
-  ## 子プロセスとしてテスト用サーバを起動する。
-  ## 子プロセスは `serve()` の accept ループに入ったまま戻らないので、
-  ## 呼び出し側は必ず `stopTestServer` で `SIGKILL` して終了させること。
+  ## Starts a test server as a child process.
+  ## The child process stays inside `serve()`'s accept loop and never
+  ## returns, so the caller must always call `stopTestServer` to
+  ## `SIGKILL` and end it.
   let pid = fork()
   if pid == 0:
     try:
@@ -45,35 +52,36 @@ proc forkTestServer(path: string;
   pid
 
 proc waitForSocket(path: string; maxMs = 2000) =
-  ## `fork()` 直後は子プロセスがまだ bind し終えていない可能性があるので、
-  ## ソケットファイルが実際に現れるまで短く待つ。
+  ## Right after `fork()`, the child process may not have finished
+  ## binding yet, so wait briefly until the socket file actually shows up.
   var waited = 0
   while not socketExists(path) and waited < maxMs:
     os.sleep(10)
     waited += 10
 
 proc stopTestServer(pid: Pid; path: string) =
-  ## サーバプロセスを終了し、ソケットファイルの残骸を消す。
-  ## `SIGKILL` された子は自分でソケットファイルを片付ける機会が無いため、
-  ## 後始末はテスト（親プロセス）の責務にする。
+  ## Terminates the server process and removes any leftover socket file.
+  ## A child killed with `SIGKILL` never gets a chance to clean up its own
+  ## socket file, so that cleanup is left to the test (the parent process).
   discard kill(pid, SIGKILL)
   var status: cint
   discard waitpid(pid, status, 0)
   removeFile(path)
 
 proc newRawUnixSocket(): Socket =
-  ## `std/posix` を同じファイルで import すると `AF_UNIX` 等の enum 値が
-  ## posix の同名 `cint` 定数とあいまいになるため、`nativesockets` 側を
-  ## 明示的に修飾する（`ipc/client.nim` と同じ回避策）。
+  ## Importing `std/posix` in the same file makes enum values such as
+  ## `AF_UNIX` ambiguous with posix's identically named `cint` constants,
+  ## so the `nativesockets` side is qualified explicitly (the same
+  ## workaround used in `ipc/client.nim`).
   newSocket(nativesockets.AF_UNIX, nativesockets.SOCK_STREAM,
       nativesockets.IPPROTO_IP)
 
 # ---------------------------------------------------------------------------
-# 1. 正常な RPC 往復
+# 1. A normal RPC round trip
 # ---------------------------------------------------------------------------
 
-suite "server/client: 正常な RPC 往復":
-  test "daemon.ping を登録して call が結果を返す":
+suite "server/client: a normal RPC round trip":
+  test "registering daemon.ping lets call return its result":
     const path = "/tmp/pw-t1.sock"
     removeFile(path)
     let pid = forkTestServer(path, proc(s: IpcServer) =
@@ -86,21 +94,23 @@ suite "server/client: 正常な RPC 往復":
       stopTestServer(pid, path)
 
 # ---------------------------------------------------------------------------
-# 2. ソケットのパーミッションが 0600
+# 2. The socket's permissions are 0600
 # ---------------------------------------------------------------------------
 
-suite "server: ソケットのパーミッション":
-  test "newIpcServer が作るソケットは 0600":
+suite "server: socket permissions":
+  test "the socket newIpcServer creates is 0600":
     const path = "/tmp/pw-t2.sock"
     removeFile(path)
-    # **重要**: `newIpcServer` は内部で `AsyncSocket` を生成する。この
-    # unittest 本体プロセス（親）で一度でも `AsyncSocket` に触れると、Nim の
-    # asyncdispatch のグローバル dispatcher（kqueue fd を保持する）が親の中で
-    # 初期化されてしまい、以後 `fork()` する全ての子プロセスがその
-    # kqueue fd を「継承」してしまう。すると子プロセス側の `accept()` が
-    # "Bad file descriptor" で失敗するようになる（実測で確認済みのバグ）。
-    # そのため `newIpcServer` は必ずこの子プロセスの中だけで呼び、判定結果は
-    # `unittest.check`（親の集計にしか乗らない）ではなく exit code で親に返す。
+    # **Important**: `newIpcServer` internally creates an `AsyncSocket`. If
+    # this unittest main (parent) process ever touches an `AsyncSocket`
+    # even once, Nim's asyncdispatch global dispatcher (which holds a
+    # kqueue fd) gets initialized inside the parent, and every child
+    # process `fork()`ed afterward "inherits" that kqueue fd. The child's
+    # own `accept()` then starts failing with "Bad file descriptor" (this
+    # bug was confirmed empirically). So `newIpcServer` must only ever be
+    # called inside this child process, and the verdict is reported back
+    # to the parent via exit code rather than `unittest.check` (which only
+    # rolls up into the parent's own tally).
     let pid = fork()
     if pid == 0:
       let ok =
@@ -118,11 +128,11 @@ suite "server: ソケットのパーミッション":
     removeFile(path)
 
 # ---------------------------------------------------------------------------
-# 3. 未登録メソッド
+# 3. An unregistered method
 # ---------------------------------------------------------------------------
 
-suite "server/client: 未登録メソッド":
-  test "RpcRemoteError の code が rpcMethodNotFound になる":
+suite "server/client: an unregistered method":
+  test "RpcRemoteError's code becomes rpcMethodNotFound":
     const path = "/tmp/pw-t3.sock"
     removeFile(path)
     let pid = forkTestServer(path, proc(s: IpcServer) =
@@ -138,11 +148,11 @@ suite "server/client: 未登録メソッド":
       stopTestServer(pid, path)
 
 # ---------------------------------------------------------------------------
-# 4. ハンドラが RpcError を投げた場合
+# 4. When a handler raises RpcError
 # ---------------------------------------------------------------------------
 
-suite "server/client: ハンドラが RpcError を投げる":
-  test "code がクライアント側の RpcRemoteError.code に届く":
+suite "server/client: a handler raises RpcError":
+  test "the code reaches the client's RpcRemoteError.code":
     const path = "/tmp/pw-t4.sock"
     removeFile(path)
     let pid = forkTestServer(path, proc(s: IpcServer) =
@@ -160,11 +170,11 @@ suite "server/client: ハンドラが RpcError を投げる":
       stopTestServer(pid, path)
 
 # ---------------------------------------------------------------------------
-# 5. ハンドラが予期しない例外を投げてもサーバが死なない
+# 5. The server doesn't die even if a handler raises an unexpected exception
 # ---------------------------------------------------------------------------
 
-suite "server: ハンドラの想定外の例外":
-  test "rpcInternalError になり、その後も次のリクエストを処理できる":
+suite "server: an unexpected exception from a handler":
+  test "becomes rpcInternalError, and later requests still get processed":
     const path = "/tmp/pw-t5.sock"
     removeFile(path)
     let pid = forkTestServer(path, proc(s: IpcServer) =
@@ -179,27 +189,28 @@ suite "server: ハンドラの想定外の例外":
       except RpcRemoteError as e:
         check e.code == rpcInternalError
 
-      # サーバプロセスが生き延びていることを、別の接続で改めて確認する
-      # （1接続=1コマンドなので同じ接続の使い回しではなく新しい call）。
+      # Re-confirm, over a separate connection, that the server process is
+      # still alive (since 1 connection = 1 command, this is a fresh
+      # `call` rather than reusing the same connection).
       let res = call(mDaemonPing, path = path)
       check res == %*{"pong": true}
     finally:
       stopTestServer(pid, path)
 
 # ---------------------------------------------------------------------------
-# 6. 壊れた行
+# 6. A malformed line
 # ---------------------------------------------------------------------------
 
-suite "server: 壊れた行":
-  test "rpcParseError が返る":
+suite "server: a malformed line":
+  test "rpcParseError is returned":
     const path = "/tmp/pw-t6.sock"
     removeFile(path)
     let pid = forkTestServer(path, proc(s: IpcServer) =
       s.register(mDaemonPing, pingHandler))
     waitForSocket(path)
     try:
-      # `client.call` は常に正しい JSON をエンコードしてしまうため、壊れた行を
-      # 送るにはここだけ生のソケットを使う。
+      # `client.call` always encodes valid JSON, so sending a malformed
+      # line requires using a raw socket here instead.
       var raw = newRawUnixSocket()
       raw.connectUnix(path)
       raw.send("not json at all\n")
@@ -212,11 +223,11 @@ suite "server: 壊れた行":
       stopTestServer(pid, path)
 
 # ---------------------------------------------------------------------------
-# 7. デーモンが起動していないとき (ENOENT)
+# 7. When the daemon isn't running (ENOENT)
 # ---------------------------------------------------------------------------
 
-suite "client: デーモンが起動していない (ENOENT)":
-  test "ソケットファイルが無ければ DaemonNotRunningError":
+suite "client: the daemon isn't running (ENOENT)":
+  test "a missing socket file raises DaemonNotRunningError":
     const path = "/tmp/pw-t7.sock"
     removeFile(path)
     try:
@@ -226,18 +237,19 @@ suite "client: デーモンが起動していない (ENOENT)":
       discard
 
 # ---------------------------------------------------------------------------
-# 8. 残骸ソケットだけがあるとき (ECONNREFUSED)
+# 8. When only a stale socket remains (ECONNREFUSED)
 # ---------------------------------------------------------------------------
 
-suite "client: 残骸ソケットだけがある (ECONNREFUSED)":
-  test "DaemonNotRunningError になり、かつ残骸ファイルは消されない":
+suite "client: only a stale socket remains (ECONNREFUSED)":
+  test "raises DaemonNotRunningError, and the stale file is not removed":
     const path = "/tmp/pw-t8.sock"
     removeFile(path)
-    # bind はするが listen しない = クラッシュしたデーモンの残骸を再現する。
+    # Bind but don't listen -- reproduces the remnant left behind by a
+    # crashed daemon.
     var stale = newRawUnixSocket()
     stale.bindUnix(path)
     stale.close()
-    check socketExists(path) # 前提: ここで既に「残骸ソケット」になっている
+    check socketExists(path) # precondition: this is now a "stale socket"
 
     try:
       discard call(mDaemonPing, path = path)
@@ -245,20 +257,20 @@ suite "client: 残骸ソケットだけがある (ECONNREFUSED)":
     except DaemonNotRunningError:
       discard
 
-    check socketExists(path) # クライアントは残骸を消してはいけない
+    check socketExists(path) # the client must not remove the stale file
     removeFile(path)
 
 # ---------------------------------------------------------------------------
-# 9. ping() は例外を投げず bool を返す
+# 9. ping() returns a bool instead of raising
 # ---------------------------------------------------------------------------
 
 suite "client: ping":
-  test "デーモンが無いとき false を返す（例外を投げない）":
+  test "returns false when there's no daemon (raises nothing)":
     const path = "/tmp/pw-t9a.sock"
     removeFile(path)
     check ping(path = path) == false
 
-  test "デーモンが有るとき true を返す（例外を投げない）":
+  test "returns true when the daemon is present (raises nothing)":
     const path = "/tmp/pw-t9b.sock"
     removeFile(path)
     let pid = forkTestServer(path, proc(s: IpcServer) =
@@ -270,25 +282,27 @@ suite "client: ping":
       stopTestServer(pid, path)
 
 # ---------------------------------------------------------------------------
-# 10. newIpcServer が既存の残骸ソケットを消して bind できる
+# 10. newIpcServer removes an existing stale socket before binding
 # ---------------------------------------------------------------------------
 
-suite "server: 残骸ソケットの掃除":
-  test "socketExists を使って残骸を消してから bind する":
+suite "server: cleaning up a stale socket":
+  test "uses socketExists to remove the stale file before binding":
     const path = "/tmp/pw-t10.sock"
     removeFile(path)
-    # 残骸を作る側は `std/net` の同期ソケットなので dispatcher には触れない
-    # （問題ない）。`os.fileExists` は S_ISREG しか見ないためソケットには
-    # false を返す。`newIpcServer` が `fileExists` で残骸判定していたら、
-    # この既存ソケットを消さないまま `bindUnix` を呼んで `EADDRINUSE` の
-    # `OSError` で失敗するはず。
+    # The side that creates the stale socket uses `std/net`'s synchronous
+    # socket, so it never touches the dispatcher (no problem there).
+    # `os.fileExists` only checks S_ISREG, so it returns false for a
+    # socket. If `newIpcServer` were checking for a stale file with
+    # `fileExists`, it would fail to remove this existing socket and then
+    # fail with an `OSError` of `EADDRINUSE` when calling `bindUnix`.
     var stale = newRawUnixSocket()
     stale.bindUnix(path)
     stale.close()
     check socketExists(path)
 
-    # `newIpcServer` 自体は（上のスイートと同じ理由で）子プロセスの中だけで
-    # 呼ぶ。判定結果は exit code で親に返す。
+    # `newIpcServer` itself is (for the same reason as the suite above)
+    # called only inside the child process. The verdict is reported back
+    # to the parent via exit code.
     let pid = fork()
     if pid == 0:
       let ok =
@@ -305,20 +319,21 @@ suite "server: 残骸ソケットの掃除":
     var status: cint
     discard waitpid(pid, status, 0)
     check WEXITSTATUS(status) == 0
-    removeFile(path) # 念のため
+    removeFile(path) # just in case
 
 # ---------------------------------------------------------------------------
-# 追加（必須の10件には無いが、`call` の doc comment に明記した挙動なので
-# 併せて検証する）: タイムアウト
+# Extra (not among the required 10, but it's a behavior documented in
+# `call`'s doc comment, so it's covered too): timeout
 # ---------------------------------------------------------------------------
 
-suite "client: タイムアウト":
-  test "応答が timeoutMs 以内に届かないと IpcClientError":
+suite "client: timeout":
+  test "no response within timeoutMs raises IpcClientError":
     const path = "/tmp/pw-t11.sock"
     removeFile(path)
-    # ハンドラは同期 proc なので、ここで `os.sleep` するとサーバの
-    # シングルスレッドイベントループそのものを止める。応答が返らない状況を
-    # 手軽に再現するのに使う（実際のハンドラでこれをやってはいけない）。
+    # The handler is a synchronous proc, so `os.sleep` here stalls the
+    # server's single-threaded event loop itself. This is used as an easy
+    # way to reproduce a situation where no response ever comes back (a
+    # real handler must never do this).
     let pid = forkTestServer(path, proc(s: IpcServer) =
       s.register("slow.method", proc(params: JsonNode): JsonNode =
         os.sleep(500)
@@ -329,8 +344,8 @@ suite "client: タイムアウト":
         discard call("slow.method", path = path, timeoutMs = 100)
         fail()
       except RpcRemoteError:
-        fail() # ここに来たら「サーバは速く応答した」ことになり想定と違う
+        fail() # reaching here would mean "the server responded quickly", which is wrong
       except IpcClientError:
-        discard # タイムアウトで IpcClientError になることを期待している
+        discard # expecting a timeout to become an IpcClientError
     finally:
       stopTestServer(pid, path)

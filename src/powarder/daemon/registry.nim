@@ -1,15 +1,17 @@
-## デーモンが持つ「今の状態」の集合管理層。
+## The layer that manages the daemon's collective "current state".
 ##
-## `HostSession`（マスター）と `Forward`（個々のポートフォワード）の実体を
-## `Table` で保持し、それらのライフサイクル関数（`hostsession.tick` /
-## `forward.tick` など）を正しい順序で呼び出す薄いコンテナ。
+## Holds the entities of `HostSession` (masters) and `Forward` (individual
+## port forwards) in `Table`s, and is a thin container that invokes their
+## lifecycle functions (`hostsession.tick` / `forward.tick`, etc.) in the
+## correct order.
 ##
-## **状態遷移の判断はここでは行わない。** それは `hostsession` / `forward` /
-## `core/statemachine` の責務。ここは「どの `HostSession` / `Forward` が
-## 存在するか」「それらをどの順序で駆動するか」だけを扱う。
+## **State-transition decisions are not made here.** That is the
+## responsibility of `hostsession` / `forward` / `core/statemachine`. This
+## module only deals with "which `HostSession` / `Forward` exist" and "in
+## what order they are driven".
 ##
-## **`同じ host を指す複数のトンネルが1つのマスターを共有する」という
-## powarder の設計の核心は `getOrCreateHost` で実現する。**
+## **The core of powarder's design -- "multiple tunnels pointing at the
+## same host share a single master" -- is realized in `getOrCreateHost`.**
 
 import std/tables
 
@@ -20,52 +22,58 @@ import powarder/daemon/forward
 
 type
   Registry* = ref object
-    hosts*: Table[string, HostSession] ## キーは hostKeyString(key)
-    forwards*: Table[string, Forward]  ## キーは Forward.id
+    hosts*: Table[string, HostSession] ## Keyed by hostKeyString(key)
+    forwards*: Table[string, Forward]  ## Keyed by Forward.id
     enabledOverride*: Table[string, bool]
-      ## トンネル名 → 有効/無効（`powarder start` / `stop` の意図）。
+      ## Tunnel name -> enabled/disabled (the intent behind `powarder start`
+      ## / `stop`).
       ##
-      ## `powarder start` / `stop` は**設定ファイルを書き換えない**。
-      ## デーモン内メモリのオーバーレイ層として持つ（`systemctl` の
-      ## enabled と active が別概念なのと同じ発想）。設定ファイルが指定する
-      ## `autostart` の上に、実行時の start/stop 意図をこの Table で被せる。
-      ## これにより「`stop` した後に無関係な設定変更で `reload` したら
-      ## 勝手に再開する」事故を、reconcile 側の特別扱い無しに防げる
-      ## （reconcile は `isEnabled` を見るだけで、`autostart` を直接見ない）。
+      ## `powarder start` / `stop` **do not rewrite the config file.** They
+      ## are kept as an overlay layer in the daemon's in-memory state (the
+      ## same idea as `systemctl`'s enabled vs. active being separate
+      ## concepts). The runtime start/stop intent is laid on top of the
+      ## `autostart` specified by the config file, via this Table. This
+      ## prevents the accident where "after `stop`, an unrelated config
+      ## change triggers `reload` and it resumes on its own", without any
+      ## special-casing on the reconcile side (reconcile only looks at
+      ## `isEnabled` and never looks at `autostart` directly).
     hostKeyCache: Table[string, HostSessionKey]
-      ## `getOrCreateHost` が `ssh -G` の再実行を省略するための内部専用
-      ## キャッシュ。公開型定義には無い（doc comment は `getOrCreateHost`
-      ## 側を参照）。
+      ## Internal-only cache used by `getOrCreateHost` to skip re-running
+      ## `ssh -G`. Not present in the public type definition (see
+      ## `getOrCreateHost`'s doc comment for details).
 
 # ---------------------------------------------------------------------------
-# キー文字列化
+# Key stringification
 # ---------------------------------------------------------------------------
 
 proc hostKeyString*(key: HostSessionKey): string =
-  ## `HostSessionKey` を `Table` のキーにするための文字列化。
+  ## Stringifies a `HostSessionKey` for use as a `Table` key.
   ##
-  ## `HostSessionKey` はただの object で `==` は自動生成されるが、
-  ## `Table[HostSessionKey, HostSession]` のキーとして直接使うには
-  ## `std/hashes.hash(HostSessionKey)` の定義が別途必要になる
-  ## （`core/types.nim` にはまだ無く、このモジュールはそれを変更できない
-  ## 制約がある）。`hash` を自分でここに書き足すこともできるが、
-  ## `HostSessionKey` は `host` と `fingerprint` という2つの文字列だけの
-  ## 単純な object なので、素直に「決定的な文字列」へ落として `Table[string, _]`
-  ## にする方が余計な型クラス実装を増やさずに済む。`@` は `host` にも
-  ## `fingerprint`（16進文字列）にも出現しない区切り文字なので衝突しない。
+  ## `HostSessionKey` is a plain object with an auto-generated `==`, but
+  ## using it directly as a key in `Table[HostSessionKey, HostSession]`
+  ## would separately require a `std/hashes.hash(HostSessionKey)`
+  ## definition (not yet present in `core/types.nim`, and this module has
+  ## a constraint that it cannot change that). We could add `hash`
+  ## ourselves here, but since `HostSessionKey` is a simple object with
+  ## just two strings, `host` and `fingerprint`, it's more straightforward
+  ## to flatten it into a "deterministic string" and use `Table[string,
+  ## _]`, without adding an extra type-class implementation. `@` is a
+  ## separator that never appears in `host` or in `fingerprint` (a hex
+  ## string), so there is no collision.
   key.host & "@" & key.fingerprint
 
 proc hostArgsCacheKey(host: string; extraArgs: seq[string]): string =
-  ## `getOrCreateHost` のキャッシュキー。`host` と `extraArgs` の組をそのまま
-  ## 文字列化する（`\x1F`（ASCII unit separator）区切り。ホスト名や引数に
-  ## 通常出現しない制御文字なので区切りとして安全）。
+  ## The cache key for `getOrCreateHost`. Stringifies the pair of `host`
+  ## and `extraArgs` as-is (separated by `\x1F`, the ASCII unit
+  ## separator). This control character normally never appears in a host
+  ## name or in arguments, so it's a safe separator.
   result = host
   for a in extraArgs:
     result.add('\x1F')
     result.add(a)
 
 # ---------------------------------------------------------------------------
-# 生成
+# Generation
 # ---------------------------------------------------------------------------
 
 proc newRegistry*(): Registry =
@@ -77,115 +85,128 @@ proc newRegistry*(): Registry =
   )
 
 # ---------------------------------------------------------------------------
-# ホスト
+# Host
 # ---------------------------------------------------------------------------
 
 proc getOrCreateHost*(reg: Registry; host: string;
     extraArgs: seq[string] = @[]): HostSession =
-  ## 「同じ host を指す複数のトンネルが1つのマスターを共有する」を実現する
-  ## 箇所。`newHostSession(host, extraArgs)` で fingerprint 込みの
-  ## `HostSessionKey` を計算し、既に同じ key のホストが登録済みならそれを
-  ## 返す。無ければ登録して返す。
+  ## The place where "multiple tunnels pointing at the same host share a
+  ## single master" is realized. `newHostSession(host, extraArgs)`
+  ## computes a `HostSessionKey` that includes the fingerprint, and if a
+  ## host with the same key is already registered, returns it. Otherwise
+  ## it registers and returns a new one.
   ##
-  ## **`ssh -G` の再実行を避ける工夫**: `newHostSession` は呼ばれるたびに
-  ## 内部で `ssh -G` を実行して fingerprint を計算し直す。reconcile は
-  ## 「同じ host を共有する複数トンネル」を1回ずつこの関数に通すため、
-  ## 何もしないと同じホストに対して `ssh -G` が何度も無駄に実行されてしまう
-  ## （reconcile が周期的に呼ばれる運用ではなおさら）。
+  ## **The trick for avoiding re-running `ssh -G`**: `newHostSession`
+  ## re-runs `ssh -G` internally to recompute the fingerprint every time
+  ## it's called. reconcile passes each "group of multiple tunnels sharing
+  ## the same host" through this function once per tunnel, so without
+  ## countermeasures, `ssh -G` would end up running wastefully many times
+  ## for the same host (all the more so when reconcile is invoked
+  ## periodically).
   ##
-  ## そこで `(host, extraArgs)` の組を `hostKeyCache` に憶えておき、
-  ## 2回目以降の呼び出しはそこから直接 `HostSessionKey` を引いて
-  ## `reg.hosts` を引き直すだけにし、`newHostSession`（＝`ssh -G`）を
-  ## 一切呼ばない経路にした。
+  ## So we remember the pair `(host, extraArgs)` in `hostKeyCache`, and
+  ## from the second call onward we just look up the `HostSessionKey`
+  ## directly from there and re-look-up `reg.hosts`, taking a path that
+  ## never calls `newHostSession` (i.e. `ssh -G`) at all.
   ##
-  ## **この最適化が「host の変更」「sshExtraArgs の変更」を Add/Remove に
-  ## 落とす性質を壊さない理由**: キャッシュのキーが `(host, extraArgs)` の
-  ## 組そのものなので、どちらかが変われば別のキャッシュキーになり、
-  ## 素直に `ssh -G` を再実行して新しい fingerprint を得る（キャッシュヒット
-  ## しない）。**唯一キャッシュが見逃すのは「host も extraArgs も変わって
-  ## いないのに `~/.ssh/config` 自体がデーモン起動中に書き換わった」という
-  ## 稀なケース**で、この場合はデーモンを再起動するまで反映されない。
-  ## ホストは一度登録されたら `Registry` から削除されない設計
-  ## （`teardownAll` を除く）なので、このケースを許容してもキャッシュと
-  ## 実体がずれて壊れることはない。
+  ## **Why this optimization doesn't break the property that "a change to
+  ## `host` or to `sshExtraArgs` falls through to Add/Remove"**: since the
+  ## cache key is the `(host, extraArgs)` pair itself, if either one
+  ## changes it becomes a different cache key, and `ssh -G` is naturally
+  ## re-run to get the new fingerprint (no cache hit). **The only case the
+  ## cache misses is the rare one where neither `host` nor `extraArgs`
+  ## changed, but `~/.ssh/config` itself was edited while the daemon was
+  ## running** -- in that case the change is not reflected until the
+  ## daemon is restarted. Since a host, once registered, is never removed
+  ## from `Registry` (except by `teardownAll`), this case doesn't cause
+  ## the cache and the actual state to drift apart and break.
   let cacheKey = hostArgsCacheKey(host, extraArgs)
   if cacheKey in reg.hostKeyCache:
     let hks = hostKeyString(reg.hostKeyCache[cacheKey])
     if hks in reg.hosts:
       return reg.hosts[hks]
-    # キャッシュに残っているのに実体が無い（本来起きないはずだが、防御的に
-    # 下のフォールバックへ進んで作り直す）。
+    # The cache has an entry but the entity doesn't exist (should never
+    # happen in principle, but as a defensive measure, fall through below
+    # to recreate it).
 
   let candidate = newHostSession(host, extraArgs)
   let hks = hostKeyString(candidate.key)
   reg.hostKeyCache[cacheKey] = candidate.key
   if hks in reg.hosts:
-    return reg.hosts[hks] ## 既存を優先し、作った candidate は捨てる
+    return reg.hosts[hks] ## Prefer the existing one; discard the constructed candidate
   reg.hosts[hks] = candidate
   candidate
 
 proc adoptHost*(reg: Registry; hs: HostSession) =
-  ## 孤児 adopt（M6。`daemon/orphan.adoptOrphans`）用。`getOrCreateHost` と
-  ## 同じキー（`hostKeyString(hs.key)`）で `reg.hosts` に登録する。
+  ## For adopting orphans (M6. `daemon/orphan.adoptOrphans`). Registers
+  ## into `reg.hosts` under the same key as `getOrCreateHost`
+  ## (`hostKeyString(hs.key)`).
   ##
-  ## **`hostKeyCache` を明示的に温める必要は無い。** adopt 後に reconcile が
-  ## 同じ `(host, extraArgs)` を要求すると `getOrCreateHost` はキャッシュ
-  ## ミスで `newHostSession`（＝`ssh -G`）を1回実行するが、ssh_config が
-  ## 変わっていなければ同じ fingerprint が得られ、`hks` 経由で `reg.hosts`
-  ## からこの adopt 済みセッションをそのまま引き当てて再利用する
-  ## （`getOrCreateHost` のフォールバック経路）。ssh_config が変わっていた
-  ## 場合は新しいセッションが作られるが、それは「設定が変わったので繋ぎ
-  ## 直す」という通常の Add/Remove ロジックが正しく機能した結果であり、
-  ## 特別な後始末は不要（Add/Remove は元々そういう設計）。
+  ## **There's no need to explicitly warm up `hostKeyCache`.** After the
+  ## adopt, when reconcile requests the same `(host, extraArgs)`,
+  ## `getOrCreateHost` misses the cache and runs `newHostSession` (i.e.
+  ## `ssh -G`) once, but as long as ssh_config hasn't changed, it gets the
+  ## same fingerprint and, via `hks`, picks up this adopted session
+  ## straight from `reg.hosts` and reuses it (the fallback path in
+  ## `getOrCreateHost`). If ssh_config has changed, a new session is
+  ## created, but that's simply the normal Add/Remove logic of "config
+  ## changed, so reconnect" working correctly, and needs no special
+  ## cleanup (that's what Add/Remove was designed for in the first place).
   reg.hosts[hostKeyString(hs.key)] = hs
 
 proc clearHostKeyCache*(reg: Registry) =
-  ## `(host, extraArgs)` → fingerprint のキャッシュを破棄する。
+  ## Discards the `(host, extraArgs)` -> fingerprint cache.
   ##
-  ## **`daemon.reload` から必ず呼ぶこと。** reload は「設定を読み直す」操作なので、
-  ## `~/.ssh/config` の再評価もここで行うべきである。呼ばないと
-  ## 「ssh_config を直して reload しても反映されない」という分かりにくい挙動になる
-  ## （`getOrCreateHost` の doc comment で述べたキャッシュの唯一の穴がこれ）。
+  ## **Must always be called from `daemon.reload`.** Since reload is the
+  ## "reread the config" operation, re-evaluating `~/.ssh/config` should
+  ## also happen here. If it isn't called, we get the confusing behavior
+  ## where "editing ssh_config and reloading doesn't take effect" (this is
+  ## the one hole in the cache mentioned in `getOrCreateHost`'s doc
+  ## comment).
   ##
-  ## 既存の `HostSession` / `Forward` は破棄しない。次回の `getOrCreateHost` が
-  ## `ssh -G` を再実行し、fingerprint が変わっていれば新しい key のホストが立ち、
-  ## 古いホストは参照カウントが 0 になって grace period 経過後に自分で停止する
-  ## （Add/Remove の一般ロジックに乗るだけで、特別扱いは不要）。
+  ## Existing `HostSession` / `Forward` instances are not discarded. The
+  ## next `getOrCreateHost` re-runs `ssh -G`, and if the fingerprint has
+  ## changed, a host with a new key is created; the old host's reference
+  ## count drops to 0 and it stops itself once the grace period elapses
+  ## (it just rides on the general Add/Remove logic; no special handling
+  ## needed).
   reg.hostKeyCache.clear()
 
 # ---------------------------------------------------------------------------
-# フォワード
+# Forward
 # ---------------------------------------------------------------------------
 
 proc addForward*(reg: Registry; tunnelName: string; spec: ForwardSpec;
     host: HostSession): Forward =
-  ## `newForward` して registry に登録する。
+  ## Calls `newForward` and registers it into the registry.
   ##
-  ## id の重複登録は状態を壊す（`host.addForwardRef` の二重カウントや、
-  ## 既存 Forward を上書きして参照を見失う事故につながる）ため、
-  ## `newForward` を呼ぶ**前**に `reg.forwards` を確認して防御する
-  ## （設定の検証で同じ bind アドレス/ポートの衝突は防がれているはずだが、
-  ## 万一に備える）。
+  ## Registering a duplicate id would corrupt state (double-counting in
+  ## `host.addForwardRef`, or overwriting an existing Forward and losing
+  ## track of its reference), so we guard against this by checking
+  ## `reg.forwards` **before** calling `newForward` (config validation
+  ## should already prevent collisions on the same bind address/port, but
+  ## this guards against the unexpected).
   let id = forwardId(spec, host.host)
   if id in reg.forwards:
-    raise newException(ValueError, "forward id はすでに登録されています: " & id)
+    raise newException(ValueError, "forward id is already registered: " & id)
   result = newForward(tunnelName, spec, host)
   reg.forwards[id] = result
 
 proc adoptForward*(reg: Registry; fw: Forward) =
-  ## 孤児 adopt（M6。`daemon/orphan.adoptOrphans`）用。呼び出し側が既に
-  ## `daemon/forward.adoptForward` で組み立て済みの `Forward`（`fwActive`。
-  ## UDS が生きていることを確認済み）をそのまま登録するだけで、`newForward`
-  ## は呼ばない（呼ぶと参照カウントを二重に増やしてしまう）。
-  ## `addForward` と同じ理由で id の重複を防御する。
+  ## For adopting orphans (M6. `daemon/orphan.adoptOrphans`). The caller
+  ## has already assembled a `Forward` via `daemon/forward.adoptForward`
+  ## (`fwActive`, confirmed that the UDS is alive), and this just
+  ## registers it as-is; it does not call `newForward` (doing so would
+  ## double-increment the reference count). Guards against duplicate ids
+  ## for the same reason as `addForward`.
   if fw.id in reg.forwards:
-    raise newException(ValueError, "forward id はすでに登録されています: " & fw.id)
+    raise newException(ValueError, "forward id is already registered: " & fw.id)
   reg.forwards[fw.id] = fw
 
 proc removeForward*(reg: Registry; id: string) =
-  ## fwDetaching を経て破棄可能になった Forward を Table から取り除く。
-  ## `id` が存在しなくても（`Table.del` は無いキーに対して no-op なので）
-  ## 安全に呼べる。
+  ## Removes from the Table a Forward that has gone through fwDetaching
+  ## and become discardable. Safe to call even if `id` doesn't exist
+  ## (`Table.del` is a no-op for a missing key).
   reg.forwards.del(id)
 
 proc forwardsOf*(reg: Registry; hostKey: string): seq[Forward] =
@@ -201,12 +222,12 @@ proc forwardsOfTunnel*(reg: Registry; tunnelName: string): seq[Forward] =
       result.add(fw)
 
 # ---------------------------------------------------------------------------
-# start/stop オーバーレイ
+# start/stop overlay
 # ---------------------------------------------------------------------------
 
 proc isEnabled*(reg: Registry; tunnelName: string; autostart: bool): bool =
-  ## `enabledOverride` にエントリがあればそれを、無ければ `autostart`
-  ## （設定ファイルの値）を返す。
+  ## Returns the entry from `enabledOverride` if one exists; otherwise
+  ## returns `autostart` (the config file's value).
   reg.enabledOverride.getOrDefault(tunnelName, autostart)
 
 proc setEnabled*(reg: Registry; tunnelName: string; enabled: bool) =
@@ -216,7 +237,8 @@ proc clearEnabledOverride*(reg: Registry; tunnelName: string) =
   reg.enabledOverride.del(tunnelName)
 
 proc pruneOverrides*(reg: Registry; knownTunnelNames: openArray[string]) =
-  ## 設定ファイルから完全に消えたトンネル名の override をガベージコレクトする。
+  ## Garbage-collects overrides for tunnel names that have completely
+  ## disappeared from the config file.
   var stale: seq[string] = @[]
   for name in reg.enabledOverride.keys:
     if name notin knownTunnelNames:
@@ -225,22 +247,24 @@ proc pruneOverrides*(reg: Registry; knownTunnelNames: openArray[string]) =
     reg.enabledOverride.del(name)
 
 # ---------------------------------------------------------------------------
-# 駆動
+# Driving
 # ---------------------------------------------------------------------------
 
 proc tickAll*(reg: Registry) =
-  ## デーモンの 500ms ループから呼ばれる。
+  ## Called from the daemon's 500ms loop.
   ##
-  ## 順序が重要:
-  ## 1. 全 `HostSession` の `tick`（マスターの状態を先に進める）
-  ## 2. 全 `Forward` の `tick`（ホストの状態を前提に判断するので後）
-  ## 3. `isDiscardable` な `Forward` を Table から除去する
+  ## Order matters:
+  ## 1. `tick` every `HostSession` (advance the master's state first)
+  ## 2. `tick` every `Forward` (this comes after, since it judges based on
+  ##    the host's state)
+  ## 3. Remove `Forward`s that are `isDiscardable` from the Table
   ##
-  ## 3 を 2 のループの中で直接やらない理由: `Table` の値をイテレート中に
-  ## 同じ `Table` から要素を削除すると、Nim の `Table` イテレータは
-  ## 壊れる（未定義動作・要素の飛ばし）。そのため、まず削除対象の id だけを
-  ## 別の `seq` に集めておき、イテレーションが終わった後にまとめて
-  ## `del` する（`std/tables` の一般的な安全パターン）。
+  ## Why step 3 isn't done directly inside the loop of step 2: deleting
+  ## elements from a `Table` while iterating over its values corrupts
+  ## Nim's `Table` iterator (undefined behavior, skipped elements). So we
+  ## first collect just the ids to be removed into a separate `seq`, and
+  ## `del` them all together after the iteration finishes (the general
+  ## safe pattern for `std/tables`).
   for hs in reg.hosts.values:
     hostsession.tick(hs)
 
@@ -255,18 +279,20 @@ proc tickAll*(reg: Registry) =
     reg.forwards.del(id)
 
 proc teardownAll*(reg: Registry) =
-  ## graceful shutdown 用。
+  ## For graceful shutdown.
   ##
-  ## **Forward を先に、HostSession を後に** teardown する（forward が
-  ## 参照カウントを減らしてからマスターを落とす順序。逆順だと
-  ## `forward.teardown` が `fw.host.removeForwardRef` を呼ぶ相手の
-  ## マスターが既に落ちていることになり、また `fw.host` 経由で
-  ## `ctlPath` / `host` を使う `cancelForward` 呼び出しが意味を失う）。
+  ## Tears down **Forwards first, then HostSessions** (the order in which
+  ## a forward decrements its reference count before the master goes
+  ## down. In the reverse order, the master that `forward.teardown`'s
+  ## `fw.host.removeForwardRef` call targets would already be down, and
+  ## the `cancelForward` call, which uses `ctlPath` / `host` via
+  ## `fw.host`, would become meaningless).
   ##
-  ## 呼び出し後は `reg.forwards` / `reg.hosts` を空にする
-  ## （プロセス自体が終了する前提の完全な後始末なので、Table に残す理由が
-  ## 無い。テストからは「残骸が無いこと」を Table が空であることでも
-  ## 確認できるようにする）。
+  ## After the call, `reg.forwards` / `reg.hosts` are emptied (this is a
+  ## complete cleanup premised on the process itself terminating, so
+  ## there's no reason to keep them in the Table. This also lets tests
+  ## confirm "no leftovers remain" simply by checking that the Table is
+  ## empty).
   for fw in reg.forwards.values:
     forward.teardown(fw)
   reg.forwards.clear()

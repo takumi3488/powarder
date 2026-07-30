@@ -1,14 +1,16 @@
-## `powarder/cli/dispatch` とその周辺（`names` / `autostart` / `cmd_completion`）のテスト。
+## Tests for `powarder/cli/dispatch` and its surroundings (`names` /
+## `autostart` / `cmd_completion`).
 ##
-## デーモンを実際に起動せずにテストできる範囲を最大化する方針:
-## - テーブル整形・ログ tail の増分読みは「文字列を組み立てる純粋関数」
-##   （`renderPsTable` / `renderHostsTable` / `tailLines` / `readIncrement`）を
-##   直接呼んでテストする。
-## - `dispatch` 自体の実行は、デーモンに絶対到達できない
-##   （`POWARDER_RUNTIME_DIR` を隔離した上でソケットが存在しない）状況を作り、
-##   `--no-autostart` で終了コード 7 になることだけを確認する。
-##   実際にデーモンを自動起動させるテストは実行ファイルが要るため行わない
-##   （報告参照）。
+## Policy for maximizing the range that can be tested without actually
+## starting the daemon:
+## - Table formatting and incremental log-tail reads are "pure functions
+##   that assemble strings" (`renderPsTable` / `renderHostsTable` /
+##   `tailLines` / `readIncrement`), tested by calling them directly.
+## - For `dispatch` itself, we create a situation where the daemon can
+##   never be reached (isolate `POWARDER_RUNTIME_DIR` so the socket doesn't
+##   exist), and only check that `--no-autostart` produces exit code 7.
+##   A test that actually lets the daemon autostart isn't done here, since
+##   it would require the built executable (see the report).
 
 import std/unittest
 import std/os
@@ -25,8 +27,8 @@ import powarder/core/fmt
 import powarder/ipc/protocol
 
 proc withEnv(pairs: openArray[(string, string)], body: proc()) =
-  ## 環境変数を一時的に差し替える（`tests/tpaths.nim` / `tests/tcli.nim` の
-  ## ヘルパーを踏襲）。
+  ## Temporarily overrides environment variables (mirrors the helper in
+  ## `tests/tpaths.nim` / `tests/tcli.nim`).
   var saved: seq[(string, bool, string)]
   for (k, v) in pairs:
     saved.add (k, existsEnv(k), getEnv(k))
@@ -60,11 +62,11 @@ proc mkRow(name, typ, bindAddr, target, host, state, status: string;
 # ===========================================================================
 
 suite "names: randomName(seed)":
-  test "同じ seed からは常に同じ名前になる":
+  test "the same seed always gives the same name":
     check randomName(1) == randomName(1)
     check randomName(42) == randomName(42)
 
-  test "「形容詞-名詞」形式（小文字英字とハイフンのみ）":
+  test "\"adjective-noun\" format (lowercase letters and hyphens only)":
     let n = randomName(7)
     let parts = n.split('-')
     check parts.len == 2
@@ -73,7 +75,7 @@ suite "names: randomName(seed)":
       for c in p:
         check c in {'a' .. 'z'}
 
-  test "seed を変えれば違う名前になりうる":
+  test "changing the seed can give a different name":
     let first = randomName(0)
     var sawDifferent = false
     for s in 1 .. 30:
@@ -87,7 +89,7 @@ suite "names: randomName(seed)":
 # ===========================================================================
 
 suite "cmd_completion: completionScript":
-  test "zsh は #compdef powarder で始まり、主要サブコマンド・daemon のサブサブコマンドを含む":
+  test "zsh starts with #compdef powarder and includes the main subcommands and daemon sub-subcommands":
     let s = completionScript("zsh")
     check s.startsWith("#compdef powarder")
     check "run" in s
@@ -96,18 +98,18 @@ suite "cmd_completion: completionScript":
     check "status" in s ## daemon status
     check "install" in s ## daemon install
 
-  test "bash / fish は簡易版でもサブコマンド名を含む":
+  test "bash / fish are simplified but still include subcommand names":
     check "run" in completionScript("bash")
     check "daemon" in completionScript("bash")
     check "run" in completionScript("fish")
     check "daemon" in completionScript("fish")
 
-  test "未知のシェルは例外":
+  test "unknown shell raises an exception":
     expect ValueError:
       discard completionScript("powershell")
 
 # ===========================================================================
-# dispatch.exitCodeForRpcError: RpcRemoteError.code -> 終了コードの全パターン
+# dispatch.exitCodeForRpcError: RpcRemoteError.code -> every exit-code pattern
 # ===========================================================================
 
 suite "dispatch: exitCodeForRpcError":
@@ -127,18 +129,18 @@ suite "dispatch: exitCodeForRpcError":
     check exitCodeForRpcError(errConfigInvalid) == ecConfig
     check ecConfig.int == 3
 
-  test "その他のコードは ecGeneral (1) にフォールバックする":
+  test "other codes fall back to ecGeneral (1)":
     check exitCodeForRpcError(errHostNotFound) == ecGeneral
     check exitCodeForRpcError(errForwardBindFailed) == ecGeneral
     check exitCodeForRpcError(-99999) == ecGeneral
     check ecGeneral.int == 1
 
 # ===========================================================================
-# dispatch.renderPsTable: tunnel.list のモック JSON -> テーブル文字列
+# dispatch.renderPsTable: mock tunnel.list JSON -> table string
 # ===========================================================================
 
 suite "dispatch: renderPsTable":
-  test "-L 行は統計が出て、-R 行は統計列が '-' になる":
+  test "-L rows show stats, -R rows have '-' stat columns":
     let w = newWriter(noColor = true)
 
     let localRow = mkRow("prod-db", "L", "127.0.0.1:15432", "db.internal:5432",
@@ -169,12 +171,13 @@ suite "dispatch: renderPsTable":
         "dev-box", "-", "-", "-",
         formatDuration(initDuration(seconds = 3900)), "up"]
     check lines[2].splitWhitespace() == expectedRemote
-    # -R の行では原理的に取れない統計列が "-" になっていること（最重要ポイント）
+    # stat columns that can't be obtained in principle for -R rows must be
+    # "-" (the most important point)
     check expectedRemote[5] == "-" ## CONNS
     check expectedRemote[6] == "-" ## RX/TX
     check expectedRemote[7] == "-" ## LAST
 
-  test "行が無くてもヘッダだけは出る":
+  test "the header still appears even with no rows":
     let w = newWriter(noColor = true)
     let rendered = renderPsTable(newJArray(), w)
     check rendered.splitLines().len == 1
@@ -186,7 +189,7 @@ suite "dispatch: renderPsTable":
 # ===========================================================================
 
 suite "dispatch: renderHostsTable":
-  test "host.list のモック JSON をテーブルに整形できる":
+  test "can format mock host.list JSON into a table":
     let w = newWriter(noColor = true)
     var row = newJObject()
     row["host"] = %"prod-bastion"
@@ -214,7 +217,7 @@ suite "dispatch: renderHostsTable":
 # ===========================================================================
 
 suite "dispatch: tailLines":
-  test "末尾 n 行を返す":
+  test "returns the last n lines":
     let path = "/tmp/pw-dtail-1.log"
     removeFile(path)
     writeFile(path, "a\nb\nc\nd\ne\n")
@@ -222,12 +225,12 @@ suite "dispatch: tailLines":
     check tailLines(path, 100) == @["a", "b", "c", "d", "e"]
     removeFile(path)
 
-  test "ファイルが無ければ空 seq":
+  test "returns an empty seq if the file doesn't exist":
     let path = "/tmp/pw-dtail-nonexist.log"
     removeFile(path)
     check tailLines(path, 10) == newSeq[string]()
 
-  test "末尾に改行が無くても最後の行を落とさない":
+  test "doesn't drop the last line even without a trailing newline":
     let path = "/tmp/pw-dtail-2.log"
     removeFile(path)
     writeFile(path, "a\nb\nc")
@@ -235,11 +238,11 @@ suite "dispatch: tailLines":
     removeFile(path)
 
 # ===========================================================================
-# dispatch.readIncrement: logs -f の増分読み取り
+# dispatch.readIncrement: incremental reads for logs -f
 # ===========================================================================
 
 suite "dispatch: readIncrement":
-  test "初回は offset 0 から全部読める":
+  test "the first read starts at offset 0 and reads everything":
     let path = "/tmp/pw-dincr-1.log"
     removeFile(path)
     writeFile(path, "hello\n")
@@ -248,7 +251,7 @@ suite "dispatch: readIncrement":
     check off == 6
     removeFile(path)
 
-  test "追記分だけを増分として読める":
+  test "can read just the appended part as an increment":
     let path = "/tmp/pw-dincr-2.log"
     removeFile(path)
     writeFile(path, "line1\n")
@@ -261,19 +264,19 @@ suite "dispatch: readIncrement":
     check off2 == off1 + 6
     removeFile(path)
 
-  test "truncate（ローテーション）されたら先頭から読み直す":
+  test "re-reads from the start after a truncate (rotation)":
     let path = "/tmp/pw-dincr-3.log"
     removeFile(path)
-    writeFile(path, "aaaaaaaaaa\n") # 11 バイト
+    writeFile(path, "aaaaaaaaaa\n") # 11 bytes
     let (_, off1) = readIncrement(path, 0)
     check off1 == 11
-    writeFile(path, "new\n") # ローテーション後の短い新しい内容
+    writeFile(path, "new\n") # short new content after rotation
     let (data2, off2) = readIncrement(path, off1)
     check data2 == "new\n"
     check off2 == 4
     removeFile(path)
 
-  test "ファイルが存在しない場合は増分無しで offset をそのまま返す":
+  test "returns the offset unchanged with no data if the file doesn't exist":
     let path = "/tmp/pw-dincr-nonexist.log"
     removeFile(path)
     let (data, off) = readIncrement(path, 42)
@@ -281,45 +284,47 @@ suite "dispatch: readIncrement":
     check off == 42
 
 # ===========================================================================
-# dispatch: daemon --foreground（DaemonRunner の依存性注入）
+# dispatch: daemon --foreground (DaemonRunner dependency injection)
 # ===========================================================================
-# `daemon/run.nim` を import しなくてもテストできる部分。ダミーの
-# `DaemonRunner` を渡して、正しくそこへ委譲されることだけを確認する。
-# IPC も daemon プロセスも一切必要ない。
+# The part that can be tested without importing `daemon/run.nim`. Just
+# passes a dummy `DaemonRunner` and confirms it's delegated to correctly.
+# Needs no IPC and no daemon process at all.
 
-suite "dispatch: daemon --foreground (DaemonRunner 注入)":
-  test "subsubcommand が空なら runDaemon() の戻り値がそのまま返る":
+suite "dispatch: daemon --foreground (DaemonRunner injection)":
+  test "when subsubcommand is empty, the return value of runDaemon() is passed through":
     let args = ParsedArgs(subcommand: "daemon", subsubcommand: "", tailLines: 50)
     let fakeRunDaemon: DaemonRunner = proc (): int = 42
     check dispatch(args, fakeRunDaemon) == 42
 
-  test "runDaemon が nil なら ecGeneral (1)":
+  test "ecGeneral (1) when runDaemon is nil":
     let args = ParsedArgs(subcommand: "daemon", subsubcommand: "", tailLines: 50)
     check dispatch(args) == ecGeneral.int
 
 # ===========================================================================
-# dispatch: daemon install / uninstall は M7 で実装済み（`platform/service`）
+# dispatch: daemon install / uninstall was implemented in M7 (`platform/service`)
 # ===========================================================================
-# **ここでは `dispatch(args)` に subsubcommand "install"/"uninstall" を
-# 実際に流すテストは書かない。** `installService()` / `uninstallService()` は
-# 本物の `launchctl` / `systemctl` を呼び、実ファイル
-# （`~/Library/LaunchAgents/...` / `~/.config/systemd/user/...`）を書き出す
-# 副作用があるため、ここで呼ぶとテスト実行環境（開発者の実マシン）に
-# 実際に LaunchAgent/systemd unit が登録されてしまう（しかもテストバイナリ
-# 自身のパスが登録されるという最悪の事故になりうる）。
+# **We deliberately don't write a test that actually feeds subsubcommand
+# "install"/"uninstall" into `dispatch(args)` here.** `installService()` /
+# `uninstallService()` call the real `launchctl` / `systemctl` and write
+# real files (`~/Library/LaunchAgents/...` / `~/.config/systemd/user/...`)
+# as a side effect, so calling them here would actually register a
+# LaunchAgent/systemd unit on the test-running environment (the developer's
+# real machine) -- and worse, it could register the test binary's own path,
+# which would be the worst-case accident.
 #
-# `installService` / `uninstallService` が内部で使う純粋関数
-# （`renderUnitFile` / `unitFilePath` / `serviceLabel` / `lingerNote`）は
-# `tests/tservice.nim` で `platform/service_darwin` / `platform/service_linux`
-# を直接 import して検証している（そちらも実際の `launchctl` / `systemctl` は
-# 呼ばない）。手動での実機検証手順は M7 の報告に記載する。
+# The pure functions that `installService` / `uninstallService` use
+# internally (`renderUnitFile` / `unitFilePath` / `serviceLabel` /
+# `lingerNote`) are verified in `tests/tservice.nim` by directly importing
+# `platform/service_darwin` / `platform/service_linux` (that one also never
+# calls the real `launchctl` / `systemctl`). The manual on-machine
+# verification steps are recorded in the M7 report.
 
 # ===========================================================================
-# dispatch.prunableNames: tunnel.list のモック JSON -> 削除対象の名前
+# dispatch.prunableNames: mock tunnel.list JSON -> names to remove
 # ===========================================================================
 
 suite "dispatch: prunableNames":
-  test "status == \"stopped\" の行だけを集める":
+  test "collects only rows with status == \"stopped\"":
     let stoppedRow = mkRow("idle-tunnel", "L", "127.0.0.1:1", "x:1", "h",
         "fwPending", "stopped", newJNull(), newJNull(), newJNull(),
         newJNull(), newJNull(), newJNull())
@@ -330,10 +335,10 @@ suite "dispatch: prunableNames":
     rows.add activeRow
     check prunableNames(rows) == @["idle-tunnel"]
 
-  test "空配列を渡すと空配列が返る":
+  test "passing an empty array returns an empty array":
     check prunableNames(newJArray()) == newSeq[string]()
 
-  test "全行 stopped なら全部集める":
+  test "collects everything when every row is stopped":
     let a = mkRow("a", "L", "1", "2", "h", "fwPending", "stopped",
         newJNull(), newJNull(), newJNull(), newJNull(), newJNull(), newJNull())
     let b = mkRow("b", "R", "1", "2", "h", "fwPending", "stopped",
@@ -343,7 +348,7 @@ suite "dispatch: prunableNames":
     rows.add b
     check prunableNames(rows) == @["a", "b"]
 
-  test "全行 stopped でなければ空配列":
+  test "returns an empty array unless every row is stopped":
     let activeRow = mkRow("busy-tunnel", "L", "127.0.0.1:2", "x:2", "h",
         "fwActive", "healthy", %0, %0, %0, %0, newJNull(), %10)
     var rows = newJArray()
@@ -351,11 +356,11 @@ suite "dispatch: prunableNames":
     check prunableNames(rows) == newSeq[string]()
 
 # ===========================================================================
-# usage(): 主要サブコマンドを含む
+# usage(): includes the main subcommands
 # ===========================================================================
 
 suite "argv.usage":
-  test "主要サブコマンドを全部含む":
+  test "includes every main subcommand":
     let u = usage()
     for cmd in ["run", "up", "down", "ps", "start", "stop", "restart",
                 "inspect", "check", "logs", "rm", "hosts", "daemon",
@@ -363,18 +368,18 @@ suite "argv.usage":
       check cmd in u
 
 # ===========================================================================
-# dispatch: --no-autostart かつデーモン無しなら終了コード 7
+# dispatch: exit code 7 when --no-autostart and no daemon
 # ===========================================================================
 
 suite "dispatch: --no-autostart":
-  test "デーモンに到達できず --no-autostart なら ecDaemonUnreachable (7)":
+  test "ecDaemonUnreachable (7) when the daemon can't be reached and --no-autostart is set":
     withEnv({envRuntimeDir: "/tmp/pw-dispatch-rt-noexist"}, proc() =
       removeFile("/tmp/pw-dispatch-rt-noexist/powarder.sock")
       let args = ParsedArgs(subcommand: "ps", noAutostart: true, tailLines: 50)
       check dispatch(args) == ecDaemonUnreachable.int
       check ecDaemonUnreachable.int == 7)
 
-  test "start / stop / restart / rm / prune も同様に 7 になる":
+  test "start / stop / restart / rm / prune also give 7 the same way":
     withEnv({envRuntimeDir: "/tmp/pw-dispatch-rt-noexist2"}, proc() =
       removeFile("/tmp/pw-dispatch-rt-noexist2/powarder.sock")
       for sub in ["start", "stop", "restart", "rm", "prune"]:
@@ -386,27 +391,29 @@ suite "dispatch: --no-autostart":
 # dispatch: logs
 # ===========================================================================
 #
-# ログの実体は **ホスト単位**（1 ControlMaster = 1 ログファイル）に書かれ、
-# ファイル名にホストの fingerprint が入るため、**トンネル名だけからパスを
-# 決定できない**。よって `logs` は `tunnel.inspect` で `log_path` を問い合わせる。
+# The log itself is written **per host** (1 ControlMaster = 1 log file), and
+# the file name includes the host's fingerprint, so **the path can't be
+# determined from the tunnel name alone**. That's why `logs` queries
+# `log_path` via `tunnel.inspect`.
 #
-# その結果、デーモンが停止している場合は「ログが無い」のではなく
-# 「どのファイルを読めばよいか特定できない」状態になるので、
-# `ecOk` ではなく `ecDaemonUnreachable`（7）を返し、
-# `logs/` 配下のファイル一覧を案内する（ファイル自体はデーモンの生死に
-# 関係なく残っているので、直接読めば内容は確認できる）。
+# As a result, when the daemon is stopped, the situation isn't "there's no
+# log" but "we can't pin down which file to read", so it returns
+# `ecDaemonUnreachable` (7) instead of `ecOk`, and points the user at the
+# file listing under `logs/` (the files themselves remain regardless of
+# whether the daemon is alive, so reading them directly still works).
 #
-# 「デーモン稼働中でログファイルがまだ無い」ケースだけは `ecOk` を返すが、
-# それには実デーモンが必要なので単体テストでは検証できない（E2E で確認済み）。
+# Only the case "the daemon is running but the log file doesn't exist yet"
+# returns `ecOk`, but that requires a real daemon so it can't be verified in
+# a unit test (confirmed via E2E).
 
 suite "dispatch: logs":
-  test "デーモンが停止していればパスを特定できないので 7 を返す":
+  test "returns 7 because the path can't be determined when the daemon is stopped":
     withEnv({envStateDir: "/tmp/pw-dispatch-state-empty",
              envRuntimeDir: "/tmp/pw-dispatch-rt-empty"}, proc() =
       let args = ParsedArgs(subcommand: "logs",
           positional: @["nonexistent-tunnel"], tailLines: 50)
       check dispatch(args) == ecDaemonUnreachable.int)
 
-  test "トンネル名を省略すると使用法エラー（2）":
+  test "omitting the tunnel name gives a usage error (2)":
     let args = ParsedArgs(subcommand: "logs", positional: @[], tailLines: 50)
     check dispatch(args) == ecUsage.int

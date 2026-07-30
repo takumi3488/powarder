@@ -1,28 +1,30 @@
-## macOS (launchd) 向けの OS サービス登録実装。
+## macOS (launchd) OS service registration implementation.
 ##
-## `~/Library/LaunchAgents/dev.powarder.daemon.plist` を生成し、
-## `launchctl bootstrap` / `bootout` で登録・解除する。
+## Generates `~/Library/LaunchAgents/dev.powarder.daemon.plist`, and
+## registers/deregisters it via `launchctl bootstrap` / `bootout`.
 ##
-## ### ★最重要: `KeepAlive.SuccessfulExit = false`
+## ### IMPORTANT: `KeepAlive.SuccessfulExit = false`
 ##
-## launchd の `KeepAlive` は、`true` のような単純な値だと「exit コードに
-## 関わらず常に再起動する」挙動になる。これだと `powarder daemon stop`
-## （= プロセスが exit 0 で終了する）が即座に launchd に再起動されてしまい、
-## デーモンを止められなくなる重大なバグになる。クラッシュ（exit != 0）の
-## ときだけ再起動してほしいので、`<dict><key>SuccessfulExit</key><false/></dict>`
-## という辞書形式で「正常終了時は keep-alive しない」ことを明示する。
+## For launchd's `KeepAlive`, a simple value like `true` results in "always
+## restart regardless of exit code" behavior. This would be a serious bug:
+## `powarder daemon stop` (= the process exiting with exit 0) would be
+## immediately restarted by launchd, and the daemon could never be stopped.
+## Since we only want it to restart on a crash (exit != 0), the dict form
+## `<dict><key>SuccessfulExit</key><false/></dict>` is used to explicitly
+## state "do not keep-alive on a normal exit."
 ##
-## launchd は対話シェルの環境（`PATH` / `SSH_AUTH_SOCK` 等）を継承しない。
-## `EnvironmentVariables` に最低限の `PATH` を書いておかないと powarder が
-## `ssh` を発見できない。`SSH_AUTH_SOCK` は launchd 経由では原理的に
-## 解決できない（ユーザーのログインセッションの ssh-agent に依存するため）ので、
-## こちらは README のトラブルシュートで案内するに留める（Keychain 統合の
-## `UseKeychain yes` を使えば回避できる）。
+## launchd does not inherit an interactive shell's environment (`PATH` /
+## `SSH_AUTH_SOCK` etc.). Without writing at least a minimal `PATH` in
+## `EnvironmentVariables`, powarder cannot find `ssh`. `SSH_AUTH_SOCK`
+## cannot be resolved via launchd in principle (since it depends on the
+## user's login session's ssh-agent), so this is left to be covered in the
+## README's troubleshooting section instead (it can be worked around using
+## Keychain integration's `UseKeychain yes`).
 ##
-## `renderUnitFile` はファイルにもソケットにも触らない **純粋関数**。
-## `installService` / `uninstallService` / `serviceStatus` だけが実際に
-## `launchctl` を呼ぶ（`tests/tservice.nim` はここを一切呼ばない。
-## ユーザーの実環境を汚すため）。
+## `renderUnitFile` is a **pure function** that touches neither files nor
+## sockets. Only `installService` / `uninstallService` / `serviceStatus`
+## actually call `launchctl` (`tests/tservice.nim` never calls into here at
+## all, to avoid polluting the user's real environment).
 
 import std/[os, osproc, strutils, posix]
 import powarder/platform/service_types
@@ -30,27 +32,29 @@ import powarder/core/paths
 
 const
   launchdPath = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
-    ## launchd は対話シェルの PATH を継承しないため、最低限の候補を明示する。
+    ## Since launchd does not inherit an interactive shell's PATH, minimal
+    ## candidates are specified explicitly.
 
 proc escapeXml(s: string): string =
-  ## plist は XML なので `&` `<` `>` を含みうるパスをそのまま埋め込むと壊れる。
+  ## Since a plist is XML, embedding a path that may contain `&` `<` `>`
+  ## as-is would break it.
   s.multiReplace(("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
 
 proc unitFilePath*(): string =
   getHomeDir() / "Library" / "LaunchAgents" / (serviceLabel() & ".plist")
 
 proc programArguments(exePath, configPath: string): seq[string] =
-  ## `powarder <exePath> daemon [--config <configPath>]` に対応する
-  ## `ProgramArguments` の要素列。
+  ## The element sequence for `ProgramArguments` corresponding to
+  ## `powarder <exePath> daemon [--config <configPath>]`.
   result = @[exePath, "daemon"]
   if configPath.len > 0:
     result.add "--config"
     result.add configPath
 
 proc renderUnitFile*(exePath: string; configPath = ""): string =
-  ## plist の中身を組み立てる。`daemonLogPath()` は絶対パスを返す
-  ## （plist の `StandardOutPath` は `~` を展開してくれないため、
-  ## 呼び出し側で絶対パスを解決しておく必要がある）。
+  ## Assembles the contents of the plist. `daemonLogPath()` returns an
+  ## absolute path (since the plist's `StandardOutPath` does not expand
+  ## `~`, the caller must resolve it to an absolute path beforehand).
   let logPath = daemonLogPath()
   var s = ""
   s.add "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
@@ -88,7 +92,7 @@ proc renderUnitFile*(exePath: string; configPath = ""): string =
   s
 
 # ---------------------------------------------------------------------------
-# launchctl の実行（side effect あり。テストでは呼ばない）
+# Executing launchctl (has side effects. Not called from tests)
 # ---------------------------------------------------------------------------
 
 proc guiDomain(): string =
@@ -101,7 +105,8 @@ proc runLaunchctl(args: varargs[string]): tuple[output: string; exitCode: int] =
     (e.msg, -1)
 
 proc serviceStatus*(): ServiceInfo =
-  ## plist ファイルの有無と `launchctl print` の成否から状態を判定する。
+  ## Determines the status from whether the plist file exists and whether
+  ## `launchctl print` succeeds.
   let path = unitFilePath()
   if not fileExists(path):
     return ServiceInfo(label: serviceLabel(), unitPath: path,
@@ -111,9 +116,9 @@ proc serviceStatus*(): ServiceInfo =
   ServiceInfo(label: serviceLabel(), unitPath: path, status: status, notes: @[])
 
 proc installService*(exePath: string; configPath = ""): ServiceInfo =
-  ## plist を書き出し、`launchctl bootstrap` で登録する。
-  ## `bootstrap`（新しい API）が失敗する環境向けに、古い `launchctl load` へ
-  ## フォールバックする。
+  ## Writes out the plist and registers it via `launchctl bootstrap`.
+  ## Falls back to the older `launchctl load` for environments where
+  ## `bootstrap` (the newer API) fails.
   let path = unitFilePath()
   createDir(path.parentDir)
   writeFile(path, renderUnitFile(exePath, configPath))
@@ -125,11 +130,11 @@ proc installService*(exePath: string; configPath = ""): ServiceInfo =
 
   result = serviceStatus()
   if code != 0:
-    result.notes.add "launchctl での登録に失敗した可能性があります: " &
+    result.notes.add "Registration via launchctl may have failed: " &
         outp.strip()
 
 proc uninstallService*(): ServiceInfo =
-  ## `launchctl bootout` で解除してから plist ファイルを削除する。
+  ## Deregisters via `launchctl bootout`, then deletes the plist file.
   let path = unitFilePath()
   discard runLaunchctl("bootout", guiDomain() & "/" & serviceLabel())
   if fileExists(path):

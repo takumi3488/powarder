@@ -1,13 +1,13 @@
-## `powarder/ipc/protocol` のテスト。
+## Tests for `powarder/ipc/protocol`.
 
 import std/unittest
 import std/json
 import std/options
-import std/nativesockets ## `Port` の `==` を使うために必要
+import std/nativesockets ## Needed to use `Port`'s `==`
 import powarder/core/types
 import powarder/ipc/protocol
 
-suite "encode* は改行を含まない":
+suite "encode* never contains a newline":
   test "encodeRequest":
     let line = encodeRequest(1, mTunnelList, %*{"a": 1})
     check '\n' notin line
@@ -25,49 +25,49 @@ suite "encode* は改行を含まない":
     let line = encodeError(1, errTunnelNotFound, "not found", %*{"name": "web"})
     check '\n' notin line
 
-  test "params/result/data が nil でも改行を含まない":
+  test "no newline even when params/result/data are nil":
     check '\n' notin encodeRequest(1, mDaemonPing)
     check '\n' notin encodeNotification(mDaemonPing)
     check '\n' notin encodeSuccess(1, nil)
     check '\n' notin encodeError(1, rpcInternalError, "boom")
 
-suite "request の往復変換":
-  test "id 付き・params 付き":
+suite "request round-trip":
+  test "with id and params":
     let line = encodeRequest(42, mTunnelUp, %*{"name": "web"})
     let req = decodeRequest(line)
     check req.id == some(42)
     check req.methodName == mTunnelUp
     check req.params == %*{"name": "web"}
 
-  test "params を省略した場合は nil":
+  test "params omitted means nil":
     let line = encodeRequest(1, mDaemonPing)
     let req = decodeRequest(line)
     check req.id == some(1)
     check req.params.isNil
 
-  test "notification は id が none":
+  test "a notification has id set to none":
     let line = encodeNotification(mTunnelDown, %*{"name": "web"})
     let req = decodeRequest(line)
     check req.id.isNone
     check req.methodName == mTunnelDown
     check req.params == %*{"name": "web"}
 
-suite "response の往復変換":
-  test "成功応答":
+suite "response round-trip":
+  test "success response":
     let line = encodeSuccess(7, %*{"pid": 123})
     let res = decodeResponse(line)
     check res.id == some(7)
     check res.result == %*{"pid": 123}
     check res.error.isNone
 
-  test "result を省略した成功応答":
+  test "success response with result omitted":
     let line = encodeSuccess(7, nil)
     let res = decodeResponse(line)
     check res.id == some(7)
     check res.result.isNil
     check res.error.isNone
 
-  test "エラー応答 (data あり)":
+  test "error response (with data)":
     let line = encodeError(7, errTunnelNotFound, "tunnel not found", %*{"name": "web"})
     let res = decodeResponse(line)
     check res.id == some(7)
@@ -78,34 +78,34 @@ suite "response の往復変換":
     check errInfo.message == "tunnel not found"
     check errInfo.data == %*{"name": "web"}
 
-  test "エラー応答 (data なし) は data が nil":
+  test "error response (without data) has data set to nil":
     let line = encodeError(7, rpcInternalError, "boom")
     let res = decodeResponse(line)
     check res.error.get.data.isNil
 
-suite "params/result/data が nil のときフィールドが省略される":
-  test "encodeRequest: params 省略時に \"params\" キーが無い":
+suite "fields are omitted when params/result/data are nil":
+  test "encodeRequest: no \"params\" key when params is omitted":
     let j = parseJson(encodeRequest(1, mDaemonPing))
     check not j.hasKey("params")
 
-  test "encodeNotification: params 省略時に \"params\" キーが無い":
+  test "encodeNotification: no \"params\" key when params is omitted":
     let j = parseJson(encodeNotification(mDaemonPing))
     check not j.hasKey("params")
 
-  test "encodeSuccess: result 省略時に \"result\" キーが無い":
+  test "encodeSuccess: no \"result\" key when result is omitted":
     let j = parseJson(encodeSuccess(1, nil))
     check not j.hasKey("result")
 
-  test "encodeError: data 省略時に \"data\" キーが無い":
+  test "encodeError: no \"data\" key when data is omitted":
     let j = parseJson(encodeError(1, rpcInternalError, "boom"))
     check not j["error"].hasKey("data")
 
-  test "encodeNotification は \"id\" キー自体を持たない":
+  test "encodeNotification has no \"id\" key at all":
     let j = parseJson(encodeNotification(mDaemonPing))
     check not j.hasKey("id")
 
-suite "decode* の異常系":
-  test "空文字列は RpcParseError (rpeInvalidJson)":
+suite "decode* error cases":
+  test "an empty string is RpcParseError (rpeInvalidJson)":
     expect RpcParseError:
       discard decodeRequest("")
     try:
@@ -114,70 +114,70 @@ suite "decode* の異常系":
     except RpcParseError as e:
       check e.kind == rpeInvalidJson
 
-  test "壊れた JSON は RpcParseError (rpeInvalidJson)":
+  test "malformed JSON is RpcParseError (rpeInvalidJson)":
     try:
       discard decodeRequest("{not json")
       fail()
     except RpcParseError as e:
       check e.kind == rpeInvalidJson
 
-  test "JSON だがトップレベルが配列":
+  test "JSON whose top level is an array":
     try:
       discard decodeRequest("[1, 2, 3]")
       fail()
     except RpcParseError as e:
       check e.kind == rpeInvalidJson
 
-  test "jsonrpc フィールドが無い":
+  test "the jsonrpc field is missing":
     try:
       discard decodeRequest("""{"method": "daemon.ping"}""")
       fail()
     except RpcParseError as e:
       check e.kind == rpeInvalidVersion
 
-  test "jsonrpc フィールドが \"1.0\"":
+  test "the jsonrpc field is \"1.0\"":
     try:
       discard decodeRequest("""{"jsonrpc": "1.0", "method": "daemon.ping"}""")
       fail()
     except RpcParseError as e:
       check e.kind == rpeInvalidVersion
 
-  test "method フィールドが無い (request)":
+  test "the method field is missing (request)":
     try:
       discard decodeRequest("""{"jsonrpc": "2.0"}""")
       fail()
     except RpcParseError as e:
       check e.kind == rpeMissingField
 
-  test "method フィールドが文字列でない":
+  test "the method field is not a string":
     try:
       discard decodeRequest("""{"jsonrpc": "2.0", "method": 1}""")
       fail()
     except RpcParseError as e:
       check e.kind == rpeInvalidField
 
-  test "id フィールドが整数でない (request)":
+  test "the id field is not an integer (request)":
     try:
       discard decodeRequest("""{"jsonrpc": "2.0", "method": "daemon.ping", "id": "1"}""")
       fail()
     except RpcParseError as e:
       check e.kind == rpeInvalidField
 
-  test "id フィールドが無い (response)":
+  test "the id field is missing (response)":
     try:
       discard decodeResponse("""{"jsonrpc": "2.0", "result": 1}""")
       fail()
     except RpcParseError as e:
       check e.kind == rpeMissingField
 
-  test "error.code が無い (response)":
+  test "error.code is missing (response)":
     try:
       discard decodeResponse("""{"jsonrpc": "2.0", "id": 1, "error": {"message": "x"}}""")
       fail()
     except RpcParseError as e:
       check e.kind == rpeMissingField
 
-  test "error.message が文字列でない (response)":
+  test "error.message is not a string (response)":
     try:
       discard decodeResponse(
           """{"jsonrpc": "2.0", "id": 1, "error": {"code": -1, "message": 1}}""")
@@ -185,11 +185,11 @@ suite "decode* の異常系":
     except RpcParseError as e:
       check e.kind == rpeInvalidField
 
-  test "空文字列は decodeResponse でも RpcParseError":
+  test "an empty string is also RpcParseError for decodeResponse":
     expect RpcParseError:
       discard decodeResponse("")
 
-suite "types.nim の型の往復変換":
+suite "round-tripping types.nim's types":
   test "ForwardSpec (fkLocal)":
     let spec = ForwardSpec(kind: fkLocal, bindAddr: "127.0.0.1", bindPort: Port(15432),
                             targetHost: "db.internal", targetPort: Port(5432))
@@ -211,7 +211,7 @@ suite "types.nim の型の往復変換":
     let j = toJson(policy)
     check retryPolicyFromJson(j) == policy
 
-  test "RetryPolicy (既定値)":
+  test "RetryPolicy (defaults)":
     let policy = initRetryPolicy()
     check retryPolicyFromJson(toJson(policy)) == policy
 
@@ -229,7 +229,7 @@ suite "types.nim の型の往復変換":
     let j = toJson(cfg)
     check tunnelConfigFromJson(j) == cfg
 
-  test "TunnelConfig (sshExtraArgs が空)":
+  test "TunnelConfig (sshExtraArgs empty)":
     let cfg = TunnelConfig(
       name: "empty-args",
       host: "myhost",
@@ -261,13 +261,13 @@ suite "types.nim の型の往復変換":
     check j["port"].getInt == 9999
     check upstreamTargetFromJson(j) == target
 
-  test "UpstreamTarget の == は kind が違えば false":
+  test "UpstreamTarget's == is false when kind differs":
     let a = UpstreamTarget(kind: ukUnix, path: "/tmp/a.sock")
     let b = UpstreamTarget(kind: ukTcp, port: Port(1))
     check a != b
 
-suite "TunnelConfig を RPC の params に載せて往復させる":
-  test "tunnel.create の params として使える":
+suite "carrying a TunnelConfig round-trip as RPC params":
+  test "usable as tunnel.create's params":
     let cfg = TunnelConfig(
       name: "web",
       host: "myhost",

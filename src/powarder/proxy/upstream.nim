@@ -1,4 +1,5 @@
-## 内部エンドポイント（ssh が張った UDS、または TCP フォールバック）への接続。
+## Connecting to the internal endpoint (the UDS ssh established, or the TCP
+## fallback).
 
 import std/asyncdispatch
 import std/asyncnet
@@ -7,19 +8,21 @@ import powarder/core/types
 
 type
   UpstreamUnhealthyError* = object of CatchableError
-    ## 上流（UDS または TCP）への接続確立に失敗したことを表す。
+    ## Represents a failure to establish a connection to the upstream
+    ## (UDS or TCP).
 
 proc dialUpstream*(target: UpstreamTarget): Future[AsyncSocket] {.async.} =
-  ## `target` に接続し、確立済みの `AsyncSocket` を返す。
+  ## Connects to `target` and returns the established `AsyncSocket`.
   ##
-  ## `buffered = false` が重要: `acceptAddr` は accept した子ソケットに
-  ## 親の `isBuffered` を継承するので、公開リスナー側も含めて unbuffered に
-  ## 揃えておくと `recvInto`/`send` が内部バッファへの余分な `copyMem` を
-  ## 経由しない。
+  ## `buffered = false` matters: since `acceptAddr` makes the accepted
+  ## child socket inherit the parent's `isBuffered`, keeping everything
+  ## unbuffered — including the public listener side — means `recvInto`/
+  ## `send` avoid an extra `copyMem` through an internal buffer.
   ##
-  ## connect 失敗（`ECONNREFUSED` / `ENOENT` 等）は `std/asyncdispatch` の
-  ## 実装が `retFuture.fail(newOSError(...))` するので `OSError` が飛ぶ。
-  ## ここで捕まえて `UpstreamUnhealthyError` に変換し、ソケットは必ず close する。
+  ## A connect failure (`ECONNREFUSED` / `ENOENT` etc.) causes `OSError` to
+  ## be raised, since `std/asyncdispatch`'s implementation does
+  ## `retFuture.fail(newOSError(...))`. It is caught here and converted
+  ## into `UpstreamUnhealthyError`, and the socket is always closed.
   case target.kind
   of ukUnix:
     let sock = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_NONE,
@@ -29,7 +32,7 @@ proc dialUpstream*(target: UpstreamTarget): Future[AsyncSocket] {.async.} =
     except CatchableError as e:
       sock.close()
       raise newException(UpstreamUnhealthyError,
-          "UDS " & target.path & " への接続に失敗しました: " & e.msg)
+          "Failed to connect to UDS " & target.path & ": " & e.msg)
     result = sock
   of ukTcp:
     let sock = newAsyncSocket(buffered = false)
@@ -38,20 +41,23 @@ proc dialUpstream*(target: UpstreamTarget): Future[AsyncSocket] {.async.} =
     except CatchableError as e:
       sock.close()
       raise newException(UpstreamUnhealthyError,
-          "TCP 127.0.0.1:" & $target.port &
-          " への接続に失敗しました: " & e.msg)
+          "Failed to connect to TCP 127.0.0.1:" & $target.port &
+          ": " & e.msg)
     result = sock
 
 proc probeUpstream*(target: UpstreamTarget): Future[bool] {.async.} =
-  ## 接続を試みて即 close し、成否を bool で返す（ヘルスチェック用）。
+  ## Attempts a connection and closes it immediately, returning success as
+  ## a bool (for health checks).
   ##
-  ## **重要な既知の制約**: OpenSSH の `channels.c` の
-  ## `channel_post_port_listener()` は `accept()` が成功した瞬間に
-  ## （1バイトも送っていなくても）`port_open_helper()` を呼んでリモートへ
-  ## `direct-tcpip` の `SSH_MSG_CHANNEL_OPEN` を送る。つまり
-  ## **`probeUpstream` は必ず踏み台経由で宛先への実接続を発生させる**
-  ## （回避不可能）。だから定期的なプローブはデフォルト無効にし、デーモン
-  ## 起動時の adopt 判定など回数が限られる場面で使うこと。
+  ## **Important known limitation**: OpenSSH's `channels.c`
+  ## `channel_post_port_listener()` calls `port_open_helper()` the instant
+  ## `accept()` succeeds (even before a single byte is sent), which sends a
+  ## `direct-tcpip` `SSH_MSG_CHANNEL_OPEN` to the remote side. In other
+  ## words, **`probeUpstream` always triggers a real connection to the
+  ## destination via the bastion** (this cannot be avoided). Therefore
+  ## periodic probing is disabled by default, and this should only be used
+  ## in situations with a bounded number of calls, such as adopt
+  ## determination at daemon startup.
   try:
     let sock = await dialUpstream(target)
     sock.close()
