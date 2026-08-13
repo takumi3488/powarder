@@ -83,6 +83,12 @@ type
     configPath*: string  ## If empty, uses configfile.findConfigFile()
     socketPath*: string  ## If empty, uses paths.ipcSocketPath()
     activeProfiles*: seq[string]
+      ## Profiles currently active for this session (the same idea as
+      ## docker compose's `--profile`). Persisted to / restored from
+      ## `state.json` (`buildPersistedState` / `newDaemon`), so the set
+      ## `handleTunnelUp` establishes for the session survives a daemon
+      ## restart even when launchd/systemd relaunch the daemon without
+      ## `--profile`.
     tickIntervalMs*: int ## Default 500
     stateSaveIntervalMs*: int ## Default 5000 (saving on every tick would waste I/O)
 
@@ -229,7 +235,13 @@ proc buildPersistedState(d: Daemon): PersistedState =
     forwards.add PersistedForward(id: fw.id, tunnelName: fw.tunnelName,
         spec: fw.spec, state: fw.state, udsPath: udsPath)
 
-  PersistedState(version: 1, savedAt: "", hosts: hosts, forwards: forwards)
+  # `activeProfiles` rides along in the saved state so that `tickOnce`'s
+  # "compare against the last saved JSON" check picks up a profile change
+  # automatically (the moment `handleTunnelUp` rewrites
+  # `d.opts.activeProfiles`, the next tick's snapshot differs and gets
+  # saved) -- no extra save trigger is needed here or in `handleTunnelUp`.
+  PersistedState(version: 1, savedAt: "",
+      activeProfiles: d.opts.activeProfiles, hosts: hosts, forwards: forwards)
 
 proc persistState(d: Daemon) =
   ## Saving is ultimately nothing more than a hint to make adopt (M6) after
@@ -489,12 +501,26 @@ proc handleTunnelInspect(d: Daemon; params: JsonNode): JsonNode =
 
 proc handleTunnelUp(d: Daemon; params: JsonNode): JsonNode =
   let names = getStrArray(params, "names")
-  if params != nil and params.hasKey("profiles") and params["profiles"].kind == JArray:
-    # `up` is an operation that fixes "the set of profiles active for this
-    # session" (the same idea as docker compose's `--profile`), so it is
-    # persisted to also take effect on subsequent reconciles (the main
-    # loop and any later `reconcile` calls).
-    d.opts.activeProfiles = getStrArray(params, "profiles")
+  # `up` is an operation that fixes "the set of profiles active for this
+  # session" (the same idea as docker compose's `--profile`), so it is
+  # persisted to also take effect on subsequent reconciles (the main
+  # loop and any later `reconcile` calls).
+  #
+  # **An empty array is NOT a "clear the profile set" signal** -- this is
+  # the primary statement of the rule, which `handleTunnelDown` shares.
+  # `cli/dispatch.cmdUp` always serialises the `profiles` key into the
+  # `tunnel.up` payload, so an empty array is indistinguishable from
+  # "no `--profile` was given" on the wire; and since the set is now
+  # persisted (`buildPersistedState`), treating it as a clear would let
+  # a bare `powarder up` permanently erase what `up --profile X`
+  # established. The session's set is replaced only when a non-empty
+  # array arrives -- the same "empty means don't touch" rule `newDaemon`
+  # applies when restoring from state. (The collapsed guard is safe:
+  # `getStrArray` already returns `@[]` for a nil payload, a missing key,
+  # or a non-array value, so the `len > 0` check is the whole decision.)
+  let profiles = getStrArray(params, "profiles")
+  if profiles.len > 0:
+    d.opts.activeProfiles = profiles
 
   let configPathOverride = getStrParam(params, "config_path")
   if configPathOverride.len > 0:
@@ -527,10 +553,20 @@ proc handleTunnelUp(d: Daemon; params: JsonNode): JsonNode =
 
 proc handleTunnelDown(d: Daemon; params: JsonNode): JsonNode =
   let names = getStrArray(params, "names")
+  # Same wire rule as `up` (primary statement in `handleTunnelUp`):
+  # `cli/dispatch.cmdDown` always serialises the `profiles` key, so an
+  # empty array is indistinguishable from "no `--profile` was given" and
+  # means "not specified", never "the empty set". The fallback to
+  # `d.opts.activeProfiles` is what makes the `else` branch reachable at
+  # all: without it a bare `powarder down` would send `@[]`,
+  # `isTargeted(tc, @[])` matches only profile-less tunnels, and the
+  # profile-tagged tunnels a bare `powarder up` starts (and that this
+  # change now keeps alive across restarts) would silently keep running.
+  # With the fallback, a bare `down` stops what a bare `up` started.
+  let requested = getStrArray(params, "profiles")
   let profiles =
-    if params != nil and params.hasKey("profiles") and params[
-        "profiles"].kind == JArray:
-      getStrArray(params, "profiles")
+    if requested.len > 0:
+      requested
     else:
       d.opts.activeProfiles
   let immediate = getBoolParam(params, "immediate", false)
@@ -734,6 +770,12 @@ proc newDaemon*(opts: DaemonOpts): Daemon =
   ## lock** (config loading, state loading, registry creation, IPC server
   ## creation, handler registration).
   ##
+  ## **Profile precedence:** `opts.activeProfiles` is
+  ## restored from `state.json` when empty, but an explicit `--profile`
+  ## given on the daemon command line WINS and is never merged with the
+  ## persisted set. See `DaemonOpts.activeProfiles` for why the persistence
+  ## exists.
+  ##
   ## **The lock is not acquired here.** `runDaemon` needs the branch "if the
   ## lock cannot be acquired, give up on constructing a `Daemon` at all and
   ## exit with code 7" (regardless of `newIpcServer`, `ensureRuntimeDir`,
@@ -787,6 +829,30 @@ proc newDaemon*(opts: DaemonOpts): Daemon =
     normalizedOpts.tickIntervalMs = defaultTickIntervalMs
   if normalizedOpts.stateSaveIntervalMs <= 0:
     normalizedOpts.stateSaveIntervalMs = defaultStateSaveIntervalMs
+
+  # Restore the profiles persisted to `state.json`. launchd / systemd
+  # start the daemon through the service generators
+  # (`platform/service_darwin.programArguments` /
+  # `platform/service_linux.execStartLine`), which emit `<exe> daemon`
+  # plus `--config PATH` when one is configured -- never `--profile` --
+  # so without this restore a relaunch would drop every profile-tagged
+  # tunnel even though `autostart: true` is set: `reconcile.isTargeted`
+  # only targets profile-tagged tunnels while their profile is in
+  # `activeProfiles`, and an empty set means they never come up again.
+  #
+  # **An explicit `--profile` on the daemon command line WINS and is never
+  # merged with the persisted set**; the state file is consulted only when
+  # no profile was given. Merging would silently re-activate tunnels the
+  # user deliberately left out of the command line.
+  if normalizedOpts.activeProfiles.len == 0 and persisted.activeProfiles.len > 0:
+    normalizedOpts.activeProfiles = persisted.activeProfiles
+    # One startup line, same stderr style as `logAdoptReport`. **Emitted
+    # only when the restore actually took effect** -- logging whenever
+    # `activeProfiles` merely happens to be non-empty would claim "restored
+    # from state" for a set that came from an explicit `--profile`.
+    var msg = "powarder: restored active profiles from state: "
+    msg.add normalizedOpts.activeProfiles.join(",")
+    stderr.writeLine(msg)
 
   result = Daemon(
     opts: normalizedOpts,
