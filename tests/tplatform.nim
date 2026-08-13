@@ -90,6 +90,185 @@ suite "lock: cross-process exclusion (uses fork)":
     got.get.release()
     removeFile(lockFile)
 
+suite "lock: free-ness probes":
+  ## `isSingletonLockFree` / `lockHolderPid` let a CLI
+  ## process (which never holds the lock itself) check whether the daemon's
+  ## singleton lock is free, so it can decide whether a fresh daemon may be
+  ## spawned. Both are pure `fcntl(F_GETLK)` queries: they never
+  ## acquire the lock, so a probe cannot deny a concurrently starting daemon
+  ## (a try-acquire probe could, and did — see the probe/acquire race test
+  ## below). `F_GETLK` ignores the *caller's own* locks, so these procs must
+  ## never be called from a process that already holds the lock: the answer
+  ## would be a spurious "free". That is why every "held" case below has a
+  ## forked child hold the lock while the parent (which holds nothing)
+  ## probes it.
+
+  test "true for a free path":
+    let path = "/tmp/pw-lock-free.lock"
+    removeFile(path)
+    check isSingletonLockFree(path)
+    removeFile(path)
+
+  test "a lock held by another process is not free":
+    let lockFile = "/tmp/pw-lock-held.lock"
+    let markerFile = "/tmp/pw-lock-held-ready"
+    removeFile(lockFile)
+    removeFile(markerFile)
+
+    let pid = fork()
+    if pid == 0:
+      # Child process: take the lock, write the readiness marker, then
+      # hold until SIGKILLed by the parent. The 5s cap (100 * 50ms) keeps
+      # the test from hanging if the kill never arrives. Never discard the
+      # acquire result: a lost race exits with a distinct status so the
+      # parent can report it as such instead of as a confusing probe
+      # failure 2s later.
+      let got = tryAcquireSingletonLock(lockFile)
+      if got.isNone:
+        exitnow(3)
+      writeFile(markerFile, "ready")
+      for i in 0 ..< 100:
+        os.sleep(50)
+      exitnow(2)
+
+    # Readiness = the marker file the child writes only after a successful
+    # acquire, never a probe of the lock itself: probing the primitive
+    # under test as a readiness signal would (with an acquire-based probe)
+    # steal the lock from the child in the microseconds before its F_SETLK.
+    var status: cint
+    var waited = 0
+    var childLostRace = false
+    while not fileExists(markerFile) and waited < 2000:
+      # A child that lost the race exits immediately with the failure
+      # status; reap it without blocking and report that, so the failure
+      # reads "the child could not take the lock", not "marker missing".
+      if waitpid(pid, status, WNOHANG) == pid:
+        childLostRace = true
+        break
+      os.sleep(50)
+      waited += 50
+
+    if childLostRace:
+      checkpoint("the forked child could not take the lock (exit " & $WEXITSTATUS(status) & ")")
+      fail()
+    else:
+      check not isSingletonLockFree(lockFile)
+
+      discard kill(pid, SIGKILL)
+      discard waitpid(pid, status, 0)
+
+      # The kernel released the child's lock together with the process, so
+      # the path is free again.
+      check isSingletonLockFree(lockFile)
+
+    removeFile(lockFile)
+    removeFile(markerFile)
+
+  test "a path inside a nonexistent directory counts as free (OSError is free)":
+    # Nothing can hold a lock on a file that cannot even be opened, so an
+    # OSError from the probe must be treated as "free" and never propagate.
+    let path = "/tmp/pw-lock-missing-dir/pw-lock-missing.lock"
+    removeFile(path) # no-op: the parent directory does not exist
+    check isSingletonLockFree(path) # must not raise
+    removeFile(path) # still nothing to remove, but keep cleanup consistent
+
+  test "probing the lock never prevents a concurrent acquire (F_GETLK query, not a try-acquire)":
+    ## Regression test for the root cause of the original flakiness in
+    ## this suite. `isSingletonLockFree` used to be implemented as
+    ## tryAcquireSingletonLock + immediate release, so for the microseconds
+    ## the probe held the lock it made the answer false for everyone else —
+    ## including a real daemon in runDaemon's single tryAcquireSingletonLock,
+    ## which does not retry and exits exitAlreadyRunning (7). Measured on an
+    ## idle 8-core box, the forked child failed to acquire in 22/3000 and
+    ## 5/3000 trials; with the parent's probe deleted, 0/3000. The F_GETLK
+    ## rewrite made the probe a pure query that never acquires, so it cannot
+    ## deny anyone. Regressing to a try-acquire probe would reintroduce the
+    ## race, and this test would start failing again.
+    for trial in 0 ..< 300:
+      let lockFile = "/tmp/pw-lock-probe-race.lock"
+      removeFile(lockFile)
+      let pid = fork()
+      if pid == 0:
+        # Child: a single acquire with no retry, exactly like runDaemon.
+        # Sleep 1ms first so the parent's hammer loop is already probing
+        # when the acquire lands. Exit 0 on success, 1 if a probe denied it.
+        os.sleep(1)
+        let got = tryAcquireSingletonLock(lockFile)
+        exitnow(if got.isSome: 0 else: 1)
+      # Hammer both probes in a tight loop until the child is reaped, so
+      # probes land across the child's acquire moment on every trial.
+      var status: cint = 0
+      while waitpid(pid, status, WNOHANG) == 0:
+        discard isSingletonLockFree(lockFile)
+        discard lockHolderPid(lockFile)
+      check WEXITSTATUS(status) == 0 # 1 would mean a probe denied the acquire
+      removeFile(lockFile)
+
+  test "lockHolderPid: none while the lock is free":
+    let path = "/tmp/pw-lock-holder-free.lock"
+    removeFile(path)
+    check lockHolderPid(path).isNone
+    check isSingletonLockFree(path) # the two probes agree
+    removeFile(path)
+
+  test "lockHolderPid: reports the forked holder's pid, and none after it releases":
+    let lockFile = "/tmp/pw-lock-holder-held.lock"
+    let markerFile = "/tmp/pw-lock-holder-held-ready"
+    removeFile(lockFile)
+    removeFile(markerFile)
+
+    let pid = fork()
+    if pid == 0:
+      # Child: take the lock, write the readiness marker, then hold until
+      # SIGKILLed by the parent (5s cap). A lost race exits with a distinct
+      # status instead of being discarded.
+      let got = tryAcquireSingletonLock(lockFile)
+      if got.isNone:
+        exitnow(3)
+      writeFile(markerFile, "ready")
+      for i in 0 ..< 100:
+        os.sleep(50)
+      exitnow(2)
+
+    var status: cint
+    var waited = 0
+    var childLostRace = false
+    while not fileExists(markerFile) and waited < 2000:
+      if waitpid(pid, status, WNOHANG) == pid:
+        childLostRace = true
+        break
+      os.sleep(50)
+      waited += 50
+
+    if childLostRace:
+      checkpoint("the forked child could not take the lock (exit " & $WEXITSTATUS(status) & ")")
+      fail()
+    else:
+      check fileExists(markerFile)
+      # F_GETLK reports the holder's pid in l_pid; it must be the forked
+      # child's pid exactly.
+      check lockHolderPid(lockFile) == some(pid.int)
+      # Reporting the holder must not disturb the held lock.
+      check not isSingletonLockFree(lockFile)
+
+      discard kill(pid, SIGKILL)
+      discard waitpid(pid, status, 0)
+      # The kernel released the lock together with the child process, so
+      # the holder is gone again.
+      check lockHolderPid(lockFile).isNone
+
+    removeFile(lockFile)
+    removeFile(markerFile)
+
+  test "lockHolderPid: none for a path in a nonexistent directory (OSError is free)":
+    # Nothing can hold a lock on a file that cannot even be opened, so an
+    # OSError from the probe counts as "no holder" and must never propagate
+    # (the same failure-counts-as-free rule as isSingletonLockFree).
+    let path = "/tmp/pw-lock-holder-missing-dir/pw-lock-holder.lock"
+    removeFile(path) # no-op: the parent directory does not exist
+    check lockHolderPid(path).isNone # must not raise
+    removeFile(path)
+
 suite "procinfo: liveness check":
 
   test "pidAlive(getpid()) is true":

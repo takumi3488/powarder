@@ -17,7 +17,12 @@ import std/os
 import std/json
 import std/strutils
 import std/times
+import std/monotimes
+import std/options
+import std/posix
 import powarder/cli/dispatch
+import powarder/cli/autostart
+import powarder/platform/lock
 import powarder/cli/argv
 import powarder/cli/output
 import powarder/cli/names
@@ -437,3 +442,151 @@ suite "dispatch: logs":
   test "omitting the tunnel name gives a usage error (2)":
     let args = ParsedArgs(subcommand: "logs", positional: @[], tailLines: 50)
     check dispatch(args) == ecUsage.int
+
+# ===========================================================================
+# autostart.ensureDaemon: refusal to spawn while the singleton lock is held
+# ===========================================================================
+# The lock-based phase 1 of `autostart.ensureDaemon` ("wait for the singleton
+# lock to be free before spawning") is the core of the `daemon restart` fix:
+# without it, restart burns its whole poll budget on a socket that will never
+# appear (a shutting-down daemon closes the IPC socket first and releases the
+# lock last, seconds later), then leaves no daemon behind. Nothing in this
+# file exercised that phase before: every `dispatch` call above either passes
+# `noAutostart: true` (which bails at step 2, before phase 1) or uses a
+# subcommand that never reaches `ensureDaemon`, so the refusal-to-spawn
+# behaviour could be reverted with the whole suite still green.
+#
+# An fcntl advisory lock is scoped per process, and the F_GETLK-based probes
+# ignore the caller's own locks, so a lock taken inside the test process
+# itself would be invisible and the test would pass for the wrong reason.
+# Every "held" case therefore forks a child that takes the lock and holds it
+# until SIGKILLed, and signals readiness via a marker file (same pattern as
+# the cross-process suites in tests/tplatform.nim). No test here spawns a
+# real daemon: that would leave a process and a socket behind and make the
+# suite order-dependent.
+
+var ensureDaemonTestDirCounter = 0
+
+proc ensureDaemonTestDir(): string =
+  ## A unique per-test scratch directory under /tmp. A fixed name could
+  ## collide with a previous run's leftovers (e.g. from an aborted test),
+  ## which would make the "no socket / no log line" assertions meaningless.
+  inc ensureDaemonTestDirCounter
+  "/tmp/pw-ensuredaemon-" & $getCurrentProcessId() & "-" &
+      $ensureDaemonTestDirCounter
+
+proc forkLockHolder(lockFile, markerFile: string): cint =
+  ## Fork a child that acquires `lockFile` and holds it for its whole life
+  ## (until the caller SIGKILLs it), writing `markerFile` once the lock is
+  ## provably held. Returns the child's pid; the caller MUST reap it.
+  ##
+  ## The child exits via `exitnow` (posix `_exit`) rather than `quit()`,
+  ## because `quit()` would drag in the Nim runtime's exit-time processing
+  ## and unittest's global state, causing the child to re-run the suite
+  ## (the same rationale documented in tests/tplatform.nim).
+  let pid = fork()
+  if pid == 0:
+    let got = tryAcquireSingletonLock(lockFile)
+    if got.isNone:
+      exitnow(3) ## the parent must not hold the lock; something is wrong
+    writeFile(markerFile, "ready")
+    for i in 0 ..< 100:
+      os.sleep(50) ## hold for up to 5s; normally SIGKILLed long before
+    exitnow(2)
+
+proc waitForMarker(markerFile: string; timeoutMs = 2000): bool =
+  var waited = 0
+  while not fileExists(markerFile) and waited < timeoutMs:
+    os.sleep(50)
+    waited += 50
+  fileExists(markerFile)
+
+proc reapLockHolder(pid: cint) =
+  ## SIGKILL the holder child (the kernel then releases its lock) and reap
+  ## it, so no zombie and no held lock outlives the test.
+  if pid > 0:
+    discard kill(pid, SIGKILL)
+    var status: cint
+    discard waitpid(pid, status, 0)
+
+suite "ensureDaemon: does not spawn while the singleton lock is held":
+
+  test "refuses to spawn while another process holds the singleton lock":
+    let dir = ensureDaemonTestDir()
+    createDir(dir)
+    let lockFile = dir / "powarder.lock"
+    let markerFile = dir / "ready"
+    var child: cint = -1
+    try:
+      withEnv({envRuntimeDir: dir, envStateDir: dir, envConfig: dir}, proc() =
+        child = forkLockHolder(lockFile, markerFile)
+        check waitForMarker(markerFile)
+
+        # With the lock held for the whole budget, phase 1 must give up
+        # WITHOUT spawning. A buggy spawn would show up in one of two ways:
+        # the child daemon wins the lock and serves RPCs (the IPC socket
+        # appears), or it loses `tryAcquireSingletonLock` and prints the
+        # "already running" line to the daemon log -- both must be absent.
+        check not ensureDaemon(noAutostart = false, timeoutMs = 300)
+
+        check not socketExists(ipcSocketPath())
+        check not fileExists(ipcSocketPath())
+        let log = daemonLogPath()
+        check (not fileExists(log)) or
+            ("the daemon is already running" notin readFile(log))
+      )
+    finally:
+      reapLockHolder(child)
+      removeFile(lockFile)
+      removeFile(markerFile)
+      removeFile(dir / "powarder.sock")
+      removeDir(dir)
+
+  test "noAutostart = true still bails immediately without spawning":
+    let dir = ensureDaemonTestDir()
+    createDir(dir)
+    try:
+      withEnv({envRuntimeDir: dir, envStateDir: dir, envConfig: dir}, proc() =
+        let timeoutMs = 5000
+        let start = getMonoTime()
+        check not ensureDaemon(noAutostart = true, timeoutMs = timeoutMs)
+        let elapsed = (getMonoTime() - start).inMilliseconds
+        # Step 2 must give up right after the failed ping; burning the poll
+        # budget instead would be a regression. "Far below" is the contract.
+        check elapsed < 1000
+        check not socketExists(ipcSocketPath())
+        check not fileExists(ipcSocketPath())
+      )
+    finally:
+      removeFile(dir / "powarder.sock")
+      removeDir(dir)
+
+  test "a held lock does not make ensureDaemon hang past its budget":
+    let dir = ensureDaemonTestDir()
+    createDir(dir)
+    let lockFile = dir / "powarder.lock"
+    let markerFile = dir / "ready"
+    var child: cint = -1
+    try:
+      withEnv({envRuntimeDir: dir, envStateDir: dir, envConfig: dir}, proc() =
+        child = forkLockHolder(lockFile, markerFile)
+        check waitForMarker(markerFile)
+
+        let timeoutMs = 300
+        let start = getMonoTime()
+        check not ensureDaemon(noAutostart = false, timeoutMs = timeoutMs)
+        let elapsed = (getMonoTime() - start).inMilliseconds
+        # Phase 1 polls at 100ms intervals, so a held lock burns roughly the
+        # whole budget and then gives up. Both bounds are loose so the test
+        # cannot flake on a loaded CI, but they still catch a broken probe
+        # that short-circuits instantly or hangs (looping forever or
+        # burning many times the budget).
+        check elapsed >= 200
+        check elapsed < timeoutMs * 5
+      )
+    finally:
+      reapLockHolder(child)
+      removeFile(lockFile)
+      removeFile(markerFile)
+      removeFile(dir / "powarder.sock")
+      removeDir(dir)

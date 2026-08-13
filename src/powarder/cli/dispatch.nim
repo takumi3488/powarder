@@ -720,24 +720,119 @@ proc cmdDaemonStop(w: Writer): int =
     ecDaemonUnreachable.int
 
 proc cmdDaemonRestart(w: Writer): int =
+  ## Restarts the daemon by asking the running one to shut down and then
+  ## starting a fresh one.
+  ##
+  ## The wait after the shutdown RPC watches the singleton lock, not just
+  ## `ping()` — the live incident that made this a lock wait:
+  ## `daemon/run.shutdown` closes the IPC socket first (`server.close()`),
+  ## then stops every forward and ssh ControlMaster (`reg.teardownAll()`), and
+  ## releases the lock LAST. Waiting on `ping()` alone exits in milliseconds
+  ## (the socket is gone at step one) while the lock is still held, the fresh
+  ## daemon then fails `tryAcquireSingletonLock` and exits `exitAlreadyRunning`
+  ## (7) immediately, `ensureDaemon` polls a socket that will never appear,
+  ## and `restart` fails leaving NO daemon running (reproduced with five
+  ## tunnels active). The lock is the authoritative precondition for starting
+  ## (`platform/lock.nim`), so spawn only once it is free.
+  ##
+  ## The wait must also watch `ping()`, because the lock freeing is not the
+  ## same as the old daemon finishing its shutdown: every autostart command
+  ## (`ps`, `up`, `ls`, `check`, `logs`) polls this same lock and spawns the
+  ## instant it frees, and a daemon that is STARTING holds the lock while no
+  ## socket exists yet (`runDaemon` acquires before `newIpcServer` opens it),
+  ## so by the time we look another process may legitimately own the lock
+  ## while a perfectly healthy daemon answers RPCs. A reachable daemon is a
+  ## successful restart; only when the budget expires with the lock still held
+  ## and nothing answering is `restart` a failure.
+  const daemonShutdownWaitMs = 15000
+    # Ceiling for the outgoing daemon to release the lock after the shutdown
+    # RPC answers. `teardownAll` has to stop every forward and every ssh
+    # ControlMaster before the lock is released, so seconds are normal with a
+    # handful of tunnels up; the old 5s ping budget was not enough headroom,
+    # and the cost of a too-generous ceiling is only a slower failure message
+    # in a case that is already broken.
+  # Three paths below report the same success (a daemon became reachable during
+  # the wait, during the final poll interval, or was spawned by
+  # `ensureDaemon`), and the pid can only be read after the winner has written
+  # it, so the message is built here once rather than three times.
+  proc reportRestarted(): int =
+    let pid = readPid(lockPath())
+    echo w.success("daemon restarted" &
+      (if pid.isSome: " (pid=" & $pid.get & ")" else: ""))
+    ecOk.int
+
+  # **The outgoing daemon's pid, read before the shutdown RPC.** The reachability
+  # escape below must never be satisfied by the daemon we are replacing:
+  # `mDaemonShutdown` only sets a flag, and the main loop notices it up to one
+  # tick (500ms) later, so `ping()` keeps succeeding for a moment after the RPC
+  # answers. Treating that as "a daemon is up" reported a successful restart and
+  # returned while the old daemon was still on its way out, so nothing ever
+  # started a replacement (caught end to end: three restarts in a row all
+  # answered in 0s with the same pid, and the tunnels stayed dead).
+  # `lockHolderPid` is the live holder from `F_GETLK`, not the possibly stale
+  # value in the lock file, so comparing against it is what distinguishes
+  # "someone else's daemon owns the lock now" from "the one we just told to go".
+  let outgoing = lockHolderPid(lockPath())
+
   try:
     discard call(mDaemonShutdown)
   except DaemonNotRunningError:
     discard # If it was already stopped, just go ahead and try to start it
 
-  # Even after the shutdown response comes back, the actual process exit might
-  # be asynchronous, so wait briefly until ping actually stops succeeding
-  # before trying to start it.
-  var waited = 0
-  while ping() and waited < 5000:
-    os.sleep(100)
-    waited += 100
+  proc handedOver(): bool =
+    ## Whether a daemon **other than the outgoing one** is reachable, in which
+    ## case the restart is already satisfied and spawning would be wrong.
+    if not ping():
+      return false
+    let holder = lockHolderPid(lockPath())
+    outgoing.isNone or holder.isNone or holder != outgoing
+
+  # Wait for the outgoing daemon to go away before spawning, but watch
+  # reachability too. The lock is the authoritative gate for starting a fresh
+  # daemon (`platform/lock.nim`): a lock still held after the shutdown RPC
+  # answered means the old daemon is inside `teardownAll()` with no socket,
+  # and spawning now would reproduce the incident above (fresh daemon exits
+  # `exitAlreadyRunning` (7), NO daemon left running). But the lock freeing is
+  # not the same as the shutdown finishing — every autostart command polls
+  # this same lock and spawns the instant it frees, and a daemon that is
+  # STARTING holds the lock before its socket exists (`runDaemon` acquires,
+  # then `newDaemon` runs `adoptOrphans`, then `newIpcServer`), so another
+  # process may legitimately own the lock while a healthy daemon answers RPCs.
+  # `handedOver()` is therefore the escape hatch here, in the same spirit as
+  # `autostart.ensureDaemon`'s phase 1: a reachable daemon that is not the one
+  # we just retired is a successful restart, whoever holds the lock.
+  const pollIntervalMs = 100
+  var lockWaited = 0
+  var lockFree = isSingletonLockFree(lockPath())
+  while not lockFree and lockWaited < daemonShutdownWaitMs:
+    if handedOver():
+      return reportRestarted()
+    os.sleep(pollIntervalMs)
+    lockWaited += pollIntervalMs
+    lockFree = isSingletonLockFree(lockPath())
+  if not lockFree:
+    # One final reachability probe so the last poll interval is not a blind
+    # spot (a replacement may have appeared during the final sleep, in which
+    # case the failure below would be a lie).
+    if handedOver():
+      return reportRestarted()
+    # The budget is exhausted with the lock still held and nothing answering.
+    # Name the holder so the user has something actionable: `F_GETLK` reports
+    # the pid that owns the lock, and the holder may be the outgoing daemon
+    # stuck in `teardownAll` OR an unrelated process (the daemon may also have
+    # already been stopped when the shutdown RPC was sent), so do not claim a
+    # shutdown is in progress.
+    var msg = "a daemon still holds the singleton lock"
+    let holder = lockHolderPid(lockPath())
+    if holder.isSome:
+      msg.add " (pid=" & $holder.get & ", lock: " & lockPath() & ")"
+    else:
+      msg.add " (lock: " & lockPath() & ")"
+    echo w.failure(msg)
+    return ecDaemonUnreachable.int
 
   if ensureDaemon(noAutostart = false):
-    let pid = readPid(lockPath())
-    echo w.success("daemon restarted" &
-      (if pid.isSome: " (pid=" & $pid.get & ")" else: ""))
-    ecOk.int
+    reportRestarted()
   else:
     echo w.failure("failed to restart the daemon")
     ecDaemonUnreachable.int
