@@ -223,6 +223,18 @@ priority if one exists):
 | `sshExtraArgs` | Extra ssh options to pass when starting the master (optional) |
 | `retry` | Reconnect backoff settings (optional) |
 
+**Profiles persist across daemon restarts**: the set of profiles activated
+with `powarder up --profile X` is remembered by the daemon and persisted
+in its state file, so it is restored when the daemon restarts (at login
+via launchd/systemd, or after `powarder daemon restart`) -- tunnels tagged
+with an active profile and `autostart: true` come back on their own.
+Each `powarder up --profile X` replaces the remembered set rather than
+adding to it, and a bare `powarder up` leaves the remembered set alone.
+Passing `--profile` to `powarder daemon` wins over whatever was remembered
+(the two are never merged) and, like `powarder up --profile X`, replaces
+the remembered set from then on -- a daemon started with `--profile prod`
+leaves `prod` in the state file for later bare restarts.
+
 **Division of responsibility with `~/.ssh/config`**: `powarder.json`
 deliberately has no fields equivalent to `user` / `port` / `identityFile` /
 `proxyJump`. The schema enforces this split at the type level: connection

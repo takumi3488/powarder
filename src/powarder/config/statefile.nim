@@ -46,6 +46,13 @@ type
   PersistedState* = object
     version*: int
     savedAt*: string ## ISO8601 format. For debugging (see `stampSavedAt` below)
+    activeProfiles*: seq[string]
+      ## The set of config-file profiles active for this daemon session, as
+      ## fixed by `powarder up --profile X`. Persisted here because
+      ## `reconcile.isTargeted` only targets a tunnel whose non-empty
+      ## `profile` appears in `DesiredState.activeProfiles`; if this is lost
+      ## on restart, every profile-tagged tunnel silently stays down even
+      ## with `autostart: true`.
     hosts*: seq[PersistedHostSession]
     forwards*: seq[PersistedForward]
 
@@ -61,8 +68,9 @@ proc stampSavedAt(): string =
   now().format(savedAtFormat)
 
 proc emptyState*(): PersistedState =
-  ## An empty `PersistedState`. `hosts` / `forwards` are empty sequences, `version` is 1.
-  PersistedState(version: 1, savedAt: "", hosts: @[], forwards: @[])
+  ## An empty `PersistedState`. `hosts` / `forwards` / `activeProfiles` are
+  ## empty sequences, `version` is 1.
+  PersistedState(version: 1, savedAt: "", activeProfiles: @[], hosts: @[], forwards: @[])
 
 proc loadState*(path: string): PersistedState =
   ## **Never raises, even if the file is corrupted.** If the JSON is
@@ -76,11 +84,25 @@ proc loadState*(path: string): PersistedState =
   ## itself from starting up, which is far more harmful than "losing one
   ## hint and reconnecting". So this errs on the side of "lose the state
   ## and safely start over".
+  ##
+  ## As long as a schema change is purely additive (like `activeProfiles`
+  ## below), this file stays readable by both old and new powarder
+  ## binaries: `loadState` backfills keys that older state files lack
+  ## before converting, so a pre-`activeProfiles` file keeps its `hosts` /
+  ## `forwards` instead of being discarded as "schema doesn't match".
   if not fileExists(path):
     return emptyState()
   try:
     let content = readFile(path)
-    let node = parseJson(content)
+    var node = parseJson(content)
+    # Backfill `activeProfiles` for state files written before this field
+    # existed. `std/json`'s `to()` raises `KeyError` on a missing object
+    # field, and the `except CatchableError` below would turn that into
+    # `emptyState()` -- silently discarding the `hosts` / `forwards`
+    # records that `daemon/orphan.adoptOrphans` needs, i.e. leaking live
+    # orphan ControlMasters on the very first startup after an upgrade.
+    if node.kind == JObject and not node.hasKey("activeProfiles"):
+      node["activeProfiles"] = newJArray()
     result = node.to(PersistedState)
   except CatchableError:
     result = emptyState()
