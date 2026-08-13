@@ -88,6 +88,93 @@ proc release*(lock: SingletonLock) =
   if lock.fd >= 0:
     discard close(lock.fd)
 
+proc queryLock(path: string): tuple[free: bool, holder: int] =
+  ## One `F_GETLK` probe of `path`: `free` is true when no OTHER process
+  ## holds the singleton lock (or when the query itself failed), and
+  ## `holder` is the pid the kernel reported in `l_pid` (0 when free or on
+  ## failure). The rationale for `F_GETLK` over a try-acquire probe, and
+  ## the per-process caveat, live on `isSingletonLockFree` below.
+  let fd = posix.open(path.cstring, O_CREAT or O_RDWR, 0o600)
+  if fd < 0:
+    return (true, 0)
+  var fl: Tflock
+  fl.l_type = F_WRLCK.cshort
+  fl.l_whence = SEEK_SET.cshort
+  fl.l_start = 0
+  fl.l_len = 0 # 0 means the whole file, same convention as tryAcquireSingletonLock
+  let rc = fcntl(fd, F_GETLK, addr fl)
+  discard close(fd)
+  if rc == -1:
+    return (true, 0)
+  if fl.l_type == F_UNLCK:
+    (true, 0)
+  else:
+    (false, int(fl.l_pid))
+
+proc isSingletonLockFree*(path: string): bool =
+  ## Whether a new daemon may start right now: a single `F_GETLK` probe of
+  ## whether any OTHER process holds the singleton fcntl lock on `path`.
+  ##
+  ## This lock — not the IPC socket — is the authoritative gate for "may a
+  ## new daemon start". `daemon/run.shutdown` closes the IPC socket first,
+  ## so `ipc/client.ping()` starts failing immediately, but releases this
+  ## lock only at the very end, after `reg.teardownAll()` has stopped every
+  ## forward and ssh ControlMaster, which takes seconds when tunnels are
+  ## up. Anything that waits on `ping()` and then spawns a fresh daemon
+  ## fires into the window where `runDaemon` cannot acquire the lock and
+  ## exits `exitAlreadyRunning` (7); the lock being free is the one
+  ## condition that makes the spawn safe.
+  ##
+  ## **Why `F_GETLK` and not a try-acquire probe.** A try-acquire probe
+  ## (what this proc used to do) answers the question by momentarily
+  ## BECOMING the holder, so for the microseconds it holds the lock every
+  ## other process is told "held" — including a real daemon sitting in
+  ## `runDaemon`'s `tryAcquireSingletonLock`, which does not retry and
+  ## exits `exitAlreadyRunning` (7). A pre-flight check that can cause the
+  ## very failure it exists to prevent is the wrong primitive. `F_GETLK`
+  ## instead asks the kernel whether this lock WOULD conflict, and acquires
+  ## nothing: no `F_SETLK`, no window in which the answer is wrong, and no
+  ## interaction with a concurrent acquire. This also removed a measured
+  ## flake in the fork-based tests, where the parent's probe stole the lock
+  ## from the child's single acquire in ~0.2-0.7% of trials (22/3000 and
+  ## 5/3000 with the probe, 0/3000 without it).
+  ##
+  ## **Never call this from a process that already holds this lock.** POSIX
+  ## `F_GETLK` ignores locks held by the CALLING process, so a process that
+  ## holds the singleton lock is told the lock is FREE — a false "free"
+  ## rather than the stolen-lock hazard of the old probe, but wrong in the
+  ## same direction. Opening the file through a fresh fd also trips the
+  ## per-process trap documented in the module header above (lines 17-27)
+  ## for `readPid`: closing that fd releases every lock the process holds
+  ## on the file. Callers are CLI processes only, which never hold the
+  ## lock; the daemon must never call this proc.
+  ##
+  ## A failed `open` or failed `fcntl` counts as **free** and never
+  ## propagates: nothing can hold a lock on a file that cannot even be
+  ## opened, every caller creates the runtime directory in its very next
+  ## step anyway, and treating failure as "held" or raising would turn this
+  ## optional pre-flight check into a new failure mode of its own.
+  queryLock(path).free
+
+proc lockHolderPid*(path: string): Option[int] =
+  ## The pid `F_GETLK` reports as holding the singleton lock on `path`, or
+  ## `none` when the lock is free, the query failed, or `l_pid` is
+  ## meaningless (0 or negative).
+  ##
+  ## **Diagnostic only.** It exists so CLI error messages can name who is
+  ## holding the lock when a wait times out; exclusion decisions are still
+  ## the kernel's, made by `F_SETLK` in `tryAcquireSingletonLock`. The pid
+  ## can be stale the instant it is read (the holder may have exited and
+  ## released the lock), so never branch control flow on it.
+  ##
+  ## Same caller restriction as `isSingletonLockFree`: CLI processes only,
+  ## never a process that already holds this lock.
+  let q = queryLock(path)
+  if q.free or q.holder <= 0:
+    none(int)
+  else:
+    some(q.holder)
+
 proc writePid*(lock: SingletonLock; pid: int) =
   ## Writes `pid` into the lock file.
   ##
