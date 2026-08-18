@@ -3,6 +3,14 @@
     "config:best-practices"
   ],
   dependencyDashboard: false,
+  // Scan the central source file for Renovate only in the terraforms repository
+  // (additive, so the default patterns are still kept; this path does not
+  // exist in the distribution target repositories).
+  "github-actions": {
+    managerFilePatterns: [
+      "/(^|/)environments/shared/cruise/workflow\\.yml$/"
+    ],
+  },
   minimumReleaseAge: "3 days",
   lockFileMaintenance: {
     minimumReleaseAge: null,
@@ -20,6 +28,14 @@
       ],
       groupName: "all minor, patch, and digest updates",
       groupSlug: "all-minor-patch-digest-updates",
+    },
+    {
+      matchUpdateTypes: [
+        "major"
+      ],
+      prBodyNotes: [
+        "<!-- renovate-major-update -->"
+      ],
     },
     {
       matchManagers: [
