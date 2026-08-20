@@ -34,6 +34,10 @@ const
   launchdPath = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
     ## Since launchd does not inherit an interactive shell's PATH, minimal
     ## candidates are specified explicitly.
+  serviceStartTimeoutMs = 15_000
+    ## launchd may need a retry while refreshing the executable's launch
+    ## constraint record after an atomic binary replacement.
+  servicePollIntervalMs = 100
 
 proc escapeXml(s: string): string =
   ## Since a plist is XML, embedding a path that may contain `&` `<` `>`
@@ -104,19 +108,41 @@ proc runLaunchctl(args: varargs[string]): tuple[output: string; exitCode: int] =
   except OSError as e:
     (e.msg, -1)
 
+proc launchctlStateIsRunning*(output: string; exitCode: int): bool =
+  ## `launchctl print` exits 0 for both running and stopped jobs. The state
+  ## line, not the command exit code alone, is the source of truth.
+  if exitCode != 0:
+    return false
+  for line in output.splitLines:
+    if line.strip() == "state = running":
+      return true
+  false
+
 proc serviceStatus*(): ServiceInfo =
   ## Determines the status from whether the plist file exists and whether
-  ## `launchctl print` succeeds.
+  ## `launchctl print` reports the job as running.
   let path = unitFilePath()
   if not fileExists(path):
     return ServiceInfo(label: serviceLabel(), unitPath: path,
         status: ssNotInstalled, notes: @[])
-  let (_, code) = runLaunchctl("print", guiDomain() & "/" & serviceLabel())
-  let status = if code == 0: ssRunning else: ssInstalled
+  let (outp, code) = runLaunchctl("print", guiDomain() & "/" & serviceLabel())
+  let status =
+    if launchctlStateIsRunning(outp, code): ssRunning else: ssInstalled
   ServiceInfo(label: serviceLabel(), unitPath: path, status: status, notes: @[])
 
+proc waitForRunning(): ServiceInfo =
+  ## `bootstrap` can return before `RunAtLoad` has started. launchd may also
+  ## need a retry while refreshing the executable's launch constraint record.
+  result = serviceStatus()
+  var waitedMs = 0
+  while result.status != ssRunning and waitedMs < serviceStartTimeoutMs:
+    sleep(servicePollIntervalMs)
+    waitedMs += servicePollIntervalMs
+    result = serviceStatus()
+
 proc installService*(exePath: string; configPath = ""): ServiceInfo =
-  ## Writes out the plist and registers it via `launchctl bootstrap`.
+  ## Writes out the plist, replaces the registered job, and waits until
+  ## launchd reports it running.
   ## Falls back to the older `launchctl load` for environments where
   ## `bootstrap` (the newer API) fails.
   let path = unitFilePath()
@@ -124,14 +150,30 @@ proc installService*(exePath: string; configPath = ""): ServiceInfo =
   writeFile(path, renderUnitFile(exePath, configPath))
 
   let domain = guiDomain()
+  let (_, existingCode) = runLaunchctl("print", domain & "/" & serviceLabel())
+  if existingCode == 0:
+    let (outp, bootoutCode) =
+      runLaunchctl("bootout", domain & "/" & serviceLabel())
+    if bootoutCode != 0:
+      return ServiceInfo(label: serviceLabel(), unitPath: path,
+          status: ssUnknown,
+          notes: @["Could not replace existing launchd service: " &
+              outp.strip()])
+
   var (outp, code) = runLaunchctl("bootstrap", domain, quoteShell(path))
   if code != 0:
     (outp, code) = runLaunchctl("load", quoteShell(path))
 
-  result = serviceStatus()
   if code != 0:
-    result.notes.add "Registration via launchctl may have failed: " &
-        outp.strip()
+    result = serviceStatus()
+    result.status = ssUnknown
+    result.notes.add "Registration via launchctl failed: " & outp.strip()
+    return
+
+  result = waitForRunning()
+  if result.status != ssRunning:
+    result.notes.add "launchd did not start the daemon within " &
+        $(serviceStartTimeoutMs div 1000) & " seconds"
 
 proc uninstallService*(): ServiceInfo =
   ## Deregisters via `launchctl bootout`, then deletes the plist file.

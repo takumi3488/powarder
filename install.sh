@@ -169,6 +169,27 @@ verify_checksum() {
   info "Checksum OK for ${_vc_name}."
 }
 
+# verify_macos_signature FILE
+#   Rejects ad-hoc or unsigned macOS binaries before they replace the
+#   installed executable. launchd can reject those binaries even when direct
+#   shell execution succeeds.
+verify_macos_signature() {
+  _vms_file=$1
+
+  [ "$(uname -s)" = "Darwin" ] || return 0
+  have codesign || die "codesign is required to install powarder on macOS."
+
+  _vms_info=$(codesign -dvv "$_vms_file" 2>&1 || true)
+  case "$_vms_info" in
+    *"Signature=adhoc"*|*"TeamIdentifier=not set"*)
+      die "The macOS powarder binary is not Developer ID signed; refusing an install that launchd may reject."
+      ;;
+  esac
+  codesign --verify --strict "$_vms_file" >/dev/null 2>&1 ||
+    die "The macOS powarder binary failed code-signature verification."
+}
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -247,6 +268,8 @@ main() {
   extracted="${tmpdir}/${BIN_NAME}"
   [ -f "$extracted" ] || die "Archive did not contain the expected ${BIN_NAME} binary."
   chmod +x "$extracted"
+  verify_macos_signature "$extracted"
+
 
   if [ ! -d "$install_dir" ]; then
     info "Creating install directory: ${install_dir}"
