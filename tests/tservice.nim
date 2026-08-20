@@ -81,6 +81,17 @@ suite "service: serviceLabel / unitFilePath":
           getHomeDir() / ".config" / "systemd" / "user" / "powarder.service"
 
 # ===========================================================================
+# macOS: launchctl status parsing
+# ===========================================================================
+
+suite "service_darwin: launchctl status parsing":
+  test "only an explicit running state counts as running":
+    check launchctlStateIsRunning("state = running\n", 0)
+    check not launchctlStateIsRunning("state = not running\n", 0)
+    check not launchctlStateIsRunning("state = spawn scheduled\n", 0)
+    check not launchctlStateIsRunning("state = running\n", 1)
+
+# ===========================================================================
 # macOS: plist generation (service_darwin.renderUnitFile)
 # ===========================================================================
 

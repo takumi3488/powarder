@@ -40,6 +40,60 @@ jobs:
         shell: bash
         run: ./powarder --version
 
+      - name: Sign and notarize macOS binary
+        if: matrix.target == 'darwin-arm64'
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_NOTARY_APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
+          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${APPLE_CERTIFICATE_BASE64:?APPLE_CERTIFICATE_BASE64 is required}"
+          : "${APPLE_CERTIFICATE_PASSWORD:?APPLE_CERTIFICATE_PASSWORD is required}"
+          : "${APPLE_SIGNING_IDENTITY:?APPLE_SIGNING_IDENTITY is required}"
+          : "${APPLE_NOTARY_APPLE_ID:?APPLE_NOTARY_APPLE_ID is required}"
+          : "${APPLE_NOTARY_PASSWORD:?APPLE_NOTARY_PASSWORD is required}"
+          : "${APPLE_TEAM_ID:?APPLE_TEAM_ID is required}"
+
+          keychain_password="$(openssl rand -hex 16)"
+          keychain_path="${RUNNER_TEMP}/powarder-signing.keychain-db"
+          certificate_path="${RUNNER_TEMP}/developer-id.p12"
+          notary_zip="${RUNNER_TEMP}/powarder-notary.zip"
+          cleanup() {
+            security delete-keychain "${keychain_path}" >/dev/null 2>&1 || true
+            rm -f "${certificate_path}" "${notary_zip}"
+          }
+          trap cleanup EXIT
+
+          printf '%s' "${APPLE_CERTIFICATE_BASE64}" | base64 -D >"${certificate_path}"
+          security create-keychain -p "${keychain_password}" "${keychain_path}"
+          security set-keychain-settings -lut 21600 "${keychain_path}"
+          security unlock-keychain -p "${keychain_password}" "${keychain_path}"
+          security import "${certificate_path}" \
+            -P "${APPLE_CERTIFICATE_PASSWORD}" \
+            -A -t cert -f pkcs12 -k "${keychain_path}"
+          security list-keychains -d user -s "${keychain_path}"
+          security default-keychain -s "${keychain_path}"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "${keychain_password}" "${keychain_path}"
+
+          codesign --force --options runtime --timestamp \
+            --sign "${APPLE_SIGNING_IDENTITY}" ./powarder
+          codesign --verify --strict --verbose=2 ./powarder
+
+          ditto -c -k --keepParent ./powarder "${notary_zip}"
+          xcrun notarytool submit "${notary_zip}" \
+            --apple-id "${APPLE_NOTARY_APPLE_ID}" \
+            --password "${APPLE_NOTARY_PASSWORD}" \
+            --team-id "${APPLE_TEAM_ID}" \
+            --wait
+          spctl --assess --type execute --verbose=4 ./powarder
+
       - name: Create archive
         shell: bash
         run: tar czf powarder-${{ matrix.target }}.tar.gz powarder

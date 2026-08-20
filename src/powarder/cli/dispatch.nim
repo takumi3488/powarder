@@ -894,14 +894,19 @@ proc cmdDaemonInstall(args: ParsedArgs; w: Writer): int =
   let exe = expandFilename(getAppFilename())
   try:
     let info = installService(exe, args.configPath)
+    let running = info.status == ssRunning
+    let message = "installed \"" & info.label & "\" -> " & info.unitPath &
+        " (" & statusLabel(info.status) & ")"
     if w.mode == omJson:
       echo serviceInfoJson(info).pretty()
+    elif running:
+      echo w.success(message)
     else:
-      echo w.success("installed \"" & info.label & "\" -> " & info.unitPath &
-          " (" & statusLabel(info.status) & ")")
+      echo w.failure(message)
+    if w.mode != omJson:
       for n in info.notes:
         echo w.info(n)
-    ecOk.int
+    if running: ecOk.int else: ecGeneral.int
   except OSError as e:
     echo w.failure(e.msg)
     ecGeneral.int
