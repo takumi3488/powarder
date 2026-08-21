@@ -193,12 +193,14 @@ $ powarder daemon uninstall
   tunnels along with it -- will stop as soon as you log out** (`daemon
   install` / `daemon status` print this warning for you).
 
-macOS release binaries are Developer ID signed and notarized before
-publication. The release workflow requires the repository secrets
-`APPLE_CERTIFICATE_BASE64`, `APPLE_CERTIFICATE_PASSWORD`,
-`APPLE_SIGNING_IDENTITY`, `APPLE_NOTARY_APPLE_ID`,
-`APPLE_NOTARY_PASSWORD`, and `APPLE_TEAM_ID`. Unsigned or ad-hoc binaries
-may run from a shell but can be rejected by launchd.
+macOS release binaries are Developer ID signed with a secure timestamp
+before publication. The release workflow requires the repository secrets
+`APPLE_CERTIFICATE_BASE64`, `APPLE_CERTIFICATE_PASSWORD`, and
+`APPLE_SIGNING_IDENTITY`. Unsigned or ad-hoc binaries may run from a shell
+but can be rejected by launchd. The binaries are not notarized: a bare
+Mach-O executable cannot carry a stapled notarization ticket, and the
+`install.sh` download never gets a `com.apple.quarantine` attribute, so
+Gatekeeper never assesses it.
 
 `powarder daemon install` waits for the service manager to report the daemon
 as running and returns a failure status if startup does not complete.

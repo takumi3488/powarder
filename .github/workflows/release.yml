@@ -44,32 +44,25 @@ jobs:
         shell: bash
         run: ./powarder --version
 
-      - name: Sign and notarize macOS binary
+      - name: Sign macOS binary
         if: matrix.target == 'darwin-arm64'
         env:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_NOTARY_APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
-          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         shell: bash
         run: |
           set -euo pipefail
           : "${APPLE_CERTIFICATE_BASE64:?APPLE_CERTIFICATE_BASE64 is required}"
           : "${APPLE_CERTIFICATE_PASSWORD:?APPLE_CERTIFICATE_PASSWORD is required}"
           : "${APPLE_SIGNING_IDENTITY:?APPLE_SIGNING_IDENTITY is required}"
-          : "${APPLE_NOTARY_APPLE_ID:?APPLE_NOTARY_APPLE_ID is required}"
-          : "${APPLE_NOTARY_PASSWORD:?APPLE_NOTARY_PASSWORD is required}"
-          : "${APPLE_TEAM_ID:?APPLE_TEAM_ID is required}"
 
           keychain_password="$(openssl rand -hex 16)"
           keychain_path="${RUNNER_TEMP}/powarder-signing.keychain-db"
           certificate_path="${RUNNER_TEMP}/developer-id.p12"
-          notary_zip="${RUNNER_TEMP}/powarder-notary.zip"
           cleanup() {
             security delete-keychain "${keychain_path}" >/dev/null 2>&1 || true
-            rm -f "${certificate_path}" "${notary_zip}"
+            rm -f "${certificate_path}"
           }
           trap cleanup EXIT
 
@@ -90,22 +83,18 @@ jobs:
             --sign "${APPLE_SIGNING_IDENTITY}" ./powarder
           codesign --verify --strict --verbose=2 ./powarder
 
-          ditto -c -k --keepParent ./powarder "${notary_zip}"
-          # `--wait` alone polls forever, so a backed-up notary queue holds the
-          # job until the 6h limit and leaves the release neither published nor
-          # failed. Bound the wait and fail loudly instead; re-run the workflow
-          # once the notary service catches up.
-          xcrun notarytool submit "${notary_zip}" \
-            --apple-id "${APPLE_NOTARY_APPLE_ID}" \
-            --password "${APPLE_NOTARY_PASSWORD}" \
-            --team-id "${APPLE_TEAM_ID}" \
-            --wait --timeout 45m
-          spctl --assess --type execute --verbose=4 ./powarder
+          # Notarization is deliberately skipped: powarder ships as a bare
+          # Mach-O executable inside a tar.gz, which `stapler` cannot hold a
+          # ticket for, and `install.sh` fetches it with curl/wget, so the
+          # download never carries com.apple.quarantine and Gatekeeper never
+          # assesses it. The Developer ID signature above is what launchd and
+          # `install.sh`'s verify_macos_signature require.
 
       - name: Attest release binary
         uses: actions/attest@v4
         with:
           subject-path: ./powarder
+
       - name: Create archive
         shell: bash
         run: tar czf powarder-${{ matrix.target }}.tar.gz powarder
