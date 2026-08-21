@@ -80,11 +80,20 @@ they may fail to run on distributions with a much older glibc.
 
 If you'd rather not pipe a script into `sh`, download a release archive
 directly from the
-[releases page](https://github.com/takumi3488/powarder/releases). Each
-release publishes `powarder-darwin-arm64.tar.gz`,
-`powarder-linux-x86_64.tar.gz`, and `powarder-linux-arm64.tar.gz`, plus a
-`SHA256SUMS` file for verifying the archive before you extract it and put
-the binary on your `$PATH`.
+[releases page](https://github.com/takumi3488/powarder/releases). Each release publishes
+`powarder-darwin-arm64.tar.gz`, `powarder-linux-x86_64.tar.gz`, and
+`powarder-linux-arm64.tar.gz`, plus a `SHA256SUMS` file for verifying the
+archive before you extract it and put the binary on your `$PATH`. The release
+workflow also creates a GitHub artifact attestation for each binary.
+
+After extracting an archive, verify the binary's attestation with the GitHub
+CLI:
+
+```bash
+gh attestation verify powarder \
+  -R takumi3488/powarder \
+  --signer-workflow takumi3488/powarder/.github/workflows/release.yml
+```
 
 ### Updating
 
@@ -184,12 +193,14 @@ $ powarder daemon uninstall
   tunnels along with it -- will stop as soon as you log out** (`daemon
   install` / `daemon status` print this warning for you).
 
-macOS release binaries are Developer ID signed and notarized before
-publication. The release workflow requires the repository secrets
-`APPLE_CERTIFICATE_BASE64`, `APPLE_CERTIFICATE_PASSWORD`,
-`APPLE_SIGNING_IDENTITY`, `APPLE_NOTARY_APPLE_ID`,
-`APPLE_NOTARY_PASSWORD`, and `APPLE_TEAM_ID`. Unsigned or ad-hoc binaries
-may run from a shell but can be rejected by launchd.
+macOS release binaries are Developer ID signed with a secure timestamp
+before publication. The release workflow requires the repository secrets
+`APPLE_CERTIFICATE_BASE64`, `APPLE_CERTIFICATE_PASSWORD`, and
+`APPLE_SIGNING_IDENTITY`. Unsigned or ad-hoc binaries may run from a shell
+but can be rejected by launchd. The binaries are not notarized: a bare
+Mach-O executable cannot carry a stapled notarization ticket, and the
+`install.sh` download never gets a `com.apple.quarantine` attribute, so
+Gatekeeper never assesses it.
 
 `powarder daemon install` waits for the service manager to report the daemon
 as running and returns a failure status if startup does not complete.
