@@ -80,11 +80,20 @@ they may fail to run on distributions with a much older glibc.
 
 If you'd rather not pipe a script into `sh`, download a release archive
 directly from the
-[releases page](https://github.com/takumi3488/powarder/releases). Each
-release publishes `powarder-darwin-arm64.tar.gz`,
-`powarder-linux-x86_64.tar.gz`, and `powarder-linux-arm64.tar.gz`, plus a
-`SHA256SUMS` file for verifying the archive before you extract it and put
-the binary on your `$PATH`.
+[releases page](https://github.com/takumi3488/powarder/releases). Each release publishes
+`powarder-darwin-arm64.tar.gz`, `powarder-linux-x86_64.tar.gz`, and
+`powarder-linux-arm64.tar.gz`, plus a `SHA256SUMS` file for verifying the
+archive before you extract it and put the binary on your `$PATH`. The release
+workflow also creates a GitHub artifact attestation for each binary.
+
+After extracting an archive, verify the binary's attestation with the GitHub
+CLI:
+
+```bash
+gh attestation verify powarder \
+  -R takumi3488/powarder \
+  --signer-workflow takumi3488/powarder/.github/workflows/release.yml
+```
 
 ### Updating
 
