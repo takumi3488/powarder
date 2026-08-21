@@ -1,6 +1,6 @@
 # Package
 
-version       = "0.1.1"
+version       = "0.1.2"
 author        = "powarder contributors"
 description   = "Manage SSH local and remote port forwards with a CLI and a background daemon"
 license       = "Apache-2.0"
