@@ -374,3 +374,8 @@ mise exec -- nimble build -y
 
 This produces the `./powarder` binary. Put it somewhere on your `$PATH`
 (e.g. `mv powarder ~/.local/bin/`).
+
+## Support
+
+If you find powarder useful, consider [sponsoring takumi3488](https://github.com/sponsors/takumi3488)
+to support its development and maintenance.
