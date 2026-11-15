@@ -12,7 +12,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Nim
-        uses: jiro4989/setup-nim-action@efd7b4f2cab6441597916438c4f03425167d453b # v2
+        uses: jiro4989/setup-nim-action@72e8dc92dca238737f0cb2d087d98d91cb527aa5 # v2
         with:
           nim-version: '2.2.10'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
